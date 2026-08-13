@@ -1,0 +1,25 @@
+# Build output
+bin/
+obj/
+
+# The validation virtualenv: numpy, astropy, poppy, skyfield and galsim, several hundred
+# megabytes of other people's code. tools/README.md says how to rebuild it in one command.
+validation-env/
+
+# The deep-sky maps. None of these are redistributable and every one is built on the user's own
+# machine from the surveys; together they run to hundreds of megabytes. data/ITSELF is tracked,
+# because the two small catalogues below live there.
+data/*.starcat
+data/*.dustmap
+data/*.emission
+data/*.patchset
+data/*.galcat
+data/*.galimg
+data/*.cache/
+
+# Frames and their reductions, which are output, not source.
+captures/
+*.fits
+
+# macOS
+.DS_Store

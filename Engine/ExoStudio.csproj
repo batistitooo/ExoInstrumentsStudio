@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!--
+    ExoInstruments Studio: the mod's physics core, detached from KSP.
+
+    Core/ and Session/ are VENDORED into this repository, so it builds with nothing
+    else on the machine. See Directory.Build.props for why that trade was made and
+    CORE_PROVENANCE.md for the commit this copy came from.
+
+    The one file of Core not carried across is SkyChartTexture.cs, the only one that
+    really uses UnityEngine; Simulation/UnityShims.cs stands in for the rest of Unity's
+    dialect.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>ExoStudio</RootNamespace>
+    <AssemblyName>exostudio</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>CS0168;CS0219;CS0414;CS0649</NoWarn>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+
+  <ItemGroup>
+    <Compile Include="**\*.cs" Exclude="obj\**;bin\**" />
+    <Compile Include="$(CoreRoot)Core\**\*.cs" />
+    <Compile Include="$(CoreRoot)Session\**\*.cs" />
+    <!-- FitsWriter is pure image mathematics in Unity's dialect, compiled verbatim against
+         Simulation/UnityShims.cs. Stacking and colour composition were compiled here too
+         until Studio stopped stacking: frames are exported as FITS and reduced in Siril,
+         which is what an observer would actually do with them. -->
+    <Compile Include="$(CoreRoot)Visualization\FitsWriter.cs" />
+  </ItemGroup>
+
+
+</Project>

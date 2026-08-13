@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The 66th harness. The mod's tools/ directory holds 65 console projects that compile
+    slices of Core and check them headless; this one checks the thing those cannot: that
+    Core still behaves when the clock is ours instead of KSP's.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>verify</AssemblyName>
+    <RootNamespace>ExoStudio.Verify</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>CS0168;CS0219;CS0414;CS0649</NoWarn>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(StudioRoot)' == ''">
+    <StudioRoot>$(MSBuildThisFileDirectory)..\Engine</StudioRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+
+    <!-- The Studio pieces under test, minus the web host. -->
+    <Compile Include="$(StudioRoot)\Simulation\SimulationClock.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\ObservingSites.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\VisualizationBoundary.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\UnityShims.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\DeepSkyCamera.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\PngWriter.cs" />
+    <Compile Include="$(StudioRoot)\Data\CatalogCrossReference.cs" />
+    <Compile Include="$(StudioRoot)\Data\GaiaCatalogReader.cs" />
+
+    <!-- The vendored physics core, unchanged. -->
+    <Compile Include="$(CoreRoot)Core\**\*.cs" />
+    <Compile Include="$(CoreRoot)Session\**\*.cs" />
+    <Compile Include="$(CoreRoot)Visualization\FitsWriter.cs" />
+  </ItemGroup>
+
+</Project>

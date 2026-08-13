@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ExoInstruments Studio</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔭</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <div>
+      <h1>ExoInstruments <em>Studio</em></h1>
+      <p class="sub" id="catalogueLine">loading catalogue…</p>
+    </div>
+  </div>
+  <button class="ghost" id="notesToggle">Stated simplifications</button>
+</header>
+
+<div id="notes" class="notes" hidden>
+  <p class="notes-head">What this model does not claim</p>
+  <ul id="notesList"></ul>
+</div>
+
+<main>
+
+  <!-- ============================ setup column ============================ -->
+  <aside class="panel setup">
+
+    <section class="block">
+      <label class="lbl" for="search">Target</label>
+      <div class="searchwrap">
+        <input id="search" type="search" placeholder="51 Peg b" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="chips" id="targetChips" role="group" aria-label="Filter targets">
+        <button class="chip on" data-filter="all">All</button>
+        <button class="chip" data-filter="rv">RV</button>
+        <button class="chip" data-filter="transit">Transiting</button>
+      </div>
+      <ul id="results" class="results"></ul>
+      <p class="hint" id="resultCount"></p>
+    </section>
+
+    <section class="block" id="targetCard" hidden>
+      <div class="tcard">
+        <div class="tcard-head">
+          <h2 id="tName">—</h2>
+          <span class="pill" id="tStatus"></span>
+        </div>
+        <p class="tcard-sub" id="tSub"></p>
+        <dl class="kv" id="tFacts"></dl>
+      </div>
+    </section>
+
+    <section class="block">
+      <label class="lbl" for="instrument">Instrument</label>
+      <select id="instrument"></select>
+      <p class="hint" id="instrumentHint"></p>
+    </section>
+
+    <section class="block" id="siteBlock">
+      <label class="lbl" for="site">Site</label>
+      <select id="site"></select>
+    </section>
+
+    <button id="observe" class="primary" disabled>Begin observing</button>
+    <p class="err" id="startError" hidden></p>
+
+    <section class="block capturesetup" id="captureSetup" hidden>
+      <label class="lbl">Astrograph capture</label>
+      <div class="capgrid">
+        <label>RA °<input id="capRa" type="number" step="0.0001" value="202.4696"></label>
+        <label>Dec °<input id="capDec" type="number" step="0.0001" value="47.1952"></label>
+        <label>Filter<select id="capFilter"></select></label>
+        <label>Exposure s<input id="capExp" type="number" min="0.1" max="3600" step="1" value="60"></label>
+        <label>Binning<select id="capBin">
+          <option>1</option><option>2</option><option selected>4</option><option>8</option>
+        </select></label>
+        <label class="capcheck"><input id="capTrack" type="checkbox" checked> tracking mount</label>
+      </div>
+      <div class="coolrow" id="coolRow" hidden>
+        <div class="coolhead">
+          <label class="lbl" for="capTemp">Detector cooling</label>
+          <output class="mono coolval" id="capTempOut">—</output>
+        </div>
+        <input id="capTemp" type="range" step="1">
+        <p class="hint" id="coolHint"></p>
+      </div>
+      <div class="coolrow" id="zoomRow" hidden>
+        <div class="coolhead">
+          <label class="lbl" for="capZoom">Barlow</label>
+          <output class="mono coolval" id="capZoomOut">—</output>
+        </div>
+        <input id="capZoom" type="range" min="1" max="4" step="0.05" value="1">
+        <p class="hint" id="zoomHint"></p>
+      </div>
+      <button id="capture" class="primary">Capture</button>
+      <p class="err" id="captureError" hidden></p>
+    </section>
+  </aside>
+
+  <!-- ============================ run column ============================== -->
+  <section class="run">
+
+    <div class="panel clockbar" id="clockbar">
+      <div class="clockmain">
+        <div class="stat">
+          <span class="stat-lbl">Observatory clock</span>
+          <span class="stat-val big mono" id="clockDate">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-lbl">Programme baseline</span>
+          <span class="stat-val mono" id="baseline">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-lbl">Epochs collected</span>
+          <span class="stat-val mono" id="epochs">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-lbl">Real time spent</span>
+          <span class="stat-val mono" id="wall">—</span>
+        </div>
+      </div>
+
+      <div class="warp">
+        <div class="warp-head">
+          <label class="lbl" for="warp">Time acceleration</label>
+          <output class="warp-val mono" id="warpVal">×1</output>
+        </div>
+        <input id="warp" type="range" min="0" max="1000" value="0" disabled>
+      </div>
+
+      <div class="runctl">
+        <button id="pause" class="ghost" disabled>Pause</button>
+        <button id="analyse" class="accent" disabled>Analyse</button>
+      </div>
+    </div>
+
+    <div class="panel chart" id="chartPanel">
+      <div class="chart-head">
+        <h3>Sky chart</h3>
+        <span class="chart-note" id="chartNote">loading the Bright Star Catalogue…</span>
+      </div>
+      <div class="gaiabar" id="gaiaBar" hidden>
+        <div class="gaiagroup">
+          <label class="lbl">Magnitude</label>
+          <div class="dualrange">
+            <input id="magMin" type="range" min="-2" max="16" step="0.5" value="-2">
+            <input id="magMax" type="range" min="-2" max="16" step="0.5" value="16">
+          </div>
+          <output class="mono gaiaout" id="magOut">V −2 to 16</output>
+        </div>
+        <div class="gaiagroup">
+          <label class="lbl">Spectral class</label>
+          <div class="chips" id="classChips"></div>
+        </div>
+        <span class="hint gaiastat mono" id="gaiaStat"></span>
+      </div>
+      <div class="skychart" id="skychart">
+        <img id="gaiaLayer" alt="" hidden>
+        <canvas id="chartStars"></canvas>
+        <canvas id="chartOverlay"></canvas>
+        <div class="chart-tip mono" id="chartTip" hidden></div>
+        <div class="zoombadge mono" id="zoomBadge" hidden></div>
+      </div>
+      <div class="chart-legend mono">
+        <span><i class="dot dot-star"></i> <span id="starLayerLabel">Bright Star Catalogue</span></span>
+        <span><i class="dot dot-host"></i> planet host</span>
+        <span><i class="dot dot-sel"></i> selected</span>
+        <span><i class="dot dot-shade"></i> never above 20° from this site</span>
+        <span><i class="dot dot-aim"></i> telescope aim (click any patch of sky)</span>
+      </div>
+    </div>
+
+    <div class="panel chart" id="forecastPanel" hidden>
+      <div class="chart-head">
+        <h3>Observing forecast</h3>
+        <span class="chart-note" id="forecastNote"></span>
+      </div>
+      <div class="fcwrap">
+        <canvas id="forecast" data-h="380"></canvas>
+        <div class="chart-tip mono" id="forecastTip" hidden></div>
+      </div>
+      <div class="fcrow">
+        <span class="hint" id="forecastHint"></span>
+        <span class="fcactions">
+          <span class="fcscale" id="fcScale"></span>
+          <button class="ghost" id="fcBest" hidden>Best window</button>
+          <span class="pill fcstart" id="fcStartChip" hidden></span>
+        </span>
+      </div>
+    </div>
+
+    <div class="panel sky" id="skyPanel" hidden>
+      <div class="skystrip">
+        <span class="skylight" id="skyLight"></span>
+        <span class="skytext" id="skyText">—</span>
+      </div>
+      <div class="skynums mono">
+        <span><i>alt</i> <b id="skyAlt">—</b></span>
+        <span><i>airmass</i> <b id="skyX">—</b></span>
+        <span><i>Sun</i> <b id="skySun">—</b></span>
+        <span><i>moonlight</i> <b id="skyMoon">—</b></span>
+      </div>
+    </div>
+
+    <div class="panel chart" id="capturePanel" hidden>
+      <div class="chart-head">
+        <h3 id="captureTitle">Astrograph frame</h3>
+        <span class="chart-note" id="captureNote"></span>
+      </div>
+      <div class="capframe"><img id="captureImg" alt="captured frame"></div>
+      <p class="hint" id="captureMeta"></p>
+      <p class="hint" id="captureLinks"></p>
+      <p class="hint dim" id="captureReport"></p>
+      <p class="hint dim" id="captureData"></p>
+    </div>
+
+    <div class="panel chart" id="seriesPanel" hidden>
+      <div class="chart-head">
+        <h3 id="seriesTitle">Radial velocity</h3>
+        <span class="chart-note" id="seriesNote"></span>
+      </div>
+      <canvas id="series" data-h="270"></canvas>
+    </div>
+
+    <div class="panel chart" id="foldPanel" hidden>
+      <div class="chart-head">
+        <h3>Phase-folded on the recovered period</h3>
+        <span class="chart-note" id="foldNote"></span>
+      </div>
+      <canvas id="fold" data-h="250"></canvas>
+    </div>
+
+    <div class="panel result" id="resultPanel" hidden>
+      <div class="chart-head">
+        <h3>Detection</h3>
+        <span class="chart-note" id="resultNote"></span>
+      </div>
+      <div id="verdict"></div>
+      <table class="signals">
+        <thead>
+          <tr><th></th><th>Period</th><th id="ampHead">Semi-amplitude</th><th>S/N</th><th>Verdict</th></tr>
+        </thead>
+        <tbody id="signalRows"></tbody>
+      </table>
+    </div>
+
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

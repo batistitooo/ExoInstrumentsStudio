@@ -1,0 +1,28 @@
+<Project>
+
+  <!--
+    Studio is self-contained. Core/, Session/ and Visualization/FitsWriter.cs are the
+    ExoInstruments mod's physics, VENDORED into this repository rather than compiled out of a
+    checkout of the mod, so this repo builds with nothing else on the machine.
+
+    THE COST OF THAT, STATED PLAINLY. These files also live in the mod, and two copies of 36,500
+    lines drift. The mod's own build used to compile this tree in place precisely to stop that
+    happening, and that argument was correct: a copy silently diverges, and then the poppy and
+    galsim cross-validations only ever cover one of the two.
+
+    What replaces it is a check rather than a hope. tools/check_core_drift.py diffs this copy
+    against a mod checkout and names every file that differs, and CORE_PROVENANCE.md records the
+    commit this copy was taken from. Divergence is allowed, since the two faces legitimately move
+    at different speeds; going unnoticed is not.
+  -->
+
+  <PropertyGroup>
+    <CoreRoot>$(MSBuildThisFileDirectory)</CoreRoot>
+  </PropertyGroup>
+
+  <Target Name="CheckCorePresent" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(CoreRoot)Core/StarTarget.cs')"
+           Text="The vendored physics core is missing from '$(CoreRoot)Core'. This repository is meant to be self-contained; see CORE_PROVENANCE.md." />
+  </Target>
+
+</Project>
