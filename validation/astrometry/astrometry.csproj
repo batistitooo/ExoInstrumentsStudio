@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Pointing geometry, dumped from the SAME functions the capture path calls. See DumpAltAz.cs.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>dumpaltaz</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>CS0168;CS0219;CS0414;CS0649</NoWarn>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="DumpAltAz.cs" />
+    <!-- Studio's own clock and sites, and the whole vendored core behind them. Compiling the
+         core wholesale rather than file by file costs about a second and cannot go stale as
+         the dependency graph moves, which is how the mod's skyfield-tests harness died. -->
+    <Compile Include="$(CoreRoot)Engine\Simulation\SimulationClock.cs" />
+    <Compile Include="$(CoreRoot)Engine\Simulation\ObservingSites.cs" />
+    <Compile Include="$(CoreRoot)Engine\Simulation\VisualizationBoundary.cs" />
+    <Compile Include="$(CoreRoot)Engine\Simulation\UnityShims.cs" />
+    <Compile Include="$(CoreRoot)Core\**\*.cs" />
+    <Compile Include="$(CoreRoot)Session\**\*.cs" />
+  </ItemGroup>
+
+</Project>

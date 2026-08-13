@@ -18,6 +18,10 @@
 
   <PropertyGroup>
     <CoreRoot>$(MSBuildThisFileDirectory)</CoreRoot>
+    <!-- The cross-validation harnesses under validation/ came from the mod's tools/ and name the
+         core directory as $(Core). They are kept VERBATIM, so that what they measure here is what
+         they measure there; this is the only thing rerouted. -->
+    <Core Condition="'$(Core)' == ''">$(MSBuildThisFileDirectory)Core</Core>
   </PropertyGroup>
 
   <Target Name="CheckCorePresent" BeforeTargets="BeforeBuild">

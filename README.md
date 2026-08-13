@@ -1,7 +1,8 @@
 # ExoInstruments Studio
 
-The ExoInstruments physics core, detached from Kerbal Space Program, on the real sky,
-with the clock in our hands.
+An observatory simulator on the real sky, with the clock in your hands. Point a real telescope
+at a real target from a real site, expose, and read out a frame through a physics pipeline that
+has been [measured against POPPY, GalSim, Skyfield and dust_extinction](ACCURACY.md).
 
 ```bash
 ./run.sh
@@ -9,30 +10,81 @@ with the clock in our hands.
 
 Then open <http://127.0.0.1:5227>.
 
+![The Studio interface](docs/images/studio-ui.png)
+
+*The whole 7,369,627-star Gaia DR3 catalogue on an all-sky chart, 4,141 planet hosts over it, and
+the observing forecast for the selected target from the selected site. Click any patch of sky to
+aim a telescope at it.*
+
 ---
+
+## What comes out of it
+
+Every frame below was produced by this repository, by the command shown under it. No stacking, no
+retouching: these are single sub-exposures written straight out of the detector model.
+
+| | |
+|---|---|
+| ![Veil in O III](docs/images/veil-oiii.png) | ![M51](docs/images/m51-luminance.png) |
+| **Veil Nebula, [O III], RedCat 51, 900 s** at Roque de los Muchachos. The filaments are NSNS's *measured* [O III] plane, not a ratio inferred from H-alpha. | **M51, luminance, CDK1000, 600 s** at Roque de los Muchachos. The galaxy is measured survey imagery, not a Sersic profile. |
+| ![Carina in S II](docs/images/carina-sii.png) | ![M42 in H-alpha](docs/images/m42-halpha.png) |
+| **Carina, [S II], RC20, 600 s** from Paranal, at airmass 2.5 because that is where Carina was that night. | **M42, H-alpha, RC20, 300 s** from Paranal. The filter admits [N II] 6548 and 6584 alongside H-alpha, as a real 7 nm filter does. |
+| ![M31](docs/images/m31-luminance.png) | ![Omega Centauri](docs/images/omegacen-lum.png) |
+| **M31, luminance, RedCat 51, 300 s.** 2,383 catalogue stars in the field. | **Omega Centauri, luminance, RC20, 120 s** from Paranal. |
+
+Reproduce any of them:
+
+```bash
+curl -s -X POST http://127.0.0.1:5227/api/capture -H 'Content-Type: application/json' \
+  -d '{"telescope":"RedCat51","site":"orm","raDeg":313.29,"decDeg":31.72,
+       "filter":"OIII","exposureSeconds":900,"binning":2}'
+```
+
+The response carries the frame as PNG, a FITS URL, and the numbers behind it: seeing, airmass,
+sky electrons per pixel, how many catalogue stars were drawn, and which emission lines the filter
+admitted and whether each was measured or derived.
 
 ## What this is
 
-A local HTTP server that compiles the mod's `Core/` and `Session/` **in place, unchanged**,
-and drives them from a clock we own instead of KSP's. The browser is the interface.
+A local HTTP server running the [ExoInstruments](https://github.com/batistitooo/ExoInstruments)
+physics core on the real sky, driven from a clock we own rather than a game's. The browser is the
+interface. It does radial-velocity and transit campaigns against the real exoplanet catalogue, and
+deep-sky imaging with five real astrographs.
 
-Nothing in the mod tree is ever modified by this project.
+**It is self-contained.** `Core/`, `Session/` and one file of `Visualization/` are the KSP mod's
+physics, vendored into this repository: clone it, run `./run.sh`, and nothing else needs to exist
+on the machine. What that trade costs, and the check that stops the two copies drifting apart
+unnoticed, is in [CORE_PROVENANCE.md](CORE_PROVENANCE.md).
 
-## Pointing it at the mod
+## Accuracy
 
-Studio is its own repository, and the mod is a build-time dependency living outside it:
-`Core/` and `Session/` are compiled from the mod tree in place, never copied, so there is
-exactly one validated core behind the game, this server and (later) the Python binding.
+Frames that look like photographs prove nothing. [**ACCURACY.md**](ACCURACY.md) is the evidence:
+every mechanism run against the code that does it for a living, and the disagreement reported
+including where it is large.
 
-`Directory.Build.props` resolves that path, in order:
+| | reference | agreement |
+|---|---|---|
+| Diffraction, annular pupil | POPPY 1.1.1 | encircled energy **0.002 %** |
+| Kolmogorov seeing | GalSim 2.8.5 | profile core **2.3e-4**, FWHM constant **0.03 %** |
+| Delivered PSF, sampled instruments | GalSim 2.8.5 | FWHM **0.06 to 0.10 %** |
+| Extinction law F99 | dust_extinction 1.5 | **4e-11** |
+| Pointing altitude | Skyfield 1.55 | RMS **0.35 deg** |
 
-1. `-p:ModRoot=<path>` on the command line
-2. the `EXOINSTRUMENTS_MOD` environment variable
-3. `Directory.Build.props.user` (git-ignored; copy the `.example`)
-4. the default, `../KSP/ExoInstruments/ExoInstruments`
+The last two rows of that table in the full document are failures, and they are the reason to read
+it: the RedCat 51 is undersampled at 1.17 px per FWHM and its aperture correction is **60 %
+optimistic**, and pointing carries no precession, which is worth 0.35 degrees in 2026. Both are
+quantified rather than mentioned.
 
-The resolved path is stamped into the assembly, so the running server finds the mod's data
-files without being told twice. `EXOINSTRUMENTS_DATA` overrides where those are looked for.
+## The big sky maps
+
+The Gaia catalogue, the dust map, the H-alpha composite and its narrowband patches, the galaxy
+catalogue and its imagery are **not** in this repository. They are hundreds of megabytes, none are
+redistributable, and each is built on your own machine from the surveys. Studio runs without them,
+with correspondingly less sky, and `/api/capture/data` reports exactly which it found.
+
+Point it at them with `EXOINSTRUMENTS_DATA=/path/to/PluginData`, or drop them in `data/`. They are
+built by the mod's `tools/setup_data.py`; a KSP install that already has them is found
+automatically.
 
 ## Why a local server rather than WebAssembly
 
@@ -48,8 +100,18 @@ talks to `/api/*` (see `Engine/Api/Dto.cs`, which is deliberately the portabilit
 ## Layout
 
 ```
+Core/                     the vendored physics, 122 files, unmodified (CORE_PROVENANCE.md)
+Session/                  the vendored session layer, 3 files
+Visualization/            one file: FitsWriter.cs
+data/                     the two small catalogues that ship; the big maps are found, not shipped
+validation/               the cross-validations behind ACCURACY.md
+  poppy-crossvalidation/  diffraction against POPPY
+  galsim-crossvalidation/ seeing and the delivered PSF against GalSim
+  dust-crossvalidation/   the extinction law against dust_extinction
+  astrometry/             pointing and airmass against Skyfield
+tools/check_core_drift.py diffs the vendored core against a mod checkout
 Engine/
-  ExoStudio.csproj        compiles $(ModRoot)/Core/**  + $(ModRoot)/Session/**
+  ExoStudio.csproj        compiles Core/** + Session/** from this repository
   Program.cs              the HTTP API and static host
   Simulation/
     SimulationClock.cs    the time authority; the warp invariant lives here
@@ -77,7 +139,8 @@ Verify/                   the 66th harness (the mod's tools/ holds 65)
 
 ## Coupling, measured
 
-Of the mod's ~59 000 lines:
+This is what the split with the mod looked like when the core was vendored, and it is why the
+split is where it is. Of the mod's ~59 000 lines:
 
 | | lines | needed changing |
 |---|---|---|
@@ -254,6 +317,21 @@ cd Verify && dotnet run
 published K, warp invariance across five configurations, sky geometry on a real Earth
 (culmination altitude, and a sidereal day distinguishable from a solar one), 51 Peg b
 recovered end to end, and the streaming Gaia reader against the mod's own cone search.
+
+That harness checks Studio against **itself**. The physics is checked against **other people's
+code** in `validation/`, reported in [ACCURACY.md](ACCURACY.md):
+
+```bash
+python3 -m venv validation-env
+./validation-env/bin/pip install numpy scipy astropy poppy skyfield galsim dust_extinction
+cd validation/poppy-crossvalidation && dotnet run && ../../validation-env/bin/python compare_poppy.py
+```
+
+And the vendored core against the mod it came from, when a mod checkout is present:
+
+```bash
+python3 tools/check_core_drift.py --mod /path/to/ExoInstruments/ExoInstruments
+```
 
 ## Stated simplifications
 
