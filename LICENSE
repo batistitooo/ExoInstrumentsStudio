@@ -1,0 +1,55 @@
+Copyright © 2026 Baptiste Gress. All Rights Reserved.
+
+This repository and all of its contents (including but not limited to source
+code, documentation, assets, and data files) are the exclusive proprietary
+property of the copyright holder. This is a source-available license, not
+an open-source license.
+
+This repository vendors the physics core of the ExoInstruments mod for
+Kerbal Space Program, which is the property of the same copyright holder and
+is published under the same terms. See CORE_PROVENANCE.md.
+
+PERMITTED USE
+
+Any person may download and run this software, in its original and unmodified
+form, free of charge, for personal, non-commercial use on their own machine.
+This is the only right granted by this license.
+
+Viewing the source code of this repository is additionally permitted for
+the purpose of evaluating the author's engineering and scientific work
+(for example, in an academic or professional review context). This does
+not expand the permitted-use rights above.
+
+PROHIBITED USE
+
+Except as explicitly permitted above, no license, express or implied, is
+granted to any person or entity. In particular, the following are strictly
+prohibited without prior written permission from the copyright holder:
+
+  * Forking, modifying, reverse-engineering for the purpose of modification,
+    or creating any derivative work based on this software, in whole or in
+    part.
+  * Redistributing, rehosting, republishing, or mirroring this software, in
+    its original or in any modified form, on any platform, software
+    repository, website, or file-sharing service other than the official
+    source listed in this repository.
+  * Using any part of this source code in another software project, whether
+    open-source, closed-source, commercial, or non-commercial.
+  * Selling, sublicensing, or otherwise commercially exploiting this
+    software or any derivative of it.
+  * Removing or altering this copyright and license notice from any copy
+    of this software.
+
+Any unauthorized modification, redistribution, or republication of this
+software, in whole or in part, is strictly prohibited and will be treated
+as a violation of applicable copyright law.
+
+THIRD-PARTY DATA
+
+data/ExoplanetCatalog.csv is derived from the Extrasolar Planets Encyclopaedia
+(exoplanet.eu) and data/BrightStarCatalog.tsv from the Yale Bright Star
+Catalogue. Those datasets remain under their own terms and are redistributed
+here for use with this software only.
+
+All rights not expressly granted herein are reserved by the copyright
+holder.
