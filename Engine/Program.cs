@@ -78,6 +78,9 @@ string[] deepSkyDirs =
 var deepSky = new Lazy<DeepSkyData>(() => new DeepSkyData(deepSkyDirs.Where(d => d != null)));
 var captureStore = new CaptureStore();
 
+/// <summary>Largest frame this build will hold. See the capture endpoint for the measurements behind it.</summary>
+const long MaxFramePixels = 32_000_000;
+
 // Only the two methods this build actually drives. The rest of Observatories is real but
 // belongs to paths that are not ported (solar-system photography needs a renderer;
 // direct imaging is flagged UnderConstruction in the mod itself).
@@ -201,13 +204,31 @@ app.MapPost("/api/capture", (CaptureRequestDto req) =>
     if (offered != null && !offered.Contains(filter))
         return Results.BadRequest(new { error = $"{instrument.DisplayName} does not carry a {filter} filter." });
 
-    // Pixel budget: the compute cost is honest (it is the mod's own pipeline), so the API
-    // refuses a frame that would take minutes rather than silently degrading it.
+    // Pixel budget, which used to be 3 Mpx and refused every instrument in the roster at its
+    // native resolution. The ASI294MM Pro is 4144x2822, so binning 1 is 11.7 Mpx and FORS2 is
+    // 16.9, and a user asking for a full-resolution frame was told to bin it instead.
+    //
+    // THE NUMBER WAS NEVER MEASURED, and when it was, it turned out to be guarding against a cost
+    // that does not exist. Timed on this pipeline, RC20, 300 s, H-alpha on M42:
+    //
+    //     binning 4    1036x705      0.7 Mpx     8.9 s
+    //     binning 2    2072x1411     2.9 Mpx     8.9 s
+    //     binning 1    4144x2822    11.7 Mpx    11.9 s
+    //
+    // and the genuine worst case in the roster, the RedCat 51's 13.2 square degrees pointed at the
+    // Galactic centre, unguided so every one of its 14,467 stars trails, at binning 1: 13.7 s. The
+    // work is dominated by the fixed stages, the cone search and the PSF kernel and the emission
+    // integral, not by the pixel count. The response carries the frame as a base64 PNG and that
+    // comes to 3.8 MB at binning 1, which is not a problem either.
+    //
+    // So the limit now sits where a REAL constraint is, memory: the pipeline holds several float
+    // planes of the frame, so 32 Mpx is about half a gigabyte and is roughly twice the largest
+    // sensor here. It exists to stop a future absurd sensor, not to make anyone bin a photograph.
     var spec = instrument.VisualTelescope;
     int bin = Math.Clamp(req.Binning ?? 4, 1, 8);
     long px = (long)(spec.NativeSensorWidthPx / bin) * (spec.NativeSensorHeightPx / bin);
-    if (px > 3_000_000)
-        return Results.BadRequest(new { error = $"{spec.NativeSensorWidthPx / bin}x{spec.NativeSensorHeightPx / bin} at binning {bin} is over the 3 Mpx budget; raise the binning." });
+    if (px > MaxFramePixels)
+        return Results.BadRequest(new { error = $"{spec.NativeSensorWidthPx / bin}x{spec.NativeSensorHeightPx / bin} at binning {bin} is {px / 1e6:F1} Mpx, over the {MaxFramePixels / 1e6:F0} Mpx this build will hold in memory at once. Raise the binning." });
 
     ulong seed = (ulong)Environment.TickCount64;
     var request = new DeepSkyCamera.Request
