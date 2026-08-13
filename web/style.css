@@ -478,3 +478,15 @@ table.signals tr.miss td { color: var(--ink-faint); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #202834; border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: #2c3644; }
+
+/* A data problem the server detected. Deliberately not .dim: the one time this mattered, the
+   message was rendered in grey inline with six file paths and nobody saw it for hours. */
+.dataWarning {
+  margin: 0 0 6px 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn, #e0a030);
+  background: rgba(224, 160, 48, 0.08);
+  color: var(--warn, #e0a030);
+  font-size: 12px;
+  line-height: 1.45;
+}

@@ -32,11 +32,11 @@ const state = {
 
 const fmt = {
   num(v, d = 2) {
-    if (v === null || v === undefined || Number.isNaN(v)) return '—';
+    if (v === null || v === undefined || Number.isNaN(v)) return 'n/a';
     return v.toLocaleString('en-GB', { minimumFractionDigits: d, maximumFractionDigits: d });
   },
   int(v) {
-    if (v === null || v === undefined) return '—';
+    if (v === null || v === undefined) return 'n/a';
     return Math.round(v).toLocaleString('en-GB').replace(/,/g, ' ');
   },
   warp(r) {
@@ -44,7 +44,7 @@ const fmt = {
     return '×' + Math.round(r).toLocaleString('en-GB').replace(/,/g, ' ');
   },
   days(d) {
-    if (d === null || d === undefined) return '—';
+    if (d === null || d === undefined) return 'n/a';
     if (d < 2) return fmt.num(d * 24, 1) + ' h';
     if (d < 400) return fmt.num(d, 1) + ' d';
     return fmt.num(d / 365.25, 2) + ' yr';
@@ -55,7 +55,7 @@ const fmt = {
            String(sec).padStart(2, '0') + 's';
   },
   date(iso) {
-    return iso ? iso.replace('T', ' ').replace('Z', '') : '—';
+    return iso ? iso.replace('T', ' ').replace('Z', '') : 'n/a';
   },
 };
 
@@ -483,9 +483,9 @@ function renderSky(c) {
       : k.occultedByMoon ? `Occulted by the ${k.occultingMoon}`
       : 'Target below the altitude limit');
 
-  $('skyAlt').textContent = k.targetAltitudeDeg === null ? '—' : fmt.num(k.targetAltitudeDeg, 1) + '°';
-  $('skyX').textContent = k.airmass === null ? '—' : fmt.num(k.airmass, 2);
-  $('skySun').textContent = k.sunAltitudeDeg === null ? '—' : fmt.num(k.sunAltitudeDeg, 1) + '°';
+  $('skyAlt').textContent = k.targetAltitudeDeg === null ? 'n/a' : fmt.num(k.targetAltitudeDeg, 1) + '°';
+  $('skyX').textContent = k.airmass === null ? 'n/a' : fmt.num(k.airmass, 2);
+  $('skySun').textContent = k.sunAltitudeDeg === null ? 'n/a' : fmt.num(k.sunAltitudeDeg, 1) + '°';
   $('skyMoon').textContent = k.moonSkyFactor ? fmt.num(k.moonSkyFactor, 2) : 'none';
 }
 
@@ -851,7 +851,7 @@ $('capture').onclick = async () => {
     $('capturePanel').hidden = false;
     $('captureImg').src = 'data:image/png;base64,' + data.png;
     $('captureTitle').textContent =
-      `${scope.displayName} — ${currentObjectName()}, ${$('capFilter').value}, ${$('capExp').value} s`;
+      `${scope.displayName}, ${currentObjectName()}, ${$('capFilter').value}, ${$('capExp').value} s`;
     $('captureNote').textContent =
       `${data.width}×${data.height} px · ${fmt.num(data.fovArcmin[0], 1)}′×${fmt.num(data.fovArcmin[1], 1)}′ · ` +
       `${fmt.num(data.plateScaleArcsec, 2)}″/px`;
@@ -871,7 +871,7 @@ $('capture').onclick = async () => {
     $('captureMeta').textContent = bits.join(' · ');
 
     $('captureLinks').innerHTML = data.fitsUrl
-      ? `<a href="${data.fitsUrl}" download>Download FITS</a> <span class="dim">— 16-bit, WCS and MAGZERO in the header; stack in Siril</span>`
+      ? `<a href="${data.fitsUrl}" download>Download FITS</a> <span class="dim">16-bit, WCS and MAGZERO in the header; stack in Siril</span>`
       : '';
     $('captureReport').textContent = '';
   } finally {
@@ -884,7 +884,26 @@ $('capture').onclick = async () => {
 (async () => {
   try {
     const d = await (await fetch('/api/capture/data')).json();
-    $('captureData').textContent = d.files.join(' · ');
+
+    // WARNINGS COME OUT OF THE LIST. They used to be concatenated into it with ' . ', which is
+    // how a real one went unnoticed: the Gaia catalogue's declination index was broken, the
+    // server detected it and said so in as many words, and the sentence sat in the middle of six
+    // file paths in dim grey. Every star field rendered empty for as long as that took to spot.
+    const warnings = d.files.filter(f => /^WARNING/i.test(f));
+    const paths = d.files.filter(f => !/^WARNING/i.test(f));
+
+    $('captureData').textContent = paths.join(' · ');
+    const box = $('captureDataWarnings');
+    if (box) {
+      box.innerHTML = '';
+      for (const w of warnings) {
+        const p = document.createElement('p');
+        p.className = 'dataWarning';
+        p.textContent = w.replace(/^WARNING,?\s*/i, '');
+        box.appendChild(p);
+      }
+      box.style.display = warnings.length ? '' : 'none';
+    }
   } catch { /* endpoint optional */ }
 })();
 
@@ -1614,7 +1633,7 @@ function wireSkyEvents() {
     }
     redrawChart();
     $('zoomBadge').hidden = view.zoom <= 1.001;
-    $('zoomBadge').textContent = `×${view.zoom.toFixed(1)} — double-click to reset`;
+    $('zoomBadge').textContent = `×${view.zoom.toFixed(1)}, double-click to reset`;
   }, { passive: false });
 
   cv.addEventListener('dblclick', () => {

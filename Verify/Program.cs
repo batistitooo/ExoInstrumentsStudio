@@ -18,26 +18,31 @@ using ExoStudio.Data;
 int failures = 0;
 int checks = 0;
 
-// Same source as the server: Directory.Build.props stamps the mod tree this build
-// compiled against into the assembly, so Verify cannot check a different checkout
-// from the one it was compiled from.
+// OPTIONAL, and only section 1 wants it. Studio is a standalone repository, so everything here
+// runs against its own vendored core; the one exception is the boundary stub, which by definition
+// has to be compared against the mod file it stands in for, and that file (the 6400-line Unity
+// camera) is not vendored. Without a mod checkout that section is skipped and says so, rather than
+// the whole harness refusing to start, which is what it used to do.
 string modRoot = Arg("--mod")
-    ?? Environment.GetEnvironmentVariable("EXOINSTRUMENTS_MOD")
-    ?? System.Reflection.Assembly.GetExecutingAssembly()
-        .GetCustomAttributes(typeof(System.Reflection.AssemblyMetadataAttribute), false)
-        .Cast<System.Reflection.AssemblyMetadataAttribute>()
-        .FirstOrDefault(a => a.Key == "ModRoot")?.Value
-    ?? throw new InvalidOperationException("ModRoot unknown; set EXOINSTRUMENTS_MOD or pass --mod.");
-string catalogPath = Arg("--catalog") ?? Path.Combine(modRoot, "PluginData", "ExoplanetCatalog.csv");
+    ?? Environment.GetEnvironmentVariable("EXOINSTRUMENTS_MOD");
+
+// The exoplanet catalogue ships in this repository; see CatalogService.LocateCatalog.
+string catalogPath = Arg("--catalog") ?? LocateCatalogue();
 
 Console.WriteLine();
 Console.WriteLine("ExoInstruments Studio - verification");
-Console.WriteLine($"mod       {modRoot}");
+Console.WriteLine($"mod       {modRoot ?? "(none given; section 1 will be skipped)"}");
 Console.WriteLine($"catalogue {catalogPath}");
 
 // =====================================================================================
 Section("1. Boundary stub matches the mod");
 // =====================================================================================
+if (modRoot == null)
+{
+    Console.WriteLine("    no mod checkout given, so the stub cannot be compared against what it stands in for.");
+    Console.WriteLine("    Pass --mod <path> or set EXOINSTRUMENTS_MOD to run this section.");
+}
+else
 {
     string cameraSource = File.ReadAllText(Path.Combine(modRoot, "Visualization", "SolarSystemCameraTexture.cs"));
     Match m = Regex.Match(cameraSource, @"public\s+enum\s+CameraFilter\s*\{(?<body>[^}]*)\}", RegexOptions.Singleline);
@@ -223,12 +228,17 @@ Section("6. The streaming Gaia reader against the mod's own");
     // GaiaCatalogReader is the one place Studio duplicates a format the mod owns: the
     // all-sky chart needs every star once, and RenderedStarCatalog only answers cones.
     // A duplicate decoder is a drift hazard, so it is pinned here rather than trusted.
+    // Looked for where Studio itself looks, not in a mod checkout: this repository stands alone.
     string starcat = new[]
     {
-        Path.Combine(modRoot, "PluginData", "GaiaStarCatalog.starcat"),
-        Path.GetFullPath(Path.Combine(modRoot, "..", "..", "_preinstall-backup-2026-08-12",
-                                      "ExoInstruments-GameData", "PluginData", "GaiaStarCatalog.starcat")),
-    }.FirstOrDefault(File.Exists);
+        Environment.GetEnvironmentVariable("EXOINSTRUMENTS_STARCAT"),
+        Environment.GetEnvironmentVariable("EXOINSTRUMENTS_DATA") is string dataDir
+            ? Path.Combine(dataDir, "GaiaStarCatalog.starcat") : null,
+        Path.Combine(Path.GetDirectoryName(catalogPath) ?? ".", "GaiaStarCatalog.starcat"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                     "Library/Application Support/Steam/steamapps/common/Kerbal Space Program",
+                     "GameData/ExoInstruments/PluginData/GaiaStarCatalog.starcat"),
+    }.FirstOrDefault(p => p != null && File.Exists(p));
 
     if (starcat == null)
     {
@@ -341,3 +351,26 @@ static string Arg(string flag)
     return i >= 0 && i + 1 < a.Length ? a[i + 1] : null;
 }
 
+
+
+/// <summary>
+/// The exoplanet catalogue, which ships in this repository under data/. Studio's own
+/// CatalogService does the same walk; it is repeated here rather than referenced because this
+/// harness deliberately compiles a slice of the engine and not its web host.
+/// </summary>
+static string LocateCatalogue()
+{
+    foreach (string c in new[]
+    {
+        Path.Combine(AppContext.BaseDirectory, "data", "ExoplanetCatalog.csv"),
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "data", "ExoplanetCatalog.csv"),
+        Path.Combine(Directory.GetCurrentDirectory(), "data", "ExoplanetCatalog.csv"),
+        Path.Combine(Directory.GetCurrentDirectory(), "..", "data", "ExoplanetCatalog.csv"),
+    })
+    {
+        string full = Path.GetFullPath(c);
+        if (File.Exists(full)) return full;
+    }
+    throw new FileNotFoundException(
+        "ExoplanetCatalog.csv not found. It ships in this repository under data/; pass --catalog <path>.");
+}

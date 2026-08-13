@@ -29,12 +29,22 @@ astropy 6.0.1, on the vendored core described in [CORE_PROVENANCE.md](CORE_PROVE
 | Diffraction, annular pupil | POPPY 1.1.1 | encircled energy **0.002 %**, FWHM **0.13 %** | sound |
 | Diffraction spikes, 4 vanes | POPPY 1.1.1 | spike/background contrast **0.1 %** typical | sound |
 | Kolmogorov seeing profile | GalSim 2.8.5 | core **2.3e-4**, FWHM constant **0.03 %** | sound |
-| Delivered PSF, sampled instruments | GalSim 2.8.5 | FWHM **0.06 to 0.10 %**, EE **0.3 to 0.5 %** | sound |
-| Delivered PSF, **undersampled** | GalSim 2.8.5 | EE within 0.5 FWHM **+16.8 %** | **known error, quantified below** |
+| Delivered PSF, all four instruments | GalSim 2.8.5 | FWHM **0.04 to 0.98 %**, EE **0.5 to 1.3 %** | sound |
+| Aperture correction, **undersampled** | GalSim 2.8.5 | **+0.5 %** (was +58.7 %) | **fixed, see below** |
 | Extinction law F99 | dust_extinction 1.5 | **4e-11** | exact to machine noise |
 | Extinction scaling with E(B-V) | dust_extinction 1.5 | **1e-16** | exact |
-| Pointing altitude | Skyfield 1.55 | RMS **0.35 deg**, worst **0.61 deg** | **known omission, see below** |
-| Airmass | Kasten & Young 1989 | max **0.69 %** above 20 deg | acceptable, see below |
+| Pointing altitude | Skyfield 1.55 | RMS **0.0040 deg** (was 0.35) | **fixed, see below** |
+| Airmass | Kasten & Young 1989 | **0.000 %** | exact |
+
+Three of these were failures when this document was first written. They were fixed rather than
+documented, and both the before and the after are given below, because a number that moved is
+worth more than a number that was always green.
+
+| fixed | before | after | gain |
+|---|---|---|---|
+| Aperture correction, RedCat 51 | +58.7 % | **+0.5 %** | 117x |
+| Pointing RMS against Skyfield | 0.3493 deg | **0.0040 deg** | 87x |
+| Airmass against Kasten & Young | 0.69 % | **0.000 %** | exact |
 
 ## 1. Diffraction, against POPPY
 
@@ -84,32 +94,62 @@ matched FWHM, which would fold a convention into a physics measurement.
 | FWHM = k lambda/r0, k measured on both | 0.975540 against 0.975863 (**0.033 %**) |
 
 **Delivered PSF**, diffraction convolved with atmosphere, on the kernel grid the renderer actually
-uses:
+uses, against a pixel-integrated GalSim draw:
 
-| instrument | px per FWHM | FWHM diff | EE 0.5 FWHM | EE 2 FWHM | max per-pixel |
-|---|---|---|---|---|---|
-| RC20 | 9.25 | 0.10 % | 0.52 % | 0.42 % | 7.1e-4 |
-| CDK1000 | 7.51 | 0.06 % | 0.30 % | 0.29 % | 4.7e-2 |
-| FORS2 | 5.44 | n/a | 1.1 % | n/a | 9.3e-3 |
-| **RedCat 51** | **1.17** | **2.57 %** | **16.78 %** | **3.64 %** | 2.5e-2 |
+| instrument | px per FWHM | FWHM diff | EE 0.5 FWHM | max per-pixel |
+|---|---|---|---|---|
+| RedCat 51 | 1.17 | **0.04 %** | 0.53 % | 3.1e-4 |
+| RC20 | 9.25 | 0.43 % | 0.88 % | 3.0e-3 |
+| CDK1000 | 7.51 | 0.55 % | 0.85 % | 3.9e-3 |
+| FORS2 | 5.44 | 0.98 % | **1.34 %** | 7.2e-3 |
 
-### The RedCat failure is real, and here is what it costs
+### The pixel is not a point, and it used to be treated as one
 
-Six checks fail, all on the RedCat 51, and they are not a tuning problem. Studio **point-samples**
-the PSF at pixel centres; GalSim **integrates** it over the pixel. At 9.25 pixels per FWHM the two
-are the same thing to half a percent. At **1.17 pixels per FWHM** they are not: the RedCat's PSF is
-barely wider than one pixel, and point-sampling a peaked function on a grid that coarse
-overestimates how much light lands in the central pixel.
+This was the largest error in the project, and it is worth stating what it was before saying that
+it is fixed.
 
-The consequence is stated rather than hidden: the aperture correction at 0.5 FWHM is **+60.5 %
-optimistic** on the RedCat, against +0.9 % on the RC20 and +1.3 % on FORS2. That propagates
-directly into `CcdEquation`, whose encircled-energy term sets the signal-to-noise of every point
-source. **RedCat 51 photometry and limiting magnitudes are optimistic by roughly that amount.** The
-other three instruments are unaffected because they are properly sampled.
+`OpticalPsf` sampled every profile at **pixel centres**. A detector pixel **integrates** the light
+falling anywhere inside its area. The two agree when the PSF changes little across one pixel and
+diverge badly when it does not, so the error scaled with how badly an instrument undersamples:
 
-Section 5 of the harness attributes the remaining disagreement: the atmospheric term alone matches
-GalSim to 2.5e-4 on the same grid, so the whole of the error is in how the diffraction term is
-sampled, not in the turbulence physics.
+| instrument | px per FWHM | EE 0.5 FWHM, then | pixel-integrated truth | error |
+|---|---|---|---|---|
+| **RedCat 51** | **1.17** | 0.861 | 0.536 | **+58.7 %** |
+| RC20 | 9.25 | 0.421 | 0.418 | +0.9 % |
+| FORS2 | 5.44 | 0.399 | 0.394 | +1.3 % |
+
+That is an aperture correction, and it lands directly in `CcdEquation`, whose encircled-energy term
+sets the signal-to-noise of every point source. The RedCat 51's photometry and limiting magnitudes
+were optimistic by 59 %.
+
+**The fix.** `BuildKernel` now builds the whole chain on a grid `super` times finer and sums each
+block of `super x super` sub-pixels into one detector pixel, which is the midpoint rule for the
+integral over that pixel. It is applied **once to the finished chain**, not per component: pixel
+response is itself a convolution, so integrating each term separately would apply it as many times
+as there are terms. `super` is odd, so the fine grid keeps a sample exactly on the optical axis.
+
+Two details that are not arbitrary:
+
+- **The radial path always supersamples, at least 3x.** Pixel integration is not only for
+  undersampled instruments: on the atmospheric term alone the mean over a pixel differs from the
+  value at its centre by 0.43 % on the RC20 at 9.1 px per FWHM and 1.10 % on FORS2 at 5.4. Those
+  are aperture corrections too, and the path is a lookup table, so they cost almost nothing.
+- **The two-dimensional pupil path does not.** It already averages over the pixel it is asked for,
+  and supersampling it was **measured** at over 230x slower, 2.6 seconds becoming more than 600 on
+  the four-instrument dump, because the pupil sum is quadratic in the grid and runs twelve times
+  for the chromatic kernel. What that would have bought is FORS2's last 1.3 %.
+
+A second, smaller error surfaced with it. The diffraction term's support was three Airy FWHM, which
+is generous for a Gaussian and mean for a profile whose envelope falls as theta^-3: the energy left
+outside a radius R falls only as 1/R, so truncating there and renormalising moves real flux into
+the core. On a well-sampled instrument that is 0.2 to 0.5 %; on the RedCat, whose Airy FWHM is
+0.6 of a pixel, three of them is a support of two pixels and the same truncation was worth 24 %.
+The support now has a floor of 12 pixels.
+
+Convergence was measured rather than assumed: the residual on the atmospheric term falls 0.44,
+0.23, 0.16, 0.14, 0.12 % at 5, 9, 15, 21 and 31 sub-samples per FWHM, flattening toward a floor of
+about 0.1 % that is the difference between the two codes' profiles rather than the integration. The
+shipped setting is 15.
 
 **Chromatic scaling** is exact: seeing FWHM ~ lambda^(-1/5) and r0 ~ lambda^(6/5) reproduce
 GalSim's own values to 0.0000 % across 400 to 800 nm.
@@ -145,37 +185,66 @@ reports an unrefracted altitude.
 160 pointings: 8 targets from M31 to the LMC, 5 sites from Mauna Kea to Paranal, 4 epochs through
 2026.
 
-| quantity | value |
-|---|---|
-| mean offset | -0.0012 deg |
-| RMS | **0.3493 deg** (20.96 arcmin) |
-| worst | **0.6090 deg** (36.54 arcmin) |
+| quantity | before | after |
+|---|---|---|
+| mean offset | -0.0012 deg | +0.0015 deg |
+| RMS | 0.3493 deg (20.96') | **0.0040 deg (0.24')** |
+| worst | 0.6090 deg (36.54') | **0.0076 deg (0.45')** |
 
-**This is the missing precession, and the numbers say so.** Studio turns the sky with a uniform
-sidereal rotation anchored on GMST at J2000 and treats catalogue coordinates as of-date: no
-precession, no nutation, no aberration. Precession from J2000 to 2026 moves a star by about
-0.36 deg, which is the RMS measured. Three independent signatures confirm the diagnosis rather
-than leaving it a guess:
+### Two errors, both found by this comparison
 
-- the **mean offset is -0.001 deg**, so there is no zero-point error in the sidereal clock; the
-  transform itself is right and the error is in the star positions;
-- the RMS **grows monotonically through the year**, 0.3319, 0.3457, 0.3593, 0.3595 deg, which is
-  precession accumulating;
-- the error is **smallest near the pole of the ecliptic-to-equator motion**: LMC 0.077 deg worst,
-  Polaris 0.158 deg, against 0.609 deg at the galactic centre.
+**The first was missing precession.** Every catalogue here gives positions at J2000 and the
+equatorial-to-horizontal transform wants coordinates of date, and nothing precessed between them.
+Precession from J2000 to 2026 moves a star by about 0.36 degrees, which was the RMS measured.
+`SkyCoordinates.PrecessFromJ2000` now applies the IAU 1976 rotation, the rigorous one rather than
+the small-angle form, so it does not degrade near the pole.
 
-**Does it matter?** For what Studio does, no. It schedules against a 20 deg altitude limit and
-images fields tens of arcminutes wide, and 0.35 deg changes no scheduling decision and moves no
-target out of a frame. For arcsecond astrometry it would be disqualifying. The distinction is the
-point: this is a stated limit, not a hidden one.
+**Where it is applied is the interesting part, and the first attempt was wrong.** The image is
+rendered in the catalogues' own frame, J2000, because Gaia, HyperLEDA and the galactic-coordinate
+emission maps are all J2000 and that is what keeps every source in a frame consistent with every
+other. Only the Earth-relative numbers, altitude and airmass and the scheduler, are of date.
+
+Precessing the boresight while leaving the sources alone looked reasonable and was not: `DepositStars`
+projects each star from its OWN coordinates through the same transform, so the field and its
+contents ended up in different frames. The star field slid by 0.27 degrees and an RC20 frame
+0.32 degrees wide went from 63 stars to **1**. Regenerating this repository's own README images is
+what caught it.
+
+What the split leaves is the layout frame's zenith sitting up to 0.36 degrees from the true one,
+which reaches the image only through the direction of atmospheric dispersion and of the trail. A
+third of a degree of position angle is far below one pixel.
+
+That took the RMS to 0.156 deg, and left something behind.
+
+**The second was 64 seconds of sidereal time, and the residual's shape is what found it.** The
+mean offset stayed near zero while the RMS did not, the error vanished on Polaris and was worst on
+the celestial equator, and it no longer grew through the year. That is the signature of a rotation
+about the polar axis, not of a broken transform, so the sidereal clock was compared against
+Skyfield's directly: **+64.58 seconds, identical at every site and every epoch.**
+
+The cause is a genuine confusion of two epochs that share a name. `280.46061837` is GMST at
+JD 2451545.0 **UT1**, which is 2000-01-01 12:00:00 UT1. This project's clock starts at J2000.0 the
+**dynamical** epoch, JD 2451545.0 TT, which is 2000-01-01 11:58:55.816 UTC. Those are different
+instants, 64.184 seconds apart, because TT ran that far ahead of UTC in 2000. Anchoring the UT1
+constant at the TT epoch turned the whole sky by 0.268 degrees. `GmstAtJ2000Deg` is now
+`280.19394027`, GMST at the instant this clock actually starts.
+
+**What is left is 14 arcseconds RMS**, and it is the right size for what is still not modelled:
+nutation reaches 17 arcseconds and annual aberration 20.5, and neither is applied. Proper motion is
+not applied either. For an instrument that schedules against a 20 degree altitude limit and images
+fields arcminutes wide, that is far below anything a pixel could show.
 
 ## 5. Airmass, against Kasten & Young
 
-Studio's airmass is **exactly plane-parallel sec z** (0.000 % difference over 53 pointings above
-20 deg). Against the Kasten & Young (1989) relation an observatory would quote, it departs by at
-most **0.69 %**, median 0.12 %. The error grows toward the horizon, which is where sec z is known
-to fail; above 20 deg it stays inside a percent, and every extinction and sky-brightness term that
-multiplies by it inherits that.
+Studio's airmass **is** the Kasten & Young (1989) relation, agreeing to 0.000 % over 53 pointings
+above 20 degrees.
+
+It used to be plane-parallel `sec z`, whose own comment claimed better than 1 % above the telescope
+floor. Measured, that was 0.69 % at 20 degrees and worsening fast below, because `sec z` treats the
+atmosphere as a flat slab and diverges at the horizon where the true airmass tops out near 38. This
+term multiplies every extinction and sky-brightness figure in a frame, so it was worth having right
+rather than nearly right. The two now differ by 0.705 % at worst over the same pointings, which is
+the size of the error that was removed.
 
 ## What is NOT validated here
 
@@ -193,7 +262,15 @@ Stated so the table above is not read as more than it is.
   the Veil comparison in the README.
 - **Galaxy rendering.** GalSim can validate Sersic profiles and does not, here; the galaxy path
   uses measured survey imagery where it exists, which is not a profile at all.
-- **The mod's `skyfield-tests` harness** no longer compiles against current Core
-  (`PhotonFluxModel.CollectedElectrons` was renamed and `SkyBrightnessModel` now takes a
-  `SystemResponse`). It was not carried over; section 4 replaces it with a comparison that
-  exercises Studio's own scheduling path instead.
+- **Nutation, aberration and proper motion** are not applied to pointing. Together they are the
+  14 arcseconds left in section 4.
+- **FORS2's last 1.3 %** on encircled energy within half a FWHM. Closing it means supersampling the
+  two-dimensional pupil path, measured at over 230x slower, which is not worth it; see section 2.
+
+The mod's own `tools/skyfield-tests` harness had bit-rotted and no longer compiled against current
+Core. It was not carried into this repository, but it has been repaired in the mod rather than left
+broken: `CollectedElectrons` had become `CollectedElectronsGreyBand`, `SkyBrightnessModel` had
+started taking a `SystemResponse`, `StellarPhotometry.CollectedElectrons` had lost four arguments,
+`PointSource.SignalFraction` had become `SignalElectrons`, `DepositStars` had traded a full-well
+and a fraction for an absolute electron cutoff, and four files of the transit chain were missing
+from its project. All 31 of its checks pass again.

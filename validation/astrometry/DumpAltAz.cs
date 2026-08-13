@@ -56,8 +56,15 @@ static class DumpAltAz
 
             foreach (Target t in targets)
             {
+                // Precessed first, exactly as DeepSkyCamera precesses the boresight before it
+                // converts. The catalogue coordinates below are J2000 and the transform wants
+                // coordinates of date.
+                SkyCoordinates.PrecessFromJ2000(t.RaDeg, t.DecDeg,
+                    ut * SkyCoordinates.JulianCenturiesPerSecond,
+                    out double raOfDate, out double decOfDate);
+
                 HorizontalCoordinates h = SkyCoordinates.EquatorialToHorizontal(
-                    t.RaDeg, t.DecDeg, meridianRa, site.LatitudeDeg);
+                    raOfDate, decOfDate, meridianRa, site.LatitudeDeg);
                 double airmass = ImagingObservingConditions.AirmassAt(h.AltitudeDeg);
                 w.WriteLine(string.Join(",", new[]
                 {

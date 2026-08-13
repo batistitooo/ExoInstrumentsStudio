@@ -66,14 +66,24 @@ including where it is large.
 |---|---|---|
 | Diffraction, annular pupil | POPPY 1.1.1 | encircled energy **0.002 %** |
 | Kolmogorov seeing | GalSim 2.8.5 | profile core **2.3e-4**, FWHM constant **0.03 %** |
-| Delivered PSF, sampled instruments | GalSim 2.8.5 | FWHM **0.06 to 0.10 %** |
+| Delivered PSF, four instruments | GalSim 2.8.5 | FWHM **0.04 to 0.98 %** |
 | Extinction law F99 | dust_extinction 1.5 | **4e-11** |
-| Pointing altitude | Skyfield 1.55 | RMS **0.35 deg** |
+| Pointing altitude | Skyfield 1.55 | RMS **0.0040 deg** (14 arcsec) |
+| Airmass | Kasten & Young 1989 | **0.000 %** |
 
-The last two rows of that table in the full document are failures, and they are the reason to read
-it: the RedCat 51 is undersampled at 1.17 px per FWHM and its aperture correction is **60 %
-optimistic**, and pointing carries no precession, which is worth 0.35 degrees in 2026. Both are
-quantified rather than mentioned.
+**Three of those were failures, and measuring them is what fixed them.** The document keeps the
+before and the after:
+
+| | before | after |
+|---|---|---|
+| Aperture correction, RedCat 51 | +58.7 % | **+0.5 %** |
+| Pointing RMS | 0.3493 deg | **0.0040 deg** |
+| Airmass | 0.69 % off | **exact** |
+
+The PSF was sampled at pixel centres where a detector integrates over the pixel, which cost an
+undersampled instrument 59 % of its aperture correction and its signal-to-noise with it. Pointing
+applied no precession, and under that sat 64 seconds of sidereal time from anchoring a UT1 constant
+at a TT epoch. Both are described in full, including the residuals that remain.
 
 ## The big sky maps
 

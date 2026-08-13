@@ -241,8 +241,11 @@ namespace ExoStudio.Simulation
                         ImagingObservingConditions.ComputeSunRaDeg(t, siteCtx), 0.0,
                         mer, req.Site.LatitudeDeg).AltitudeDeg;
                     if (sunAltAtT >= ImagingObservingConditions.TwilightSunAltitudeDeg) continue;
+                    SkyCoordinates.PrecessFromJ2000(req.RaDeg, req.DecDeg,
+                        t * SkyCoordinates.JulianCenturiesPerSecond,
+                        out double raAtT, out double decAtT);
                     double alt = SkyCoordinates.EquatorialToHorizontal(
-                        req.RaDeg, req.DecDeg, mer, req.Site.LatitudeDeg).AltitudeDeg;
+                        raAtT, decAtT, mer, req.Site.LatitudeDeg).AltitudeDeg;
                     if (alt > bestAlt) { bestAlt = alt; bestUt = t; }
                 }
                 if (double.IsNaN(bestUt) || bestAlt <= ImagingObservingConditions.MinTelescopeAltitudeDeg)
@@ -260,12 +263,38 @@ namespace ExoStudio.Simulation
                 obsUt, ObservingSites.EarthSiderealDaySeconds, ObservingSites.GmstAtJ2000Deg,
                 req.Site.LongitudeDeg);
 
+            // TWO FRAMES, ON PURPOSE, AND THE SPLIT IS WHERE IT IS FOR A REASON.
+            //
+            // THE IMAGE IS RENDERED IN THE CATALOGUES' OWN FRAME, J2000. Gaia, HyperLEDA and the
+            // galactic-coordinate emission maps are all J2000, so laying the field out in J2000
+            // is what keeps every source in the frame consistent with every other, and it is what
+            // the FITS WCS then honestly declares.
+            //
+            // THE EARTH-RELATIVE NUMBERS ARE OF DATE, because the sky has moved since J2000 and
+            // altitude, airmass and scheduling are properties of where a target is TONIGHT.
+            // Measured against Skyfield, not precessing them was 0.35 deg RMS.
+            //
+            // MIXING THE TWO IS THE TRAP, and it was not hypothetical: precessing the boresight
+            // while DepositStars went on projecting each star from its own J2000 position put the
+            // field and its contents in different frames. The whole star field slid by 0.27 deg
+            // and an RC20 frame 0.32 deg wide went from 63 stars to 1. So the projection below
+            // takes the J2000 altitude and nothing else does.
+            //
+            // What that leaves is the layout frame's zenith being up to 0.36 deg from the true
+            // one, which reaches the image only through the direction of atmospheric dispersion
+            // and of the trail. A third of a degree of position angle is far below a pixel.
             HorizontalCoordinates altAz = SkyCoordinates.EquatorialToHorizontal(
                 req.RaDeg, req.DecDeg, meridianRa, req.Site.LatitudeDeg);
-            res.TargetAltitudeDeg = altAz.AltitudeDeg;
+
+            SkyCoordinates.PrecessFromJ2000(req.RaDeg, req.DecDeg,
+                obsUt * SkyCoordinates.JulianCenturiesPerSecond,
+                out double aimRaOfDate, out double aimDecOfDate);
+            HorizontalCoordinates altAzOfDate = SkyCoordinates.EquatorialToHorizontal(
+                aimRaOfDate, aimDecOfDate, meridianRa, req.Site.LatitudeDeg);
+            res.TargetAltitudeDeg = altAzOfDate.AltitudeDeg;
 
             double zenithDistance = 90.0 - altAz.AltitudeDeg;
-            double airmass = ImagingObservingConditions.AirmassAt(altAz.AltitudeDeg);
+            double airmass = ImagingObservingConditions.AirmassAt(altAzOfDate.AltitudeDeg);
             res.AirmassX = airmass;
 
             // Boresight frame with up toward the zenith, exactly as the harness builds it; the
@@ -376,6 +405,7 @@ namespace ExoStudio.Simulation
             {
                 var stars = new List<RenderedStar>();
                 data.Stars.Search(req.RaDeg, req.DecDeg, fieldRadiusDeg * 1.3, 30.0, stars);
+
                 var reddening = new ReddenedResponseCache(response);
                 double exposure = req.ExposureSeconds;
                 double starTransmission = nonAtmTransmission * starScint;

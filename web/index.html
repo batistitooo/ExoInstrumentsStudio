@@ -47,7 +47,7 @@
     <section class="block" id="targetCard" hidden>
       <div class="tcard">
         <div class="tcard-head">
-          <h2 id="tName">—</h2>
+          <h2 id="tName">n/a</h2>
           <span class="pill" id="tStatus"></span>
         </div>
         <p class="tcard-sub" id="tSub"></p>
@@ -84,7 +84,7 @@
       <div class="coolrow" id="coolRow" hidden>
         <div class="coolhead">
           <label class="lbl" for="capTemp">Detector cooling</label>
-          <output class="mono coolval" id="capTempOut">—</output>
+          <output class="mono coolval" id="capTempOut">n/a</output>
         </div>
         <input id="capTemp" type="range" step="1">
         <p class="hint" id="coolHint"></p>
@@ -92,7 +92,7 @@
       <div class="coolrow" id="zoomRow" hidden>
         <div class="coolhead">
           <label class="lbl" for="capZoom">Barlow</label>
-          <output class="mono coolval" id="capZoomOut">—</output>
+          <output class="mono coolval" id="capZoomOut">n/a</output>
         </div>
         <input id="capZoom" type="range" min="1" max="4" step="0.05" value="1">
         <p class="hint" id="zoomHint"></p>
@@ -109,19 +109,19 @@
       <div class="clockmain">
         <div class="stat">
           <span class="stat-lbl">Observatory clock</span>
-          <span class="stat-val big mono" id="clockDate">—</span>
+          <span class="stat-val big mono" id="clockDate">n/a</span>
         </div>
         <div class="stat">
           <span class="stat-lbl">Programme baseline</span>
-          <span class="stat-val mono" id="baseline">—</span>
+          <span class="stat-val mono" id="baseline">n/a</span>
         </div>
         <div class="stat">
           <span class="stat-lbl">Epochs collected</span>
-          <span class="stat-val mono" id="epochs">—</span>
+          <span class="stat-val mono" id="epochs">n/a</span>
         </div>
         <div class="stat">
           <span class="stat-lbl">Real time spent</span>
-          <span class="stat-val mono" id="wall">—</span>
+          <span class="stat-val mono" id="wall">n/a</span>
         </div>
       </div>
 
@@ -197,13 +197,13 @@
     <div class="panel sky" id="skyPanel" hidden>
       <div class="skystrip">
         <span class="skylight" id="skyLight"></span>
-        <span class="skytext" id="skyText">—</span>
+        <span class="skytext" id="skyText">n/a</span>
       </div>
       <div class="skynums mono">
-        <span><i>alt</i> <b id="skyAlt">—</b></span>
-        <span><i>airmass</i> <b id="skyX">—</b></span>
-        <span><i>Sun</i> <b id="skySun">—</b></span>
-        <span><i>moonlight</i> <b id="skyMoon">—</b></span>
+        <span><i>alt</i> <b id="skyAlt">n/a</b></span>
+        <span><i>airmass</i> <b id="skyX">n/a</b></span>
+        <span><i>Sun</i> <b id="skySun">n/a</b></span>
+        <span><i>moonlight</i> <b id="skyMoon">n/a</b></span>
       </div>
     </div>
 
@@ -216,6 +216,10 @@
       <p class="hint" id="captureMeta"></p>
       <p class="hint" id="captureLinks"></p>
       <p class="hint dim" id="captureReport"></p>
+      <!-- Data problems go ABOVE the file list, and are not dim. See app.js: a broken Gaia
+           declination index was reported here for hours in grey, run together with six file
+           paths, while every star field came out empty. -->
+      <div id="captureDataWarnings" style="display:none"></div>
       <p class="hint dim" id="captureData"></p>
     </div>
 

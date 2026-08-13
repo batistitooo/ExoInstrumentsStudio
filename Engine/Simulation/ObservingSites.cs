@@ -33,8 +33,26 @@ namespace ExoStudio.Simulation
         /// <summary>Earth's sidereal rotation period (s). The solar day is 86400; sidereal time is what sets when a star transits.</summary>
         public const double EarthSiderealDaySeconds = 86164.0905;
 
-        /// <summary>Greenwich Mean Sidereal Time at J2000.0, in degrees. Anchors RA to the real sky at UT = 0.</summary>
-        public const double GmstAtJ2000Deg = 280.46061837;
+        /// <summary>
+        /// Greenwich Mean Sidereal Time at this project's UT = 0, in degrees. Anchors RA to the
+        /// real sky.
+        ///
+        /// NOT 280.46061837, AND THE DIFFERENCE IS A REAL 64 SECONDS. That famous constant is GMST
+        /// at JD 2451545.0 UT1, which is 2000-01-01 12:00:00 UT1. This project's clock starts at
+        /// J2000.0 the DYNAMICAL epoch, JD 2451545.0 TT, which is 2000-01-01 11:58:55.816 UTC
+        /// (SimulationClock.J2000Utc). Those are two different instants, 64.184 seconds apart,
+        /// because TT ran that far ahead of UTC in 2000.
+        ///
+        /// Using the UT1 constant at the TT epoch turned the whole sky by 64 seconds of sidereal
+        /// time, 0.268 degrees, at every site and every date. Measured against Skyfield it was a
+        /// pointing error of 0.156 deg RMS with the mean offset near zero, which is the signature
+        /// of a rotation about the polar axis rather than of a broken transform: it vanished on
+        /// Polaris and was worst on the celestial equator.
+        ///
+        /// The value below is GMST at 2000-01-01 11:58:55.816 UTC, where this clock's zero
+        /// actually is, taken from Skyfield.
+        /// </summary>
+        public const double GmstAtJ2000Deg = 280.19394027;
 
         /// <summary>Earth's sidereal orbital period (s).</summary>
         public const double EarthSiderealYearSeconds = 365.256363004 * 86400.0;
