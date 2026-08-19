@@ -156,12 +156,68 @@ reads as data rather than as absence. `Simulation/StarFieldCatalogs.cs` removes 
   index contradicts its records, checked exactly by reading them. That last one is the fault that
   renders an empty sky while the file loads, counts and decodes perfectly.
 
+Measured on this machine, RC20, 300 s, binning 4, before and after installing G < 21 patches of
+0.6 degree radius:
+
+| field | with the G < 13 catalogue alone | with a patch |
+|---|---|---|
+| M51 | 3 stars | 594 |
+| M31 | 16 | 6,059 |
+| M42 | 68 | 1,435 |
+| Veil | 44 | 7,293 |
+| Carina | 178 | 15,050 |
+| Omega Centauri | 761 | 94,354 |
+
+All six patches together are 9.1 MB.
+
 Build them with `tools/fetch_star_patch.py`, which writes the coverage line from the arguments it
 actually passed to the packer rather than leaving it to be typed in afterwards:
 
 ```bash
 python3 tools/fetch_star_patch.py --name M51 --ra 202.4696 --dec 47.1952 --radius 0.5 --gmax 20 --fov-arcmin 19.0 13.0
 ```
+
+### When the query service will not answer
+
+TAP has job queues and per account limits, and a burst of legitimate queries can leave it
+resetting connections for hours. `--via cdn` reads Gaia's bulk release instead, which is 3,386
+static gzipped files on a CDN with no queue to be stuck in. The release is cut on HEALPix level 8,
+so one file is a contiguous patch of sky and a field needs one or two of them rather than the
+whole 753 GB.
+
+The two routes are not approximations of each other, and that is checked rather than asserted:
+the M51 field at G < 20 is 1,332 stars by `SELECT COUNT(*)` on `gaiadr3.gaia_source`, 1,332 read
+out of the bulk files, and the catalogues the two produce are byte for byte identical. Rows go
+into the mod's packer either way, so Gaia's photometric relations stay in the one place that owns
+them.
+
+Bulk files are kept in `tools/gaia_bulk_cache/` and reused, so a second field in the same patch of
+sky costs nothing. `--discard-bulk` throws them away instead.
+
+### A fault this found
+
+`tools/reindex_starcat.py` repairs a catalogue whose declination index the reader cannot follow.
+That is not hypothetical: the packer bands stars with `DEC_BAND_WIDTH_DEG = 0.1`, the file stores
+that width as a 4 byte float which reads back as 0.100000001490116119384765625, and
+`RenderedStarCatalog` bands with the stored value. A star landing within a part in ten million of
+a band edge goes into a band no search reads, and is permanently invisible while the file loads,
+counts and decodes perfectly. Measured: 2 of 99,263 stars in the Veil patch, and 83 of 7,369,627
+in a G < 13 all sky catalogue.
+
+The root fix is one line in the packer, banding on the float32 value it is about to write:
+
+```python
+DEC_BAND_WIDTH_DEG = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+```
+
+That cannot recover files already built, which is what the repair tool is for. It re-files every
+record by the reader's own rule, changes no photometry or position, and verifies the result before
+replacing anything.
+
+`--gmax` is a cut, not a promise of completeness. Gaia DR3 is complete to about G = 20.7 for
+isolated sources and thins out beyond, so a patch cut at 21 holds every source the archive has
+under that magnitude while the archive no longer holds every star. That is still the right thing
+to ask for, since the missing ones are below what the instrument resolves anyway.
 
 `--fov-arcmin` is worth passing: it computes the radius the frame actually needs, which is half its
 diagonal times the camera's 1.3 search margin, and refuses anything smaller. Record the base's own

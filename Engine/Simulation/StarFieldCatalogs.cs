@@ -52,13 +52,20 @@ namespace ExoStudio.Simulation
         public double RadiusDeg { get; init; }
 
         /// <summary>
-        /// The completeness limit the archive was asked for, in GAIA G, not in Johnson V.
+        /// The magnitude cut the build applied, in GAIA G, not in Johnson V.
         ///
-        /// The distinction is not pedantry: the packer filters on phot_g_mean_mag and then
-        /// converts to V through Gaia's own colour relation, so a file built at G &lt; 20 holds
-        /// stars whose stored V runs both sides of 20. G is what completeness is defined against,
-        /// so G is what is recorded and compared. NaN means the build did not say, which is
-        /// treated as the shallowest possible depth so that any declared layer outranks it.
+        /// The band matters and is not pedantry: the packer filters on phot_g_mean_mag and then
+        /// converts to V through Gaia's own colour relation, so a file cut at G &lt; 20 holds
+        /// stars whose stored V runs both sides of 20. G is what the cut was made in, so G is
+        /// what is recorded and compared.
+        ///
+        /// It is a CUT, not a promise of completeness, and the two part company at the faint
+        /// end: Gaia DR3 is complete to about G = 20.7 for isolated sources and thins out
+        /// beyond, so a file cut at 21 holds every source the archive has under that magnitude
+        /// while the archive itself no longer holds every star. Ranking layers by it is still
+        /// exactly right, since a deeper cut of the same release is a superset of a shallower
+        /// one. NaN means the build did not say, which is treated as the shallowest possible
+        /// depth so that any declared layer outranks it.
         /// </summary>
         public double GaiaGLimit { get; set; }
 
@@ -129,7 +136,7 @@ namespace ExoStudio.Simulation
                 ? $"all sky, {Count:N0} stars"
                 : $"{Name}, {Count:N0} stars over {RadiusDeg:0.###} deg at "
                   + $"{CentreRaDeg:0.####} {CentreDecDeg:+0.####;-0.####}"
-                  + (double.IsNaN(GaiaGLimit) ? "" : $", complete to G < {GaiaGLimit:0.##}");
+                  + (double.IsNaN(GaiaGLimit) ? "" : $", cut at G < {GaiaGLimit:0.##}");
     }
 
     /// <summary>
@@ -219,7 +226,7 @@ namespace ExoStudio.Simulation
                     if (f.Length >= 2 && TryDeg(f[1], out double allSkyLimit))
                     {
                         if (AllSky != null) AllSky.GaiaGLimit = allSkyLimit;
-                        Report.Add($"all sky catalogue declared complete to G < {allSkyLimit:0.##}");
+                        Report.Add($"all sky catalogue declared cut at G < {allSkyLimit:0.##}");
                     }
                     else
                     {

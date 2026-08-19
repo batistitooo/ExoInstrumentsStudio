@@ -65,10 +65,10 @@ MANIFEST_HEADER = """\
 # ExoInstruments Studio deep star field patches.
 #
 # One patch per line:
-#     file   centreRaDeg   centreDecDeg   radiusDeg   gaiaGLimit
+#     file   centreRaDeg   centreDecDeg   radiusDeg   gaiaGCut
 #
 # and optionally one line
-#     allsky gaiaGLimit
+#     allsky gaiaGCut
 # recording how deep the all-sky catalogue is, so a shallower patch can never outrank it.
 #
 # A patch serves a frame only when it covers the whole of that frame's search cone. Studio reads
@@ -162,18 +162,31 @@ def main():
     p.add_argument("--dec", type=float, help="centre declination in degrees")
     p.add_argument("--radius", type=float, help="cone radius in degrees")
     p.add_argument("--gmax", type=float, default=20.0,
-                   help="Gaia G completeness limit to ask the archive for (default 20)")
+                   help="Gaia G magnitude cut to apply (default 20). A cut, not a promise of completeness: Gaia DR3 itself thins out past G = 20.7.")
     p.add_argument("--fov-arcmin", type=float, nargs=2, metavar=("W", "H"),
                    help="the instrument's field of view, so the radius can be checked against it")
     p.add_argument("--data", help="where the catalogues live (default: the deep sky data directory)")
     p.add_argument("--packer", help="path to the mod's tools/pack_gaia_catalog.py")
     p.add_argument("--user", help="ESA archive username; anonymous is fine at patch size")
+    p.add_argument("--via", choices=("auto", "archive", "cdn"), default="auto",
+                   help="where to get the rows. 'archive' asks the TAP query service, which is "
+                        "exact and tiny but has job queues and can refuse for hours at a time. "
+                        "'cdn' reads the bulk release instead, which is static files and always "
+                        "available, at 240 MB per patch of sky. 'auto' tries the archive and "
+                        "falls back to the bulk release, saying so.")
+    p.add_argument("--bulk-dir", help="where downloaded bulk files are kept (default: tools/gaia_bulk_cache). "
+                                      "They are reused, so a second field in the same patch of sky is free.")
+    p.add_argument("--discard-bulk", action="store_true",
+                   help="delete the bulk files after extracting, trading disk for a later re-download")
     p.add_argument("--allsky-limit", type=float,
-                   help="record the all-sky catalogue's own Gaia G limit and exit")
+                   help="record the all-sky catalogue's own Gaia G cut and exit")
     p.add_argument("--force", action="store_true", help="rebuild a patch that already exists")
     args = p.parse_args()
 
-    out_dir = data_dir(args.data)
+    # ABSOLUTE from here on. The packer is invoked with its own working directory, so a relative
+    # --data would be resolved against the mod's tree instead of this one: the catalogue would be
+    # written somewhere unintended and the prepared cache would be invisible to it.
+    out_dir = os.path.abspath(data_dir(args.data))
     if not os.path.isdir(out_dir):
         sys.exit(f"data directory does not exist: {out_dir}")
     manifest = os.path.join(out_dir, MANIFEST_NAME)
@@ -181,7 +194,7 @@ def main():
 
     if args.allsky_limit is not None:
         write_manifest(manifest, entries, f"{args.allsky_limit:g}")
-        print(f"recorded: the all-sky catalogue is complete to G < {args.allsky_limit:g}")
+        print(f"recorded: the all-sky catalogue is cut at G < {args.allsky_limit:g}")
         print(f"  {manifest}")
         return 0
 
@@ -217,26 +230,56 @@ def main():
     packer = find_packer(args.packer)
     tmp = target + ".partial"
     cache = target + ".cache"
-    cmd = [sys.executable, packer, "--gmax", str(args.gmax),
-           "--cone", str(args.ra), str(args.dec), str(args.radius),
-           "--out", tmp, "--cache", cache]
-    if args.user:
-        cmd += ["--user", args.user]
+    packer_cwd = os.path.dirname(os.path.dirname(packer))
+
+    def run_packer(extra):
+        """The packer does the photometry either way. Only where the rows come from differs."""
+        cmd = [sys.executable, packer, "--gmax", str(args.gmax),
+               "--cone", str(args.ra), str(args.dec), str(args.radius),
+               "--out", tmp, "--cache", cache] + extra
+        return subprocess.call(cmd, cwd=packer_cwd)
 
     print(f"building {filename}: G < {args.gmax:g} within {args.radius} deg "
           f"of {args.ra} {args.dec:+}")
-    rc = subprocess.call(cmd, cwd=os.path.dirname(os.path.dirname(packer)))
+
+    rc = 1
+    if args.via in ("auto", "archive"):
+        rc = run_packer(["--user", args.user] if args.user else [])
+        if rc != 0 and args.via == "auto":
+            print("\nthe query service did not answer. Falling back to the bulk release, which is\n"
+                  "static files and cannot be busy. Same data, larger download.\n")
+
+    if rc != 0 and args.via in ("auto", "cdn"):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import gaia_bulk
+
+        bulk_dir = args.bulk_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "gaia_bulk_cache")
+        try:
+            rows, _ = gaia_bulk.fetch_cone(args.ra, args.dec, args.radius, args.gmax,
+                                           bulk_dir, keep_files=not args.discard_bulk)
+        except Exception as e:
+            sys.exit(f"the bulk release could not be read ({e}); nothing was written")
+        if not rows:
+            sys.exit("no sources in that cone; nothing was written")
+
+        # Handed to the packer as one completed slice rather than converted here, so Gaia's
+        # photometric relations stay in the one place that owns them.
+        shutil.rmtree(cache, ignore_errors=True)
+        gaia_bulk.write_packer_cache(rows, cache, args.gmax)
+        rc = run_packer(["--from-cache"])
+
     if rc != 0 or not os.path.exists(tmp):
         if os.path.exists(tmp):
             os.remove(tmp)
-        # The packer makes its cache directory before it queries anything, and a cone is one
-        # query that never writes there, so on this path it is an empty leftover. Removed only
-        # when it IS empty, so a cache holding real downloaded slices is never thrown away.
+        # The packer makes its cache directory before it queries anything, and an online cone is
+        # one query that never writes there, so on that path it is an empty leftover. Removed
+        # only when it IS empty, so a cache holding real rows is never thrown away.
         try:
             os.rmdir(cache)
         except OSError:
             pass
-        sys.exit(f"the packer failed (exit {rc}); nothing was written and the manifest is unchanged")
+        sys.exit(f"the build failed (exit {rc}); nothing was written and the manifest is unchanged")
 
     # The file is only named in the manifest once it exists in full, so a run that dies partway
     # leaves no line claiming coverage that nothing backs.

@@ -16,6 +16,10 @@ data/*.patchset
 data/*.galcat
 data/*.galimg
 data/*.cache/
+# The patch manifest describes whichever local patch files exist, so it is local too.
+data/GaiaPatches.manifest
+# Bulk Gaia files, downloaded on demand and reused; gigabytes, and rebuildable.
+tools/gaia_bulk_cache/
 
 # Frames and their reductions, which are output, not source.
 captures/
