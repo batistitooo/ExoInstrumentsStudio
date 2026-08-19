@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 
 namespace ExoInstruments.Core
 {
@@ -52,18 +53,31 @@ namespace ExoInstruments.Core
     /// every frame. Nothing here touches the detection pipeline.
     ///
     /// NOTHING SHIPS. The catalogue is user-supplied, because the useful depths cannot be
-    /// distributed: Gaia's own counts put G &lt; 14 at 443 MB and G &lt; 16 at 1.9 GB in this
-    /// format. A Tycho-2 file used to ship and was the worst of both worlds, 29.3 MB carried to
-    /// deliver about four stars per RC20 frame. With no file installed the sky behind a
-    /// photographed body is simply empty, which is honest rather than misleadingly sparse.
+    /// distributed: Gaia's own counts put G &lt; 14 at 236 MB and G &lt; 16 at 1.1 GB in this
+    /// format. (Those two figures used to read 443 MB and 1.9 GB here, which was the packer's
+    /// own superseded table, wrong by one magnitude and by the 12-byte version-2 record; see
+    /// tools/pack_gaia_catalog.py, which corrected it.) A Tycho-2 file used to ship and was the
+    /// worst of both worlds, 29.3 MB carried to deliver about four stars per RC20 frame. With no
+    /// file installed the sky behind a photographed body is simply empty, which is honest rather
+    /// than misleadingly sparse.
     ///
-    /// Loaded once and held; a cone search reads only the declination bands the field of view
-    /// actually overlaps, so search cost tracks the field rather than the catalogue.
+    /// THE FILE IS MAPPED, NOT READ. Those sizes are therefore disk, not resident memory, and
+    /// depth is no longer paid for in RAM. This used to hold the whole catalogue in five
+    /// parallel arrays, which put a hard ceiling on depth for no benefit: the format is already
+    /// an on-disk index, banded by declination and sorted in RA within each band, and a cone
+    /// search reads only the bands the field of view overlaps. Mapping it lets the operating
+    /// system page in exactly those bands and evict them under pressure. An RC20 field is a
+    /// 0.26-degree cone: seven 0.1-degree bands, each entered by binary search and scanned
+    /// across roughly a seven-hundredth of its RA range, so a frame touches well under a
+    /// megabyte however deep the catalogue goes. Only the band index itself stays resident, at
+    /// four bytes per band.
+    ///
+    /// Search cost tracks the field rather than the catalogue, which is what makes that work.
     ///
     /// Pure C# apart from the file read, with no Unity or KSP types, so a search can run on the
     /// background imaging thread.
     /// </summary>
-    public sealed class RenderedStarCatalog
+    public sealed class RenderedStarCatalog : IDisposable
     {
         private static readonly byte[] Magic = { (byte)'E', (byte)'X', (byte)'O', (byte)'S', (byte)'T', (byte)'A', (byte)'R', (byte)'1' };
 
@@ -87,20 +101,31 @@ namespace ExoInstruments.Core
         private const double RaDegPerUnit = 360.0 / 4294967296.0;
         private const double DecDegPerUnit = 180.0 / 4294967296.0;
 
-        private uint[] raFixed;
-        private int[] decFixed;
-        private ushort[] vMagMilli;
-        private short[] bvMilli;
-        private ushort[] ebvMilli;
+        private MemoryMappedFile mapping;
+        private MemoryMappedViewAccessor view;
+
+        /// <summary>Byte offset of the first star record, i.e. the end of the header and band index.</summary>
+        private long recordsOffset;
+
+        /// <summary>Bytes per star record: 14 for version 3, 12 for a version-2 file with no reddening column.</summary>
+        private int recordBytes;
+        private bool hasReddening;
+        private int count;
+
+        /// <summary>
+        /// The one part that stays in memory, deliberately: it is the index every search enters
+        /// through, it is read log-many times per cone, and at four bytes per band it costs 7 kB
+        /// for the 1800-band files the packer writes, whatever depth they carry.
+        /// </summary>
         private uint[] bandStart;
         private int bandCount;
         private double bandWidthDeg;
 
         /// <summary>Number of stars held. Zero when no catalogue file was loaded.</summary>
-        public int Count => raFixed != null ? raFixed.Length : 0;
+        public int Count => count;
 
         /// <summary>True once a catalogue has been loaded successfully.</summary>
-        public bool IsLoaded => Count > 0;
+        public bool IsLoaded => count > 0 && view != null;
 
         /// <summary>
         /// Reads the packed catalogue. Throws on a malformed file so the caller can log it and
@@ -108,6 +133,15 @@ namespace ExoInstruments.Core
         /// </summary>
         public void Load(string path)
         {
+            // Records are decoded straight out of the mapping in the byte order they were
+            // written, so a big-endian host would read every field byte-reversed. Every platform
+            // this runs on is little-endian; say so rather than quietly rendering a scrambled sky.
+            if (!BitConverter.IsLittleEndian)
+                throw new InvalidDataException("packed star catalogues are little-endian and this is a big-endian machine");
+
+            Dispose();
+
+            long fileLength;
             using (var stream = File.OpenRead(path))
             using (var reader = new BinaryReader(stream))
             {
@@ -121,9 +155,10 @@ namespace ExoInstruments.Core
                 int version = reader.ReadInt32();
                 if (version < OldestSupportedVersion || version > FormatVersion)
                     throw new InvalidDataException("unsupported catalogue version " + version);
-                bool hasReddening = version >= 3;
+                hasReddening = version >= 3;
+                recordBytes = hasReddening ? 14 : 12;
 
-                int count = reader.ReadInt32();
+                count = reader.ReadInt32();
                 bandCount = reader.ReadInt32();
                 bandWidthDeg = reader.ReadSingle();
                 if (count < 0 || bandCount <= 0 || bandWidthDeg <= 0.0)
@@ -132,20 +167,45 @@ namespace ExoInstruments.Core
                 bandStart = new uint[bandCount + 1];
                 for (int i = 0; i <= bandCount; i++) bandStart[i] = reader.ReadUInt32();
 
-                raFixed = new uint[count];
-                decFixed = new int[count];
-                vMagMilli = new ushort[count];
-                bvMilli = new short[count];
-                ebvMilli = new ushort[count];
-                for (int i = 0; i < count; i++)
-                {
-                    raFixed[i] = reader.ReadUInt32();
-                    decFixed[i] = reader.ReadInt32();
-                    vMagMilli[i] = reader.ReadUInt16();
-                    bvMilli[i] = reader.ReadInt16();
-                    ebvMilli[i] = hasReddening ? reader.ReadUInt16() : EbvUnknown;
-                }
+                recordsOffset = stream.Position;
+                fileLength = stream.Length;
             }
+
+            // Reading the records used to check both of these for free: a short file ran the
+            // BinaryReader off the end, and a band index pointing past the stars simply indexed
+            // an array and threw. Mapping the file reads by computed offset instead, so both have
+            // to be checked here or a malformed catalogue becomes a wild read at search time.
+            long need = recordsOffset + (long)count * recordBytes;
+            if (fileLength < need)
+                throw new InvalidDataException(
+                    $"catalogue is truncated: {count:N0} stars need {need:N0} bytes and the file is {fileLength:N0}");
+            for (int i = 0; i < bandCount; i++)
+            {
+                if (bandStart[i] > bandStart[i + 1])
+                    throw new InvalidDataException("catalogue band index is not monotonic");
+            }
+            if (bandStart[bandCount] > (uint)count)
+                throw new InvalidDataException("catalogue band index runs past the last star");
+
+            mapping = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            view = mapping.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        }
+
+        /// <summary>
+        /// RA of one star, straight out of the mapping. The only field wanted on its own: the
+        /// binary search that brackets a band reads nothing else, and ScanRange decodes whole
+        /// records from an offset it computes once. Nothing is copied or held.
+        /// </summary>
+        private uint RaFixedAt(int i) => view.ReadUInt32(recordsOffset + (long)i * recordBytes);
+
+        /// <summary>Releases the mapping. Safe to call twice, and safe on a catalogue never loaded.</summary>
+        public void Dispose()
+        {
+            view?.Dispose();
+            mapping?.Dispose();
+            view = null;
+            mapping = null;
+            count = 0;
         }
 
         /// <summary>
@@ -221,23 +281,31 @@ namespace ExoInstruments.Core
         {
             for (int i = lo; i < hi; i++)
             {
-                if (vMagMilli[i] > faintestMilli) continue;
+                long at = recordsOffset + (long)i * recordBytes;
 
-                double starRaDeg = raFixed[i] * RaDegPerUnit;
-                double starDecDeg = decFixed[i] * DecDegPerUnit;
+                ushort vMagMilli = view.ReadUInt16(at + 8);
+                if (vMagMilli > faintestMilli) continue;
+
+                double starRaDeg = view.ReadUInt32(at) * RaDegPerUnit;
+                double starDecDeg = view.ReadInt32(at + 4) * DecDegPerUnit;
                 double decRad = starDecDeg * Math.PI / 180.0;
                 double deltaRa = (starRaDeg - centreRaDeg) * Math.PI / 180.0;
                 double cosSeparation = sinCentreDec * Math.Sin(decRad)
                                      + cosCentreDec * Math.Cos(decRad) * Math.Cos(deltaRa);
                 if (cosSeparation < cosRadius) continue;
 
+                // Colour and reddening are read only for a star that survived both cuts, which is
+                // a small fraction of the range scanned.
+                short bvMilli = view.ReadInt16(at + 10);
+                ushort ebvMilli = hasReddening ? view.ReadUInt16(at + 12) : EbvUnknown;
+
                 results.Add(new RenderedStar
                 {
                     RaDeg = starRaDeg,
                     DecDeg = starDecDeg,
-                    VMag = vMagMilli[i] / 1000.0 - VMagOffset,
-                    ColorIndexBV = bvMilli[i] == BvUnknown ? double.NaN : bvMilli[i] / 1000.0,
-                    ReddeningEBv = ebvMilli[i] == EbvUnknown ? double.NaN : ebvMilli[i] / 1000.0,
+                    VMag = vMagMilli / 1000.0 - VMagOffset,
+                    ColorIndexBV = bvMilli == BvUnknown ? double.NaN : bvMilli / 1000.0,
+                    ReddeningEBv = ebvMilli == EbvUnknown ? double.NaN : ebvMilli / 1000.0,
                 });
             }
         }
@@ -247,7 +315,7 @@ namespace ExoInstruments.Core
             while (lo < hi)
             {
                 int mid = lo + ((hi - lo) >> 1);
-                if (raFixed[mid] < ra) lo = mid + 1; else hi = mid;
+                if (RaFixedAt(mid) < ra) lo = mid + 1; else hi = mid;
             }
             return lo;
         }
@@ -257,7 +325,7 @@ namespace ExoInstruments.Core
             while (lo < hi)
             {
                 int mid = lo + ((hi - lo) >> 1);
-                if (raFixed[mid] <= ra) lo = mid + 1; else hi = mid;
+                if (RaFixedAt(mid) <= ra) lo = mid + 1; else hi = mid;
             }
             return lo;
         }
