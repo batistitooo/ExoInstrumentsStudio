@@ -66,6 +66,25 @@
       <select id="site"></select>
     </section>
 
+    <!-- The orbital half's answer to the site picker. It is a control panel rather than a list
+         because an orbit is not one: every element below changes something visible in the frame,
+         and the derived line under them says what. See Engine/Simulation/OrbitalPlatforms.cs. -->
+    <section class="block spacecraft" id="spacecraftBlock" hidden>
+      <div class="coolhead">
+        <label class="lbl">Spacecraft</label>
+        <output class="mono coolval" id="scName">n/a</output>
+      </div>
+      <div class="capgrid">
+        <label>Altitude km<input id="scAlt" type="number" min="160" max="36000" step="5"></label>
+        <label>Inclination °<input id="scInc" type="number" min="0" max="180" step="0.01"></label>
+        <label>Node RA °<input id="scRaan" type="number" step="1"></label>
+        <label>Phase °<input id="scPhase" type="number" step="1"></label>
+      </div>
+      <p class="hint mono" id="scDerived"></p>
+      <p class="hint dim" id="scConstraints"></p>
+      <p class="hint dim" id="scNote"></p>
+    </section>
+
     <button id="observe" class="primary" disabled>Begin observing</button>
     <p class="err" id="startError" hidden></p>
 
@@ -79,7 +98,7 @@
         <label>Binning<select id="capBin">
           <option>1</option><option>2</option><option selected>4</option><option>8</option>
         </select></label>
-        <label class="capcheck"><input id="capTrack" type="checkbox" checked> tracking mount</label>
+        <label class="capcheck" id="trackWrap"><input id="capTrack" type="checkbox" checked> tracking mount</label>
       </div>
       <div class="coolrow" id="coolRow" hidden>
         <div class="coolhead">
@@ -170,7 +189,8 @@
         <span><i class="dot dot-star"></i> <span id="starLayerLabel">Bright Star Catalogue</span></span>
         <span><i class="dot dot-host"></i> planet host</span>
         <span><i class="dot dot-sel"></i> selected</span>
-        <span><i class="dot dot-shade"></i> never above 20° from this site</span>
+        <span id="shadeKey"><i class="dot dot-shade"></i> never above 20° from this site</span>
+        <span id="cvzKey" hidden><i class="dot dot-cvz"></i> continuous-viewing zone</span>
         <span><i class="dot dot-aim"></i> telescope aim (click any patch of sky)</span>
       </div>
     </div>
@@ -190,6 +210,27 @@
           <span class="fcscale" id="fcScale"></span>
           <button class="ghost" id="fcBest" hidden>Best window</button>
           <span class="pill fcstart" id="fcStartChip" hidden></span>
+        </span>
+      </div>
+    </div>
+
+    <!-- The orbital counterpart of the forecast, and a different shape because it answers a
+         different question. A ground forecast is a continuous quantity over a night: how high,
+         through how much air. In orbit a pointing is legal or it is not, so this is the run of
+         yes/no over one revolution with the reason for each no. -->
+    <div class="panel chart" id="orbitPanel" hidden>
+      <div class="chart-head">
+        <h3>Orbital visibility</h3>
+        <span class="chart-note" id="orbitNote"></span>
+      </div>
+      <div class="orbitstrip" id="orbitStrip"></div>
+      <div class="fcrow">
+        <span class="hint" id="orbitHint"></span>
+        <span class="orbitkey">
+          <span><i class="ok"></i> observable</span>
+          <span><i class="occ"></i> Earth</span>
+          <span><i class="sun"></i> Sun</span>
+          <span><i class="moon"></i> Moon</span>
         </span>
       </div>
     </div>

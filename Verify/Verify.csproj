@@ -32,7 +32,21 @@
     <Compile Include="$(StudioRoot)\Simulation\VisualizationBoundary.cs" />
     <Compile Include="$(StudioRoot)\Simulation\UnityShims.cs" />
     <Compile Include="$(StudioRoot)\Simulation\DeepSkyCamera.cs" />
+    <!-- DeepSkyCamera's orbital branch needs the spacecraft, its orbit and the constraints. -->
+    <Compile Include="$(StudioRoot)\Simulation\OrbitalPlatforms.cs" />
     <Compile Include="$(StudioRoot)\Simulation\PngWriter.cs" />
+    <!-- The campaign, for the reproducibility check: it drives the seed from the request shape
+         all the way down to the session's generator, which is where the fix lives. -->
+    <Compile Include="$(StudioRoot)\Simulation\Campaign.cs" />
+    <!-- The observer's own instrument, and what it can detect. -->
+    <Compile Include="$(StudioRoot)\Simulation\CustomInstruments.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\DetectionLimits.cs" />
+    <!-- The inverse: reducing a frame back into magnitudes and scoring it against the truth. -->
+    <Compile Include="$(StudioRoot)\Simulation\FrameReduction.cs" />
+    <!-- Bias, dark and flat, and the fixed patterns that give them something to remove. -->
+    <Compile Include="$(StudioRoot)\Simulation\CalibrationFrames.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\ObservingPlan.cs" />
+    <Compile Include="$(StudioRoot)\Data\CatalogService.cs" />
     <Compile Include="$(StudioRoot)\Data\CatalogCrossReference.cs" />
     <Compile Include="$(StudioRoot)\Data\GaiaCatalogReader.cs" />
 

@@ -109,7 +109,21 @@ main {
   border-radius: var(--r);
 }
 
-.setup { padding: 16px; position: sticky; top: 76px; }
+/* The setup column scrolls INSIDE ITSELF rather than making the page taller.
+   Sticky alone was not enough: sticky only pins an element that FITS, and this column is
+   taller than the viewport once the spacecraft controls are open, so it just scrolled off
+   and the right column could not be reached until the left one had run out. Capping the
+   height at the viewport and giving it its own overflow makes the two columns scroll
+   independently, which is what the layout was always trying to express. */
+.setup {
+  padding: 16px;
+  position: sticky;
+  top: 76px;
+  max-height: calc(100vh - 92px);
+  overflow-y: auto;
+  overscroll-behavior: contain;   /* reaching its end does not start scrolling the page */
+  scrollbar-width: thin;
+}
 .run { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 
 .block { margin-bottom: 16px; }
@@ -391,6 +405,7 @@ canvas { display: block; width: 100%; }
 .dot-host  { background: var(--cyan); }
 .dot-sel   { background: var(--amber); box-shadow: 0 0 6px rgba(255,180,84,.8); }
 .dot-shade { background: transparent; border: 1px solid #3a2b33; border-radius: 2px !important; width: 10px !important; height: 8px !important; }
+.dot-cvz { background: transparent; border: 1px dashed rgba(126,231,135,.7); border-radius: 50% !important; width: 9px !important; height: 9px !important; }
 
 /* ----------------------------------------------------------------- results */
 
@@ -444,10 +459,18 @@ table.signals tr.miss td { color: var(--ink-faint); }
   display: flex; flex-direction: column; gap: 3px;
   font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
   color: var(--ink-faint); font-weight: 600;
+  /* A grid item's min-width defaults to auto, which resolves to its content's min-content
+     width. For a number input that is the browser's ~20-character intrinsic size, wider than
+     the 1fr track this column actually gets, so the second column (Dec, Exposure) pushed out
+     past the panel instead of shrinking. */
+  min-width: 0;
 }
 .capgrid input[type=number], .capgrid select {
   padding: 7px 9px; background: var(--bg-sunken); border: 1px solid var(--line);
   border-radius: 6px; color: var(--ink); font-family: var(--mono); font-size: 12.5px;
+  /* Same cause one level down: the control has to be told to take the track rather than its
+     own intrinsic size. box-sizing: border-box (set globally) keeps padding and border inside. */
+  width: 100%; min-width: 0;
 }
 .capgrid .capcheck {
   flex-direction: row; align-items: center; gap: 7px;
@@ -468,7 +491,10 @@ table.signals tr.miss td { color: var(--ink-faint); }
 
 @media (max-width: 1080px) {
   main { grid-template-columns: 1fr; }
-  .setup { position: static; }
+  /* One column, so the two stack and the page's own scroll is the right one. The cap and
+     the inner overflow have to go with the sticky, or the setup panel would become a short
+     scrolling box with the whole page scrolling under it. */
+  .setup { position: static; max-height: none; overflow-y: visible; }
   .clockbar { grid-template-columns: 1fr; }
   .warp { border-left: none; padding-left: 0; border-top: 1px solid var(--line-soft); padding-top: 14px; }
   .runctl { flex-direction: row; }
@@ -490,3 +516,37 @@ table.signals tr.miss td { color: var(--ink-faint); }
   font-size: 12px;
   line-height: 1.45;
 }
+
+/* ---------------------------------------------------------------- spacecraft */
+/* The orbital half. Elements the observer sets, then what follows from them, then
+   the constraint model Core published and they cannot change. */
+
+.spacecraft .capgrid { margin-bottom: 6px; }
+.spacecraft .hint { margin: 2px 0; }
+#scDerived { color: var(--cyan); font-size: 11.5px; }
+
+/* One revolution, left to right, coloured by what is blocking the pointing. A strip
+   rather than a plot because the quantity is not continuous: a pointing is legal or
+   it is not, and the interesting information is which constraint said no. */
+.orbitstrip {
+  display: flex;
+  height: 42px;
+  gap: 1px;
+  border-radius: var(--r);
+  overflow: hidden;
+  background: var(--bg-sunken);
+  margin: 6px 0 8px;
+}
+.orbitstrip span { flex: 1 1 0; min-width: 0; }
+.orbitstrip span.ok   { background: var(--green); }
+.orbitstrip span.occ  { background: #2b3543; }
+.orbitstrip span.sun  { background: var(--amber); }
+.orbitstrip span.moon { background: var(--violet); }
+.orbitstrip span.limb { background: #6b5a3a; }
+
+.orbitkey { display: inline-flex; gap: 12px; font-size: 10px; color: var(--ink-faint); font-family: var(--mono); }
+.orbitkey i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; vertical-align: -1px; margin-right: 3px; }
+.orbitkey i.ok   { background: var(--green); }
+.orbitkey i.occ  { background: #2b3543; }
+.orbitkey i.sun  { background: var(--amber); }
+.orbitkey i.moon { background: var(--violet); }

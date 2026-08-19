@@ -90,6 +90,27 @@ namespace ExoInstruments.Core
                 => plane < 0 ? TryValue(pixel, ref cursor, out rayleighs)
                              : TryPlaneValue(plane, pixel, ref cursor, out rayleighs);
 
+            /// <summary>
+            /// COVERAGE, and the value separately. True means this patch holds the cell; the value
+            /// is then NaN if that cell carries no measurement.
+            ///
+            /// The two used to be one answer -- false for a pixel outside the patch AND for a
+            /// masked cell inside it -- and the caller could only treat both as "the base map's
+            /// job". That is what put a hard-edged box on every bright star in every SHASSA patch:
+            /// the packer masks the continuum-subtraction crater around a star as NaN, the lookup
+            /// reported that exactly like the patch's outer rim, and the sample switched to the
+            /// composite mid-frame. Where the two surveys agree the switch is invisible (measured
+            /// at iota Ori: +0.0 ADU across 36% of a 10 arcmin box). Where they disagree it is the
+            /// artefact: around M42's Trapezium the composite reads 4324 to 4380 R against the
+            /// patch's 45 to 900 R in the saturated bowl, so a 3.7 x 1.2 arcmin strip -- the two
+            /// NaN cells there, dilated by the interpolation stencil -- came out +33 ADU brighter
+            /// than the sky around it, with an edge sharp to the pixel.
+            ///
+            /// Coverage is a question about the patch's GEOMETRY and has one right answer; whether
+            /// a covered cell was measured is a question about its VALUE, and only the caller
+            /// knows what to do about it. See TryRayleighsAtGalactic, which now masks and
+            /// reweights, as its own comment has always said it did.
+            /// </summary>
             internal bool TryValue(long pixel, ref int cursor, out double rayleighs)
             {
                 rayleighs = double.NaN;
@@ -116,7 +137,7 @@ namespace ExoInstruments.Core
             private bool Read(int run, int pixel, out double rayleighs)
             {
                 rayleighs = Float16.ToDouble(Values[RunOffset[run] + (pixel - RunStart[run])]);
-                return !double.IsNaN(rayleighs);
+                return true;                            // covered; NaN says unmeasured, not absent
             }
 
             /// <summary>The same lookup on one of the extra planes. Shares the run geometry, so only the array differs.</summary>
@@ -141,7 +162,7 @@ namespace ExoInstruments.Core
                     i = found;
                 }
                 rayleighs = Float16.ToDouble(ExtraValues[plane][RunOffset[i] + (p - RunStart[i])]);
-                return !double.IsNaN(rayleighs);
+                return true;                            // covered; NaN says unmeasured, not absent
             }
         }
 
@@ -937,7 +958,7 @@ namespace ExoInstruments.Core
             // on a sky level of their own, and over half of every cutout falls below it purely
             // through noise (VeilEast: 57% of raw [O III] pixels are negative). On those planes a
             // zero, and a small negative, IS the measurement -- "no oxygen light here" -- and only
-            // NaN means nothing was measured. TryPlane already reports NaN by returning false.
+            // NaN means nothing was measured. TryPlane reports coverage, so NaN is tested here.
             bool measuredPlane = plane >= 0;
 
             // THE C1 RECONSTRUCTION FIRST, over the sixteen cells of the cubic stencil, and only
@@ -964,6 +985,7 @@ namespace ExoInstruments.Core
                 for (int i = 0; i < Healpix.CubicTaps; i++)
                 {
                     if (!patch.TryPlane(plane, pixelScratch[i], ref cursor.Runs[cursorBase + (i >> 2)], out double v)
+                        || double.IsNaN(v)
                         || (!measuredPlane && !(v > 0.0)))
                     {
                         complete = false;
@@ -990,8 +1012,9 @@ namespace ExoInstruments.Core
             // continuum-subtracted survey: an off-band image is scaled and subtracted from the
             // H-alpha one to remove stellar continuum, and at a bright star that subtraction
             // over-corrects and drives the residual to zero or below (Gaustad et al. 2001,
-            // PASP 113, 1326, Sect. 4). 795 cells of 542,673 across the fourteen patches are such
-            // residuals, in discs on the brightest stars.
+            // PASP 113, 1326, Sect. 4). The packer stores those cells as NaN rather than as a
+            // number: 2,229 cells across the eighteen SHASSA patches, in discs on the brightest
+            // stars, and not one patch holds a single non-positive value.
             //
             // They are MASKED, not handed back to the base map. Two reasons, and the second is the
             // one that matters. First, a masked cell surrounded by good ones is fully covered by
@@ -1002,12 +1025,22 @@ namespace ExoInstruments.Core
             // patch's own resolution -- SHASSA resolves filaments a 6 arcmin beam averages away --
             // so the handover shows as a step, and at 0.86 arcmin per cell that step is a 13-pixel
             // staircase. Trading a black disc for a grey one with a jagged edge is not a fix.
+            //
+            // THIS PARAGRAPH DESCRIBED CODE THAT DID NOT EXIST. The masked cells are NaN, the
+            // lookup answered NaN and off-the-patch with the same false, and the loop below took
+            // the first branch -- so every masked cell WAS handed back to the base map, and the
+            // staircase this argues against was what the renderer actually drew: a sharp-edged box
+            // on the brightest star in every patch, invisible wherever the two surveys agree and
+            // +33 ADU at M42's Trapezium, where they disagree tenfold because SHASSA saturates
+            // there. Coverage and measurement are now separate answers (see Patch.TryValue), and
+            // the reweighting below is the one that runs.
             double sum = 0.0, weight = 0.0;
             for (int i = 0; i < 4; i++)
             {
                 if (!patch.TryPlane(plane, pixelScratch[i], ref cursor.Runs[cursorBase + (i >> 1)], out double v))
                     return false;                       // outside the patch: that IS the base map's job
-                if (!measuredPlane && !(v > 0.0)) continue;   // a subtraction residual: no measurement here
+                if (double.IsNaN(v)) continue;               // covered, but nothing was measured here
+                if (!measuredPlane && !(v > 0.0)) continue;  // a subtraction residual: no measurement here
                 sum += weightScratch[i] * v;
                 weight += weightScratch[i];
             }

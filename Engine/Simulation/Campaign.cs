@@ -48,8 +48,16 @@ namespace ExoStudio.Simulation
         private Task analysisTask;
         private AnalysisReport lastReport;
 
+        /// <summary>
+        /// The seed this run's noise came from. Supplied by the caller, or drawn here and then
+        /// REPORTED, so a run is reproducible whether or not anyone thought to pin it in advance:
+        /// re-post the same target, instrument, site, start date and this number, and every epoch
+        /// comes back identical. Verify section 9 is that sentence as a test.
+        /// </summary>
+        public int RandomSeed { get; }
+
         public Campaign(StarTarget target, List<StarTarget> system, InstrumentSpec instrument,
-                        ObservingSites.Site site, double startUt)
+                        ObservingSites.Site site, double startUt, int? randomSeed = null)
         {
             Target = target;
             System = system;
@@ -65,11 +73,13 @@ namespace ExoStudio.Simulation
                     // Schedule Rossiter-McLaughlin bursts around any companion that actually
                     // transits: a real programme can only plan around a known ephemeris.
                     List<StarTarget> burst = system.Where(p => p.IsTransiting).ToList();
-                    rvSession = new RvObservationSession(target, system, instrument, startUt, observer, burst);
+                    rvSession = new RvObservationSession(target, system, instrument, startUt, observer, burst, randomSeed);
+                    RandomSeed = rvSession.RandomSeed;
                     break;
 
                 case DetectionMethod.Transit:
-                    transitSession = new ObservationSession(target, system, instrument, startUt, observer);
+                    transitSession = new ObservationSession(target, system, instrument, startUt, observer, randomSeed);
+                    RandomSeed = transitSession.RandomSeed;
                     break;
 
                 default:

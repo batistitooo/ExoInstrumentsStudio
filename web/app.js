@@ -151,20 +151,37 @@ function onInstrumentChange() {
       `${scope.telescope} + ${scope.camera} at ${scope.site} · ${(scope.apertureMeters * 1000).toFixed(0)} mm ` +
       `f/${(scope.focalLengthMeters / scope.apertureMeters).toFixed(1)}` +
       (scope.barlow > 1 ? ` ×${scope.barlow} Barlow` : '') +
-      ` · ${scope.sensor} px · seeing ${scope.zenithSeeingArcsec}″ at zenith`;
-    $('siteBlock').hidden = false;
+      ` · ${scope.sensor} px · ` +
+      (scope.isSpaceBased
+        ? 'above the atmosphere: no seeing, no airmass, no airglow'
+        : `seeing ${scope.zenithSeeingArcsec}″ at zenith`);
+
+    // A space telescope has no site and no mount to fail to track with, so neither control is
+    // offered. Hiding them rather than leaving them inert is the point: a tracking checkbox the
+    // server ignores is a claim that it does something.
+    $('siteBlock').hidden = !!scope.isSpaceBased;
+    $('trackWrap').hidden = !!scope.isSpaceBased;
+    $('spacecraftBlock').hidden = !scope.isSpaceBased;
+
     $('capFilter').innerHTML = scope.filters.map((f) => `<option>${f}</option>`).join('');
     setupCooler(scope);
     setupZoom(scope);
     $('targetChips').hidden = true;
     $('search').placeholder = 'M 42, Horsehead, type:nebula in:Ori, Vega…';
     search($('search').value);
-    refreshModeChips();
+    // refreshModeChips() used to be called here and HAS NEVER EXISTED, so selecting any
+    // astrograph threw a ReferenceError on this line and everything after it in this branch
+    // silently did not run: the chart was never redrawn for the new instrument and the
+    // forecast was never loaded. The chips it named are the target-mode chips hidden on the
+    // line above, so there is nothing to refresh; the call is gone rather than stubbed.
     drawSkyStatic(); drawSkyOverlay();
-    scheduleForecast();
+    if (scope.isSpaceBased) loadPlatform(scope.platform); else scheduleForecast();
     return;
   }
 
+  $('spacecraftBlock').hidden = true;
+  $('trackWrap').hidden = false;
+  $('orbitPanel').hidden = true;
   $('targetChips').hidden = false;
   $('search').placeholder = '51 Peg b';
   search($('search').value);
@@ -185,6 +202,11 @@ function onInstrumentChange() {
 function onSiteChange() {
   drawSkyStatic();     // the never-visible declination band belongs to the site
   drawSkyOverlay();
+  // So does the cooler's reachable range: the TEC's published figure is a delta below ambient,
+  // and ambient is a property of the mountain, not of the camera. Rebuilding the control here is
+  // the whole fix; before it, the range was fixed at the instrument's home site for ever.
+  const scope = selectedScope();
+  if (scope) setupCooler(scope);
   scheduleForecast();
 }
 
@@ -747,33 +769,64 @@ function isAlias(signal, c) {
  * the published dark current from the temperature it was measured at to this one through
  * DarkCurrentModel, so a warmer sensor really does put more dark charge under the exposure.
  */
+/** The site currently selected, with its ambient air temperature. Null for a space telescope. */
+function currentSite() {
+  return state.boot.sites.find((s) => s.id === $('site').value) || null;
+}
+
+/**
+ * The cooler's reachable range, which belongs to the instrument AND the site together.
+ *
+ * The published TEC figure is a DELTA below ambient, not an absolute floor, so the same camera
+ * reaches a genuinely different temperature on a cold mountain than in Provence. This used to be
+ * baked server-side from the instrument's own home site and never moved, so taking the RC20 to
+ * Mauna Kea still offered it Provence's range.
+ */
+function coolerRange(scope) {
+  const site = currentSite();
+  const ambient = site && site.ambientTemperatureC !== null && site.ambientTemperatureC !== undefined
+    ? site.ambientTemperatureC : null;
+  if (ambient === null || scope.coolerDeltaC === null || scope.coolerDeltaC === undefined) return null;
+  return { ambient, min: ambient - scope.coolerDeltaC, max: ambient, site };
+}
+
 function setupCooler(scope) {
   const row = $('coolRow');
-  if (!scope.hasAdjustableCooler) {
+  const range = scope.hasAdjustableCooler ? coolerRange(scope) : null;
+  if (!range) {
     row.hidden = true;
     $('coolHint').textContent = '';
     return;
   }
   row.hidden = false;
   const el = $('capTemp');
-  el.min = Math.round(scope.coolerMinC);
-  el.max = Math.round(scope.coolerMaxC);
-  el.value = Math.round(scope.detectorTemperatureC);
+  el.min = Math.round(range.min);
+  el.max = Math.round(range.max);
+  // The published setpoint, but only if this site can actually hold it. At Mauna Kea the range
+  // runs far colder and at a warm site it may not reach -20 at all; clamping here rather than
+  // letting the slider sit outside its own bounds keeps the readout and the request in step.
+  el.value = Math.round(Math.min(Math.max(scope.detectorTemperatureC, range.min), range.max));
   el.oninput = () => { updateCoolerOut(scope); };
-  el.onchange = () => scheduleForecast.length && null;
   updateCoolerOut(scope);
 }
 
 function updateCoolerOut(scope) {
   const t = $('capTemp').valueAsNumber;
   $('capTempOut').textContent = `${t > 0 ? '+' : ''}${t} °C`;
+  const range = coolerRange(scope);
+  if (!range) { $('coolHint').textContent = ''; return; }
+
   // What the choice costs, in the units the exposure actually pays: the published rate is
-  // quoted at the instrument's own setpoint, and the model scales from there.
+  // quoted at the instrument's own setpoint, and the model scales from there. The ambient is
+  // the SITE's, and it says whether that figure is a night statistic or a round-the-clock mean,
+  // because only one of the five is the former.
   const dt = t - scope.detectorTemperatureC;
+  const air = `air at ${range.site.name} is ${fmt.num(range.ambient, 1)} °C` +
+              (range.site.ambientIsNightTime ? ' at night' : ' (24 h mean)') +
+              ` · this cooler holds ${scope.coolerDeltaC} °C under it, so ${fmt.num(range.min, 1)} °C`;
   $('coolHint').textContent = Math.abs(dt) < 0.5
-    ? `at the published setpoint (${scope.detectorTemperatureC} °C), ${scope.darkCurrentAtSpecC} e⁻/s/px dark`
-    : `${dt > 0 ? '+' : ''}${dt.toFixed(0)} °C from the published ${scope.detectorTemperatureC} °C · ` +
-      `ambient here is ${scope.coolerMaxC} °C`;
+    ? `at the published setpoint (${scope.detectorTemperatureC} °C), ${scope.darkCurrentAtSpecC} e⁻/s/px dark · ${air}`
+    : `${dt > 0 ? '+' : ''}${dt.toFixed(0)} °C from the published ${scope.detectorTemperatureC} °C · ${air}`;
 }
 
 /**
@@ -837,8 +890,10 @@ $('capture').onclick = async () => {
         detectorTemperatureCelsius: $('coolRow').hidden ? undefined : $('capTemp').valueAsNumber,
         zoomFactor: $('zoomRow').hidden ? undefined : $('capZoom').valueAsNumber,
         // A cell picked on the calendar books that slot; otherwise the server schedules
-        // the coming night's best moment for the field.
-        atUtc: state.fcStartIso || undefined,
+        // the coming night's best moment for the field. Never carried over to a space
+        // telescope: that slot was chosen off a GROUND site's night, and up there it
+        // means nothing but would be honoured as a hard booking and probably refused.
+        atUtc: (scope.isSpaceBased ? undefined : state.fcStartIso) || undefined,
       }),
     });
     const data = await r.json();
@@ -861,7 +916,29 @@ $('capture').onclick = async () => {
       `${fmt.int(data.starsDrawn)} Gaia stars`,
       data.galaxiesDrawn ? `${data.galaxiesDrawn} galaxies${data.galaxiesFromImages.length ? ' (' + data.galaxiesFromImages.join(', ') + ' from measured maps)' : ''}` : null,
       data.emissionLines ? `emission: ${data.emissionLines}` : null,
-      `seeing ${fmt.num(data.seeingArcsec, 2)}″ at X ${fmt.num(data.airmass, 2)}`,
+
+      // The atmospheric line, or the orbital one in its place. Not both, and not a "seeing 0″
+      // at X 1" line for a telescope that is above the weather: those two numbers have no
+      // referent up there, and printing them would imply they were measured.
+      data.platform
+        ? `${data.platform.name} at ${fmt.int(data.platform.altitudeKm)} km · ` +
+          `pointing ${fmt.num(data.platform.pointingRmsArcsec, 3)}″ rms ` +
+          `(${fmt.num(data.platform.pointingFwhmArcsec, 3)}″ into the PSF)`
+        : `seeing ${fmt.num(data.seeingArcsec, 2)}″ at X ${fmt.num(data.airmass, 2)}`,
+
+      data.platform
+        ? `sky ${fmt.num(data.platform.skyVMagPerArcsec2, 2)} V mag/arcsec² ` +
+          `(zodiacal ${fmt.num(data.platform.zodiacalVMagPerArcsec2, 2)}` +
+          (data.platform.earthshineVMagPerArcsec2 !== null
+            ? `, earthshine ${fmt.num(data.platform.earthshineVMagPerArcsec2, 2)}` : '') + ')'
+        : null,
+      data.platform && data.platform.conditions
+        ? `Sun ${fmt.num(data.platform.conditions.sunAngleDeg, 0)}°, ` +
+          `Earth limb ${fmt.num(data.platform.conditions.earthLimbAngleDeg, 0)}° ` +
+          `${data.platform.conditions.limbIsSunlit ? 'sunlit' : 'dark'}, ` +
+          `${(data.platform.occultedOrbitFraction * 100).toFixed(0)}% of the orbit occulted`
+        : null,
+
       `sky ${fmt.num(data.skyElectronsPerPixel, 1)} e⁻/px`,
       data.saturatedFraction > 0 ? `${(data.saturatedFraction * 100).toFixed(2)}% saturated` : null,
       data.detectorTemperatureC !== null && data.detectorTemperatureC !== undefined
@@ -873,7 +950,12 @@ $('capture').onclick = async () => {
     $('captureLinks').innerHTML = data.fitsUrl
       ? `<a href="${data.fitsUrl}" download>Download FITS</a> <span class="dim">16-bit, WCS and MAGZERO in the header; stack in Siril</span>`
       : '';
-    $('captureReport').textContent = '';
+    // What the orbital path leaves out, shown with the frame it applies to rather than filed
+    // away under the header's general list: these five are true of THIS picture and of no
+    // ground frame, so they belong next to it.
+    $('captureReport').textContent = data.platform && state.spaceSimplifications
+      ? 'Not modelled from orbit: ' + state.spaceSimplifications.join(' ')
+      : '';
   } finally {
     btn.disabled = false;
     btn.textContent = 'Capture';
@@ -889,6 +971,8 @@ $('capture').onclick = async () => {
     // how a real one went unnoticed: the Gaia catalogue's declination index was broken, the
     // server detected it and said so in as many words, and the sentence sat in the middle of six
     // file paths in dim grey. Every star field rendered empty for as long as that took to spot.
+    state.spaceSimplifications = d.spaceSimplifications || null;
+
     const warnings = d.files.filter(f => /^WARNING/i.test(f));
     const paths = d.files.filter(f => !/^WARNING/i.test(f));
 
@@ -917,6 +1001,15 @@ let lastForecast = null;
 
 function scheduleForecast() {
   clearTimeout(forecastTimer);
+  // A space telescope has no night to forecast. The equivalent question is which parts of the
+  // coming revolution the pointing is legal in, and that has its own endpoint and its own panel.
+  const scope = selectedScope();
+  if (scope && scope.isSpaceBased) {
+    $('forecastPanel').hidden = true;
+    forecastTimer = setTimeout(loadOrbitVisibility, 250);
+    return;
+  }
+  $('orbitPanel').hidden = true;
   forecastTimer = setTimeout(loadForecast, 250);
 }
 
@@ -1405,7 +1498,16 @@ function drawSkyStatic() {
   // Culmination altitude is 90 - |dec - lat|; below the 20° telescope floor means
   // |dec - lat| > 70. Ground truth of the same rule the sessions gate epochs on.
   const lat = currentSiteLat();
-  const spaceBased = instrumentByName($('instrument').value)?.isSpaceBased;
+  const scope = selectedScope();
+  // selectedScope() as well as instrumentByName(): the latter only searches the exoplanet
+  // roster, so it answers undefined for every astrograph and the band was still being drawn
+  // under a space telescope, which has no horizon for anything to be below.
+  const spaceBased = !!(instrumentByName($('instrument').value)?.isSpaceBased || scope?.isSpaceBased);
+
+  if ($('shadeKey')) $('shadeKey').hidden = spaceBased;
+  if ($('cvzKey')) $('cvzKey').hidden = !spaceBased;
+  if (spaceBased && state.platform) drawContinuousViewingZone(g, geo);
+
   if (lat !== null && !spaceBased) {
     g.fillStyle = 'rgba(255,110,100,.05)';
     g.strokeStyle = 'rgba(255,110,100,.22)';
@@ -1696,6 +1798,169 @@ function wireSkyEvents() {
     if (!pos) return;
     aimAt(pos);
   });
+}
+
+/**
+ * The continuous-viewing zone, the orbital counterpart of the ground map's never-visible
+ * declination band, and the opposite sign of the same idea: the ground band is where a site
+ * can NEVER point, this is where the spacecraft is NEVER occulted.
+ *
+ * It is a small circle rather than a parallel because it is centred on the ORBIT pole, not on
+ * the celestial one. The pole sits at declination 90 - inclination, at the right ascension of
+ * the ascending node minus 90 degrees, and it drifts westward with the node (about -6.6 deg per
+ * day for Hubble), which is exactly why the panel offers the node as a control: it is what puts
+ * a given target inside the zone or outside it.
+ */
+function drawContinuousViewingZone(g, geo) {
+  const p = state.platform;
+  const rDeg = p.derived.continuousViewingHalfWidthDeg;
+  if (!(rDeg > 0)) return;
+
+  const rad = Math.PI / 180;
+  const poleDec = 90 - p.orbit.inclinationDeg;
+  const poleRa = p.orbit.raanDeg - 90;
+
+  // Orthonormal frame about the pole, so the circle can be swept as one rotation in it.
+  const n = [Math.cos(poleDec * rad) * Math.cos(poleRa * rad),
+             Math.cos(poleDec * rad) * Math.sin(poleRa * rad),
+             Math.sin(poleDec * rad)];
+  // Any vector not parallel to n; the celestial pole unless n IS the celestial pole.
+  const seed = Math.abs(n[2]) > 0.9 ? [1, 0, 0] : [0, 0, 1];
+  const e1 = norm3(cross3(seed, n));
+  const e2 = cross3(n, e1);
+
+  const pts = [];
+  for (let t = 0; t <= 360; t += 4) {
+    const c = Math.cos(rDeg * rad), s = Math.sin(rDeg * rad);
+    const ct = Math.cos(t * rad), st = Math.sin(t * rad);
+    const v = [c * n[0] + s * (ct * e1[0] + st * e2[0]),
+               c * n[1] + s * (ct * e1[1] + st * e2[1]),
+               c * n[2] + s * (ct * e1[2] + st * e2[2])];
+    let ra = Math.atan2(v[1], v[0]) / rad; if (ra < 0) ra += 360;
+    pts.push([Math.min(359.999, Math.max(0.001, ra)), Math.asin(Math.max(-1, Math.min(1, v[2]))) / rad]);
+  }
+
+  // Stroked, not filled: skyPath breaks the run where the circle crosses the RA 0h seam, so a
+  // fill would close across the whole map. The outline is what carries the information anyway.
+  g.save();
+  g.strokeStyle = 'rgba(126,231,135,.55)';
+  g.setLineDash([4, 3]);
+  g.lineWidth = 1.2;
+  g.beginPath();
+  skyPath(g, geo, pts);
+  g.stroke();
+  g.restore();
+}
+
+function cross3(a, b) {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+function norm3(v) {
+  const m = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / m, v[1] / m, v[2] / m];
+}
+
+/* -------------------------------------------------------------- spacecraft */
+/* Flying the orbital half. The four elements are controls rather than a datasheet: each
+   one changes something you can see in the next frame, and the derived line under them
+   is the server's arithmetic rather than a second copy of it here. */
+
+let orbitTimer = null;
+
+async function loadPlatform(id) {
+  if (!id) { $('spacecraftBlock').hidden = true; return; }
+  const p = await (await fetch(`/api/platforms/${encodeURIComponent(id)}`)).json();
+  state.platform = p;
+  fillPlatform(p);
+  drawSkyStatic();     // the continuous-viewing zone belongs to the orbit
+  scheduleForecast();
+}
+
+function fillPlatform(p) {
+  $('scName').textContent = p.name;
+  $('scAlt').value = p.orbit.altitudeKm.toFixed(0);
+  $('scInc').value = p.orbit.inclinationDeg.toFixed(2);
+  $('scRaan').value = p.orbit.raanDeg.toFixed(0);
+  $('scPhase').value = p.orbit.phaseDeg.toFixed(0);
+
+  const d = p.derived;
+  $('scDerived').textContent =
+    `${fmt.num(d.periodMinutes, 1)} min orbit · Earth ${fmt.num(d.earthAngularRadiusDeg, 1)}° radius · ` +
+    `continuous-viewing zone ±${fmt.num(d.continuousViewingHalfWidthDeg, 1)}° about the orbit pole · ` +
+    `node ${fmt.num(d.nodalRegressionDegPerDay, 2)}°/day`;
+
+  const c = p.constraints;
+  $('scConstraints').textContent = c
+    ? `Avoidance: Sun ${c.sunAvoidanceDeg}°, sunlit limb ${c.brightLimbAvoidanceDeg}°, ` +
+      `dark limb ${c.darkLimbAvoidanceDeg}°, Moon ${c.moonAvoidanceDeg}°. ` +
+      `Pointing held to ${c.pointingJitterArcsecRms}″ rms on ` +
+      (c.controlMode === 'MomentumExchange' ? 'reaction wheels' : c.controlMode) + '.'
+    : '';
+  $('scNote').textContent = p.note || '';
+}
+
+for (const [id, field] of [['scAlt', 'altitudeKm'], ['scInc', 'inclinationDeg'],
+                           ['scRaan', 'raanDeg'], ['scPhase', 'phaseDeg']]) {
+  $(id).addEventListener('change', async () => {
+    if (!state.platform) return;
+    const body = {}; body[field] = $(id).valueAsNumber;
+    const p = await (await fetch(`/api/platforms/${encodeURIComponent(state.platform.id)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json();
+    state.platform = p;
+    fillPlatform(p);      // the server clamps, so the field is re-read rather than trusted
+    drawSkyStatic();
+    scheduleForecast();
+  });
+}
+
+/** One revolution of yes/no for the current aim, with the reason for each no. */
+async function loadOrbitVisibility() {
+  const scope = selectedScope();
+  if (!scope || !scope.isSpaceBased) { $('orbitPanel').hidden = true; return; }
+
+  const qs = new URLSearchParams({ ra: $('capRa').value, dec: $('capDec').value, samples: 120 });
+  const d = await (await fetch(`/api/platforms/${encodeURIComponent(scope.platform)}/conditions?${qs}`)).json();
+  if (d.error) { $('orbitPanel').hidden = true; return; }
+
+  $('orbitPanel').hidden = false;
+  fillPlatform(d.platform);
+
+  const c = d.conditions;
+  $('orbitNote').textContent =
+    `${d.platform.name}, one ${fmt.num(d.platform.derived.periodMinutes, 1)}-minute revolution from now`;
+
+  const strip = $('orbitStrip');
+  strip.innerHTML = '';
+  for (const p of d.orbitTrack) {
+    const s = document.createElement('span');
+    s.className = p.observable ? 'ok' : classForBlock(p.blockedBy);
+    s.title = `+${p.minutes.toFixed(1)} min · ` + (p.observable ? 'observable' : p.blockedBy);
+    strip.appendChild(s);
+  }
+
+  const open = d.orbitTrack.filter((p) => p.observable).length / d.orbitTrack.length;
+  $('orbitHint').textContent = c.observable
+    ? `Observable now. ${(open * 100).toFixed(0)}% of the orbit is open on this field; ` +
+      `longest single exposure ${fmt.int(c.maxContiguousExposureSeconds)} s. ` +
+      `Sun ${fmt.num(c.sunAngleDeg, 0)}° away, Earth limb ${fmt.num(c.earthLimbAngleDeg, 0)}° ` +
+      `(${c.limbIsSunlit ? 'sunlit' : 'dark'}), sky ${fmt.num(c.skyVMagPerArcsec2, 1)} V mag/arcsec².`
+    : d.nextWindowUtc
+      ? `${c.blockedBy} right now. Next window ${d.nextWindowUtc}; the capture will be scheduled there.`
+      : `${d.blockedBy} for the whole of the next 24 hours. ` +
+        (String(d.blockedBy || '').includes('solar')
+          ? 'The solar avoidance cone moves with the Earth’s own orbit, so it clears in weeks rather than orbits: this field is out of season.'
+          : 'Try a field nearer the orbit pole.');
+}
+
+function classForBlock(reason) {
+  const r = String(reason || '');
+  if (r.includes('occulted')) return 'occ';
+  if (r.includes('solar')) return 'sun';
+  if (r.includes('Moon') || r.includes('moon')) return 'moon';
+  return 'limb';
 }
 
 boot();

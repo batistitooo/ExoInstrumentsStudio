@@ -25,6 +25,14 @@ namespace ExoStudio.Simulation
             public string ObjectName;
             public string Kind;         // "sub", "stack", "composite"
             public byte[] Png;          // composite entries carry their colour PNG here
+
+            /// <summary>
+            /// The exposure this frame came out of, kept so the frame can be REDUCED later rather
+            /// than only downloaded. It carries the gain, the bias, the plate scale, the delivered
+            /// FWHM and the injected star catalogue, which together are what turns a picture back
+            /// into magnitudes and lets the answer be scored. See Simulation/FrameReduction.cs.
+            /// </summary>
+            public DeepSkyCamera.PreparedExposure Exposure;
         }
 
         private const int MaxHeld = 24;

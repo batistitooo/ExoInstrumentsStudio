@@ -75,6 +75,34 @@ namespace ExoStudio.Simulation
             public double LongitudeDeg { get; init; }   // east positive
             public double AltitudeMeters { get; init; }
             public string Note { get; init; }
+
+            /// <summary>
+            /// Air temperature the detector's cooler works against, Celsius.
+            ///
+            /// WHY THIS HAD TO MOVE ONTO THE SITE. Core carries an ambient temperature too, on the
+            /// INSTRUMENT (VisualTelescopeSpec.SiteAmbientTemperatureCelsius), and in the mod that
+            /// is right: each telescope stands in exactly one place, so "the instrument" and "the
+            /// site" are one fact. Studio broke that the moment it offered a site picker. With the
+            /// figure still on the instrument, taking the RC20 to Mauna Kea left its cooler bounded
+            /// by the annual mean at Saint-Michel-l'Observatoire, so the coldest setpoint on offer
+            /// at 4205 m in Hawaii was the one available in Provence, and the dark current followed.
+            /// A thermoelectric cooler pumps heat: where it lands depends on where it starts, so
+            /// this is the number that decides the whole range.
+            /// </summary>
+            public double AmbientTemperatureCelsius { get; init; } = double.NaN;
+
+            /// <summary>
+            /// Where the figure above comes from, and WHAT IT ACTUALLY IS, because the two are not
+            /// the same across these five sites and the difference is worth carrying rather than
+            /// averaging away. Only Mauna Kea has a published NIGHT-TIME statistic; the rest are
+            /// 24-hour means, which run warmer than the air at 3 a.m. by an amount nobody in this
+            /// list publishes. Shown in the interface next to the cooler, in the same spirit as the
+            /// emission lines labelling themselves measured or derived.
+            /// </summary>
+            public string AmbientTemperatureSource { get; init; }
+
+            /// <summary>True when the figure is a night-time statistic rather than a round-the-clock mean.</summary>
+            public bool AmbientIsNightTime { get; init; }
         }
 
         public static readonly Site Ohp = new()
@@ -86,6 +114,11 @@ namespace ExoStudio.Simulation
             LongitudeDeg = 5.7133,
             AltitudeMeters = 650,
             Note = "Where 51 Peg b was found in 1995, with ELODIE on the 1.93 m. SOPHIE is its successor on the same telescope.",
+            // The figure Core already carried for the RC20 and the RedCat, which stand here.
+            AmbientTemperatureCelsius = 11.8,
+            AmbientTemperatureSource = "annual mean air temperature at Saint-Michel-l'Observatoire, "
+                                     + "the commune OHP stands in (climate-data.org). Round the clock, not night.",
+            AmbientIsNightTime = false,
         };
 
         public static readonly Site LaSilla = new()
@@ -97,6 +130,15 @@ namespace ExoStudio.Simulation
             LongitudeDeg = -70.7346,
             AltitudeMeters = 2400,
             Note = "ESO 3.6 m, home of HARPS.",
+            // DERIVED, AND THE ONE HERE THAT IS. No published mean for La Silla turned up, so this
+            // is Paranal's measured 12.8 C carried down 235 m of altitude at 8 C/km, the middle of
+            // the 6.0-10.0 C/km wet-to-dry adiabatic range Lombardi et al. quote in the same paper.
+            // Same coastal Atacama range, 160 km apart. Replace it with a real ESO ambient-database
+            // query when one is run; it is the weakest number in this list and is labelled as such.
+            AmbientTemperatureCelsius = 14.7,
+            AmbientTemperatureSource = "DERIVED, not measured: Paranal's 12.8 C brought down 235 m "
+                                     + "at 8 C/km. Round the clock, not night.",
+            AmbientIsNightTime = false,
         };
 
         public static readonly Site Paranal = new()
@@ -108,6 +150,13 @@ namespace ExoStudio.Simulation
             LongitudeDeg = -70.4042,
             AltitudeMeters = 2635,
             Note = "The VLT. ESPRESSO feeds from all four unit telescopes; SPECULOOS-South sits on the same mountain.",
+            // Lombardi et al. 2009, MNRAS 399, 783, Table 3: the 2 m sensor's average over the
+            // 22-year database, 1985-2006. The paper's own choice of the 2 m over the 30 m sensor
+            // is explained there (they differ by 0.2 C, the sensor's own accuracy).
+            AmbientTemperatureCelsius = 12.8,
+            AmbientTemperatureSource = "12.8 +/- 0.5 C, 22-year mean at 2 m (Lombardi et al. 2009, "
+                                     + "MNRAS 399, 783, Table 3). Round the clock, not night.",
+            AmbientIsNightTime = false,
         };
 
         public static readonly Site RoqueDeLosMuchachos = new()
@@ -119,6 +168,13 @@ namespace ExoStudio.Simulation
             LongitudeDeg = -17.8814,
             AltitudeMeters = 2396,
             Note = "Northern-hemisphere counterpart to Paranal for bright-star spectroscopy.",
+            // Same table, the Carlsberg Meridian Telescope's station at 10.5 m: 8.8 +/- 1.2 C over
+            // 1985-2004. The paper's headline comparison is that ORM runs about 4 C colder than
+            // Paranal with three times the year-to-year spread, and this is that 4 C.
+            AmbientTemperatureCelsius = 8.8,
+            AmbientTemperatureSource = "8.8 +/- 1.2 C, 20-year mean at the CAMC station (Lombardi "
+                                     + "et al. 2009, MNRAS 399, 783, Table 3). Round the clock, not night.",
+            AmbientIsNightTime = false,
         };
 
         public static readonly Site MaunaKea = new()
@@ -130,6 +186,15 @@ namespace ExoStudio.Simulation
             LongitudeDeg = -155.4681,
             AltitudeMeters = 4205,
             Note = "Highest of the classical sites; the driest, and the best seeing of the list.",
+            // THE ONLY GENUINELY NIGHT-TIME FIGURE IN THIS LIST. The CFHT Observatory Manual, Sect. 2,
+            // publishes summit MEAN MINIMA of "around 0 C (summer) and -4 C (winter)", against
+            // daytime values of 10 C and 3 C. A minimum is reached at night, so the midpoint of the
+            // two minima is a night statistic rather than a round-the-clock mean, and the 12 C gap
+            // to the daytime figures is exactly the diurnal swing the other four sites here hide.
+            AmbientTemperatureCelsius = -2.0,
+            AmbientTemperatureSource = "midpoint of the published summit mean minima, 0 C summer and "
+                                     + "-4 C winter (CFHT Observatory Manual Sect. 2). Night-time.",
+            AmbientIsNightTime = true,
         };
 
         public static readonly Site[] All = { Ohp, LaSilla, Paranal, RoqueDeLosMuchachos, MaunaKea };

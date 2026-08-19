@@ -89,6 +89,17 @@ InstrumentSpec[] drivableInstruments = Observatories.All
     .Where(i => !i.UnderConstruction)
     .ToArray();
 
+// Plus any spectrograph or photometer the observer defined. A function rather than an array
+// because the second half changes while the server runs. This is the Queloz-lab case: radial
+// velocity is what that group does, and until now a campaign could only be run on one of the six
+// catalogue instruments, never on the one being designed.
+InstrumentSpec[] DrivableInstruments() =>
+    drivableInstruments.Concat(
+        CustomInstruments.All
+            .Select(c => c.Instrument)
+            .Where(i => i.Method is DetectionMethod.RadialVelocity or DetectionMethod.Transit))
+        .ToArray();
+
 // --- bootstrap -----------------------------------------------------------------
 
 app.MapGet("/api/bootstrap", () => Results.Json(new
@@ -102,7 +113,7 @@ app.MapGet("/api/bootstrap", () => Results.Json(new
         transiting = catalog.Targets.Count(t => t.IsTransiting),
         minimumMassCorrections = catalog.MinimumMassCorrections,
     },
-    instruments = drivableInstruments.Select(Dto.Instrument),
+    instruments = DrivableInstruments().Select(Dto.Instrument),
     sites = ObservingSites.All.Select(Dto.Site),
     limits = new
     {
@@ -146,14 +157,45 @@ app.MapGet("/api/sky", () => Results.Json(new
 // --- visual telescopes ------------------------------------------------------------
 
 // The mod's astrograph roster, from Core's own VisualTelescopeCatalog via Observatories.
-// Ground instruments only in this pass: the orbital platform's constraint model is a
-// different observing geometry, not just a missing atmosphere.
+//
+// BOTH HALVES OF IT NOW. This list used to be filtered down to the ground instruments, and the
+// reason it gave was right: the orbital platform's constraint model is a different observing
+// geometry, not just a missing atmosphere. That geometry is now here. See
+// Simulation/OrbitalPlatforms.cs for the orbit and the constraints, and the `space` branches in
+// DeepSkyCamera.Prepare for the five places they enter an exposure.
+//
+// AND THE SECOND WFC3 CHANNEL, which Core carries as a VisualTelescopeSpec but not as an
+// InstrumentSpec. In the mod that is right: Observatories.All is the career-mode unlock list, one
+// row per thing you buy or launch, and you do not launch a second Hubble to use its infrared
+// detector. WFC3 has a Channel Select Mechanism and the mod's panel drives it. Studio has no
+// unlock economy and no mechanism panel: an instrument here is a thing you can point, and the IR
+// channel is one. So it is synthesised from the Core spec rather than added to Core, which would
+// be drift against the mod for a reason that only applies here.
 InstrumentSpec[] astrographs = Observatories.All
     .Where(i => i.Method == DetectionMethod.SolarSystemPhotography && i.VisualTelescope != null)
-    .Where(i => !i.VisualTelescope.IsSpaceBased)
+    .Concat(VisualTelescopeCatalog.All
+        .Where(v => v.IsSpaceBased)
+        .Where(v => !Observatories.All.Any(i => i.VisualTelescope == v))
+        .Select(v => new InstrumentSpec
+        {
+            Name = v.Name,
+            DisplayName = v.Name + ", " + v.CameraName,
+            Method = DetectionMethod.SolarSystemPhotography,
+            Description = "The second channel of the same instrument on the same telescope. Everything "
+                        + "upstream of the detector is identical to the UVIS channel; everything from the "
+                        + "detector inwards is not, and not by degree: an HgCdTe array has no charge "
+                        + "transfer and no blooming, it is read non-destructively up a ramp, and it carries "
+                        + "interpixel capacitance and a measured persistence law.",
+            Citation = v.Name + " / " + v.CameraName + ", see VisualTelescopeCatalog for the per-figure sourcing.",
+            IsSpaceBased = true,
+            ApertureMeters = v.ApertureMeters,
+            SiteAltitudeMeters = 0.0,
+            VisualTelescope = v,
+            UnlockedByDefault = true,
+        }))
     .ToArray();
 
-app.MapGet("/api/telescopes", () => Results.Json(astrographs.Select(i => new
+app.MapGet("/api/telescopes", () => Results.Json(PointableAstrographs().Select(i => new
 {
     name = i.Name,
     displayName = i.DisplayName,
@@ -161,6 +203,13 @@ app.MapGet("/api/telescopes", () => Results.Json(astrographs.Select(i => new
     telescope = i.VisualTelescope.Name,
     camera = i.VisualTelescope.CameraName,
     site = i.VisualTelescope.SiteName,
+
+    // Which half of the roster this is. The interface hides the site picker and the tracking
+    // switch for a space telescope, because neither means anything up there, and offers the
+    // spacecraft's own controls instead.
+    isSpaceBased = i.VisualTelescope.IsSpaceBased,
+    platform = OrbitalPlatforms.ForInstrument(i.VisualTelescope)?.Id,
+
     apertureMeters = i.VisualTelescope.ApertureMeters,
     focalLengthMeters = i.VisualTelescope.FocalLengthMeters,
     barlow = i.VisualTelescope.BarlowFactor,
@@ -179,22 +228,187 @@ app.MapGet("/api/telescopes", () => Results.Json(astrographs.Select(i => new
 
     detectorTemperatureC = Finite(i.VisualTelescope.DetectorTemperatureCelsius),
     hasAdjustableCooler = i.VisualTelescope.HasAdjustableCooler,
-    coolerMinC = i.VisualTelescope.HasAdjustableCooler ? Finite(i.VisualTelescope.CoolerMinimumTemperatureCelsius) : null,
-    coolerMaxC = i.VisualTelescope.HasAdjustableCooler ? Finite(i.VisualTelescope.CoolerMaximumTemperatureCelsius) : null,
+
+    // THE DELTA, NOT THE BOUNDS. A thermoelectric cooler is published as "so many degrees below
+    // ambient" because that is what the device can actually do: it pumps heat, so where it lands
+    // depends on where it starts. The bounds therefore belong to the instrument AND the site
+    // together, and this endpoint only knows the instrument. Sending the delta lets the browser
+    // recompute them the moment the site changes, against the ambient each site carries in
+    // /api/bootstrap, which is exactly what used to be wrong: the bounds were baked here from
+    // the instrument's HOME site and never moved again.
+    coolerDeltaC = i.VisualTelescope.HasAdjustableCooler ? Finite(i.VisualTelescope.CoolerDeltaBelowAmbientC) : null,
     darkCurrentAtSpecC = i.VisualTelescope.DarkCurrentElectronsPerSecond,
 })));
 
 static double? Finite(double v) => double.IsNaN(v) || double.IsInfinity(v) ? null : v;
 
+// --- the observer's own instrument -------------------------------------------------
+//
+// The point of the whole project, for anyone who owns a telescope rather than wanting to look at
+// ours. See Simulation/CustomInstruments.cs for the rule this follows: an unsupplied quantity is
+// derived, or declared unmodelled, or refused, and never guessed. What was declared comes back with
+// the instrument and belongs in any figure made from it.
+
+app.MapGet("/api/instruments/custom", () => Results.Json(new
+{
+    imaging = CustomInstruments.All.Where(c => c.Spec != null).Select(Dto.CustomInstrument),
+    detectors = CustomInstruments.All.Where(c => c.Spec == null).Select(Dto.CustomDetector),
+}));
+
+app.MapPost("/api/instruments/custom", (CustomInstruments.Request req) =>
+{
+    CustomInstruments.Built b = CustomInstruments.Build(req, out string error);
+    return b == null ? Results.BadRequest(new { error }) : Results.Json(Dto.CustomInstrument(b));
+});
+
+/// <summary>
+/// A spectrograph or a photometer the observer specified. Separate from the imaging endpoint
+/// because a detection instrument is specified by the precision it ACHIEVES rather than by the
+/// optics that get there, which is how its own builders publish it and how Core's InstrumentSpec
+/// is shaped.
+/// </summary>
+app.MapPost("/api/instruments/detector", (CustomInstruments.DetectorRequest req) =>
+{
+    CustomInstruments.Built b = CustomInstruments.BuildDetector(req, out string error);
+    return b == null ? Results.BadRequest(new { error }) : Results.Json(Dto.CustomDetector(b));
+});
+
+app.MapDelete("/api/instruments/custom/{id}", (string id) =>
+    CustomInstruments.Remove(id)
+        ? Results.Json(new { removed = id })
+        : Results.NotFound(new { error = $"No instrument '{id}'." }));
+
+/// <summary>
+/// What this instrument can detect, which is the question an instrument builder actually has.
+///
+/// Not a capture: a capture answers "what does this field look like through it", and this answers
+/// "how faint can it go, and how fast". The numbers are the ones the exposure itself is built from,
+/// so they cannot disagree with a frame taken afterwards: the same SystemResponse, the same
+/// collecting area, the same detector chain.
+/// </summary>
+app.MapGet("/api/instruments/{name}/limits", (string name, string site, double? exposure,
+                                              string filter, int? binning, double? snr) =>
+{
+    InstrumentSpec inst = PointableAstrographs().FirstOrDefault(
+        i => string.Equals(i.Name, name, StringComparison.OrdinalIgnoreCase));
+    if (inst == null) return Results.NotFound(new { error = $"Unknown instrument '{name}'." });
+
+    if (!Enum.TryParse(filter ?? "Luminance", true, out ExoInstruments.Visualization.CameraFilter f))
+        return Results.BadRequest(new { error = $"Unknown filter '{filter}'." });
+
+    ObservingSites.Site s = CustomInstruments.SiteById(site) ?? ObservingSites.ById(site);
+    return Results.Json(Dto.Limits(DetectionLimits.Compute(
+        inst.VisualTelescope, s, f,
+        exposure ?? 300.0, binning ?? 1, snr ?? 5.0,
+        OrbitalPlatforms.ForInstrument(inst.VisualTelescope))));
+});
+
+
+// --- the spacecraft ----------------------------------------------------------------
+//
+// The orbital half's equivalent of the site picker, and it is a CONTROL PANEL rather than a
+// picker because an orbit is not a list. Altitude, inclination, node and phase each decide
+// something visible in the frame: how much sky the Earth blocks, which targets ever reach the
+// continuous-viewing zone, and how long a single exposure can run before the planet cuts it off.
+//
+// State is process-wide and survives captures, like the simulated clock: this is the state of
+// the observatory, not of a request.
+
+app.MapGet("/api/platforms", () => Results.Json(OrbitalPlatforms.All.Select(Dto.Platform)));
+
+app.MapGet("/api/platforms/{id}", (string id) =>
+{
+    OrbitalPlatforms.Platform p = OrbitalPlatforms.ById(id);
+    return p == null ? Results.NotFound(new { error = $"No spacecraft '{id}'." })
+                     : Results.Json(Dto.Platform(p));
+});
+
+/// <summary>
+/// Fly the spacecraft. Every field is optional; what is sent is applied, what is not is left.
+/// </summary>
+app.MapPost("/api/platforms/{id}", (string id, PlatformOrbitRequest req) =>
+{
+    OrbitalPlatforms.Platform p = OrbitalPlatforms.ById(id);
+    if (p == null) return Results.NotFound(new { error = $"No spacecraft '{id}'." });
+
+    // Clamped rather than refused, with the bounds meaning something physical at each end: below
+    // 160 km an orbit does not survive one revolution, and past 36000 km it is no longer low
+    // Earth orbit and the constraint model's whole shape (a planet filling half the sky) is gone.
+    if (req.AltitudeKm is double alt) p.Orbit.AltitudeKm = Math.Clamp(alt, 160.0, 36000.0);
+    if (req.InclinationDeg is double inc) p.Orbit.InclinationDeg = Math.Clamp(inc, 0.0, 180.0);
+    if (req.RaanDeg is double raan) p.Orbit.RaanAtEpochDeg = raan;
+    if (req.PhaseDeg is double phase) p.Orbit.PhaseAtEpochDeg = phase;
+
+    return Results.Json(Dto.Platform(p));
+});
+
+/// <summary>
+/// What the constraint model says about one pointing, now and over the coming orbit.
+///
+/// This is the orbital counterpart of /api/forecast, and it is a different shape because it
+/// answers a different question. A ground forecast is a continuous quantity over a night: how
+/// high, through how much air, under how much moonlight. In orbit a pointing is legal or it is
+/// not, so what comes back is the run of yes/no over one revolution, plus the reason for each no.
+/// </summary>
+app.MapGet("/api/platforms/{id}/conditions", (string id, double ra, double dec, string at, int? samples) =>
+{
+    OrbitalPlatforms.Platform p = OrbitalPlatforms.ById(id);
+    if (p == null) return Results.NotFound(new { error = $"No spacecraft '{id}'." });
+
+    double ut = DateTime.TryParse(at, CultureInfo.InvariantCulture,
+                                  DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal,
+                                  out DateTime when)
+        ? SimulationClock.UtcToUt(when)
+        : SimulationClock.UtcToUt(DateTime.UtcNow);
+
+    SpaceConditionsSnapshot now = OrbitalPlatforms.Evaluate(p, ut, ra, dec);
+    OrbitalPlatforms.State st = OrbitalPlatforms.StateAt(p.Orbit, ut);
+
+    int n = Math.Clamp(samples ?? 96, 8, 480);
+    double period = p.Orbit.PeriodSeconds;
+    var track = new List<object>(n);
+    for (int i = 0; i < n; i++)
+    {
+        double t = ut + period * i / n;
+        SpaceConditionsSnapshot s = OrbitalPlatforms.Evaluate(p, t, ra, dec);
+        track.Add(new
+        {
+            utc = SimulationClock.UtToUtc(t).ToString("yyyy-MM-dd HH:mm:ss'Z'"),
+            minutes = period * i / n / 60.0,
+            observable = s.Observable,
+            blockedBy = s.BlockingConstraint,
+            skyVMag = Finite(s.SkyVMagPerArcsec2),
+        });
+    }
+
+    bool found = OrbitalPlatforms.TryFindWindow(p, ut, ra, dec, out double nextUt, out _, out string blockedBy);
+
+    return Results.Json(new
+    {
+        platform = Dto.Platform(p),
+        state = Dto.PlatformState(st),
+        conditions = Dto.SpaceConditions(now),
+        nextWindowUtc = found ? SimulationClock.UtToUtc(nextUt).ToString("yyyy-MM-dd HH:mm:ss'Z'") : null,
+        blockedBy = found ? null : blockedBy,
+        orbitTrack = track,
+    });
+});
+
 app.MapGet("/api/capture/data", () => Results.Json(new
 {
     files = deepSky.Value.Report,
     simplifications = DeepSkyCamera.DeclaredSimplifications,
+    spaceSimplifications = DeepSkyCamera.DeclaredSpaceSimplifications,
 }));
+
+// Every astrograph that can be pointed right now: the catalogue roster plus anything the observer
+// has defined. A function rather than an array because the second half changes while the server runs.
+InstrumentSpec[] PointableAstrographs() =>
+    astrographs.Concat(CustomInstruments.All.Select(c => c.Instrument)).ToArray();
 
 app.MapPost("/api/capture", (CaptureRequestDto req) =>
 {
-    InstrumentSpec instrument = astrographs.FirstOrDefault(
+    InstrumentSpec instrument = PointableAstrographs().FirstOrDefault(
         i => string.Equals(i.Name, req.Telescope, StringComparison.OrdinalIgnoreCase));
     if (instrument == null) return Results.BadRequest(new { error = $"Unknown astrograph '{req.Telescope}'." });
 
@@ -230,11 +444,20 @@ app.MapPost("/api/capture", (CaptureRequestDto req) =>
     if (px > MaxFramePixels)
         return Results.BadRequest(new { error = $"{spec.NativeSensorWidthPx / bin}x{spec.NativeSensorHeightPx / bin} at binning {bin} is {px / 1e6:F1} Mpx, over the {MaxFramePixels / 1e6:F0} Mpx this build will hold in memory at once. Raise the binning." });
 
+    // The spacecraft, when this instrument flies on one. Resolved from the instrument rather than
+    // taken from the request: which vehicle carries WFC3 is a fact about the roster, not a choice.
+    // Site is still filled for a space telescope, and is used for nothing but the label; every
+    // atmospheric term it would otherwise drive is switched off inside Prepare.
+    OrbitalPlatforms.Platform platform = OrbitalPlatforms.ForInstrument(spec);
+
     ulong seed = (ulong)Environment.TickCount64;
     var request = new DeepSkyCamera.Request
     {
         Spec = spec,
-        Site = ObservingSites.ById(req.Site),
+        // Custom sites are looked up alongside the five real ones: an observer who defined their
+        // own instrument usually defined the mountain it stands on in the same breath.
+        Site = CustomInstruments.SiteById(req.Site) ?? ObservingSites.ById(req.Site),
+        Platform = platform,
         Ut = SimulationClock.UtcToUt(DateTime.UtcNow),
         RaDeg = req.RaDeg,
         DecDeg = req.DecDeg,
@@ -271,6 +494,7 @@ app.MapPost("/api/capture", (CaptureRequestDto req) =>
         Header = DeepSkyCamera.HeaderFor(prep, seed, req.ObjectName),
         ObjectName = req.ObjectName,
         Kind = "sub",
+        Exposure = prep,
     });
 
     return Results.Json(new
@@ -297,7 +521,117 @@ app.MapPost("/api/capture", (CaptureRequestDto req) =>
         detectorTemperatureC = prep.DetectorTemperatureCelsius,
         darkElectronsPerPixel = r.DarkElectronsPerPixel,
         zoomFactor = prep.ZoomFactor,
+
+        // Orbital readout: null on the ground, so the interface can branch on one field rather
+        // than on the instrument's name.
+        platform = r.PlatformName == null ? null : new
+        {
+            name = r.PlatformName,
+            altitudeKm = Finite(r.PlatformAltitudeKm),
+            subSatelliteRaDeg = Finite(r.SubSatelliteRaDeg),
+            subSatelliteDecDeg = Finite(r.SubSatelliteDecDeg),
+
+            // The pointing budget, which is inside the PSF: this is the jitter the OTA's own
+            // wavefront error was added to in quadrature, not a separate cosmetic number.
+            pointingRmsArcsec = Finite(r.Pointing.TotalArcsecRms),
+            pointingFwhmArcsec = Finite(r.Pointing.EquivalentFwhmArcsec),
+
+            skyVMagPerArcsec2 = Finite(r.SkyVMagPerArcsec2),
+            zodiacalVMagPerArcsec2 = Finite(r.ZodiacalVMagPerArcsec2),
+            earthshineVMagPerArcsec2 = Finite(r.EarthshineVMagPerArcsec2),
+            zodiacalIsPublished = r.ZodiacalIsPublished,
+
+            occultedOrbitFraction = Finite(r.OccultedOrbitFraction),
+            maxContiguousExposureSeconds = Finite(r.MaxContiguousExposureSeconds),
+            conditions = Dto.SpaceConditions(r.SpaceConditions),
+        },
     });
+});
+
+/// <summary>
+/// The calibration frames for a stored exposure: bias, dark and flat, as an observer would take
+/// them before the science, and each downloadable as FITS with the right IMAGETYP.
+///
+/// They mean something now. `Core/SensorNonUniformity` is wired into the detector, so a frame
+/// carries a real photo-response pattern for the flat to divide out and a real offset pattern for
+/// the bias to subtract, both drawn from the SILICON's seed rather than the exposure's, so a
+/// master stored today calibrates a light taken tomorrow.
+/// </summary>
+app.MapPost("/api/captures/{id}/calibration", (string id, CalibrationRequest req) =>
+{
+    CaptureStore.Stored s = captureStore.Get(id);
+    if (s == null) return Results.NotFound(new { error = "That frame has expired from the store; capture again." });
+    if (s.Exposure == null) return Results.BadRequest(new { error = "That frame was stored without its exposure, so calibration frames cannot be built for it." });
+
+    if (!Enum.TryParse(req?.Kind ?? "Bias", true, out CalibrationFrames.Kind kind))
+        return Results.BadRequest(new { error = $"Unknown calibration kind '{req?.Kind}'. Use Bias, Dark or Flat." });
+
+    // A dark must match the light's exposure to subtract correctly, so that is the default rather
+    // than something the caller has to remember.
+    double exposure = req?.ExposureSeconds ?? s.Exposure.ExposureSeconds;
+    int count = req?.Count ?? 16;
+
+    CalibrationFrames.Result cal = CalibrationFrames.Build(
+        s.Exposure, kind, count, exposure, (ulong)Environment.TickCount64);
+
+    ExoInstruments.Visualization.FitsWriter.FitsHeaderInfo header = DeepSkyCamera.HeaderFor(
+        s.Exposure, 0, CalibrationFrames.ImageTypeFor(kind), cal.Count, calibratedAdu: false);
+    header.ImageType = CalibrationFrames.ImageTypeFor(kind);
+    header.ExposureSeconds = cal.ExposureSeconds;
+    header.ObjectName = CalibrationFrames.ImageTypeFor(kind);
+    header.Wcs = default;                    // a calibration frame points nowhere and must not claim to
+
+    CaptureStore.Stored stored = captureStore.Add(new CaptureStore.Stored
+    {
+        Adu = cal.Adu,
+        W = cal.W,
+        H = cal.H,
+        Header = header,
+        ObjectName = CalibrationFrames.ImageTypeFor(kind).Replace(' ', '_'),
+        Kind = kind.ToString().ToLowerInvariant(),
+    });
+
+    return Results.Json(Dto.Calibration(cal, stored.Id));
+});
+
+/// <summary>
+/// Reduce a stored frame back into magnitudes, and score the answer against what went in.
+///
+/// THE ONLY CHECK ON THE FORWARD MODEL THAT DOES NOT CONSULT IT. Everything else here turns a
+/// magnitude into pixels; this turns the pixels back into a magnitude, by aperture photometry with
+/// a zero point fitted from the field, and compares. See Simulation/FrameReduction.cs for why the
+/// two independent failure modes it exposes are worth more than either cross-validation alone.
+/// </summary>
+app.MapGet("/api/captures/{id}/photometry", (string id, double? thresholdSigma, double? brightSnr,
+                                            string bias, string dark, string flat) =>
+{
+    CaptureStore.Stored s = captureStore.Get(id);
+    if (s == null) return Results.NotFound(new { error = "That frame has expired from the store; capture again." });
+    if (s.Exposure == null) return Results.BadRequest(new { error = "That frame was stored without its exposure, so it cannot be reduced." });
+
+    // Optional masters, by the ids the calibration endpoint returned. Given all three, the frame is
+    // reduced the way an observer reduces one, and the improvement is measurable: the photometric
+    // scatter falls by whatever the fixed pattern was contributing.
+    float[] light = s.Adu;
+    string applied = null;
+    if (bias != null || dark != null || flat != null)
+    {
+        float[] Master(string mid) => mid == null ? null : captureStore.Get(mid)?.Adu;
+        light = CalibrationFrames.Calibrate(s.Adu, Master(bias), Master(dark), Master(flat),
+                                            s.Exposure.BiasAdu);
+        applied = string.Join(" + ", new[]
+        {
+            bias != null ? "bias" : null, dark != null ? "dark" : null, flat != null ? "flat" : null,
+        }.Where(x => x != null));
+    }
+
+    FrameReduction.Result reduced = FrameReduction.Reduce(
+        light, s.Exposure,
+        Math.Clamp(thresholdSigma ?? FrameReduction.DefaultThresholdSigma, 1.0, 100.0),
+        Math.Clamp(brightSnr ?? 20.0, 1.0, 1000.0));
+    if (applied != null) reduced.Notes.Insert(0, $"Calibrated with {applied}.");
+
+    return Results.Json(Dto.Photometry(reduced));
 });
 
 // The stored frame as a real 16-bit FITS, written by the mod's own FitsWriter: WCS, EGAIN,
@@ -464,7 +798,7 @@ app.MapPost("/api/campaigns", (StartCampaignRequest req) =>
     StarTarget target = catalog.ByName(req.Target);
     if (target == null) return Results.BadRequest(new { error = $"No catalogue entry named '{req.Target}'." });
 
-    InstrumentSpec instrument = drivableInstruments.FirstOrDefault(
+    InstrumentSpec instrument = DrivableInstruments().FirstOrDefault(
         i => string.Equals(i.Name, req.Instrument, StringComparison.OrdinalIgnoreCase));
     if (instrument == null) return Results.BadRequest(new { error = $"Unknown or undrivable instrument '{req.Instrument}'." });
 
@@ -475,14 +809,19 @@ app.MapPost("/api/campaigns", (StartCampaignRequest req) =>
     if (instrument.Method == DetectionMethod.Transit && !catalog.SystemOf(target).Any(pl => pl.IsTransiting))
         return Results.BadRequest(new { error = $"Nothing in the {target.HostStarName} system transits from our line of sight; photometry would return a flat light curve." });
 
-    ObservingSites.Site site = ObservingSites.ById(req.Site);
+    // A custom spectrograph usually arrives with the mountain it stands on, so both are searched.
+    ObservingSites.Site site = CustomInstruments.SiteById(req.Site) ?? ObservingSites.ById(req.Site);
 
     double startUt = DateTime.TryParse(req.StartUtc, CultureInfo.InvariantCulture,
                                        DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out DateTime dt)
         ? SimulationClock.UtcToUt(dt)
         : SimulationClock.UtcToUt(DateTime.UtcNow);
 
-    var campaign = new Campaign(target, catalog.SystemOf(target), instrument, site, startUt);
+    // The seed. Given, and the run repeats exactly; omitted, and one is drawn and reported, so
+    // an interesting run stays reproducible after the fact rather than only when someone thought
+    // to pin it in advance. This is the campaign path catching up with the imaging path, which
+    // has always written its seed into the FITS header as RANDSEED.
+    var campaign = new Campaign(target, catalog.SystemOf(target), instrument, site, startUt, req.Seed);
     if (req.Warp.HasValue) campaign.SetWarp(req.Warp.Value);
     registry.Add(campaign);
     campaign.Start();

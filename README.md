@@ -30,7 +30,7 @@ retouching: these are single sub-exposures written straight out of the detector 
 | ![Carina in S II](docs/images/carina-sii.png) | ![M42 in H-alpha](docs/images/m42-halpha.png) |
 | **Carina, [S II], RC20, 600 s** from Paranal, at airmass 2.5 because that is where Carina was that night. | **M42, H-alpha, RC20, 300 s** from Paranal. The filter admits [N II] 6548 and 6584 alongside H-alpha, as a real 7 nm filter does. |
 | ![M31](docs/images/m31-luminance.png) | ![Omega Centauri](docs/images/omegacen-lum.png) |
-| **M31, luminance, RedCat 51, 300 s.** 2,383 catalogue stars in the field. | **Omega Centauri, luminance, RC20, 120 s** from Paranal. |
+| **M31, luminance, RedCat 51, 300 s.** 2,371 catalogue stars in the field. | **Omega Centauri, luminance, RC20, 120 s** from Paranal. |
 
 Reproduce any of them:
 
@@ -49,7 +49,8 @@ admitted and whether each was measured or derived.
 A local HTTP server running the [ExoInstruments](https://github.com/batistitooo/ExoInstruments)
 physics core on the real sky, driven from a clock we own rather than a game's. The browser is the
 interface. It does radial-velocity and transit campaigns against the real exoplanet catalogue, and
-deep-sky imaging with five real astrographs.
+deep-sky imaging with five real astrographs on five real mountains, plus Hubble's two WFC3
+channels in an orbit you fly yourself.
 
 **It is self-contained.** `Core/`, `Session/` and one file of `Visualization/` are the KSP mod's
 physics, vendored into this repository: clone it, run `./run.sh`, and nothing else needs to exist
@@ -120,6 +121,7 @@ validation/               the cross-validations behind ACCURACY.md
   dust-crossvalidation/   the extinction law against dust_extinction
   astrometry/             pointing and airmass against Skyfield
 tools/check_core_drift.py diffs the vendored core against a mod checkout
+TECHNICAL_REFERENCE.md    every figure Studio adds beyond Core, with its source
 Engine/
   ExoStudio.csproj        compiles Core/** + Session/** from this repository
   Program.cs              the HTTP API and static host
@@ -323,10 +325,15 @@ Ported from the mod, each stage validated before the next:
 cd Verify && dotnet run
 ```
 
-20 checks: the boundary stub against the mod, the minimum-mass correction against the
-published K, warp invariance across five configurations, sky geometry on a real Earth
-(culmination altitude, and a sidereal day distinguishable from a solar one), 51 Peg b
-recovered end to end, and the streaming Gaia reader against the mod's own cone search.
+97 checks: the boundary stub against the mod, the minimum-mass correction against the
+published K, warp invariance across five configurations, sky geometry on a real Earth,
+51 Peg b recovered end to end, the streaming Gaia reader against the mod's own cone search,
+the detector cooler reaching a colder floor at a colder site, Hubble's orbit against STScI's
+published period and the ISS's own −5.0°/day nodal regression, a campaign reproducing itself
+from its seed to 0.0 m/s, the CCD equation reproducing both of its own asymptotes, and a
+measured QE curve costing depth in blue while leaving green alone, the forward model agreeing with
+its own inverse to 12 mmag once the colour term is applied, and a flat removing exactly the
+published photo-response non-uniformity and the illumination falloff with it.
 
 That harness checks Studio against **itself**. The physics is checked against **other people's
 code** in `validation/`, reported in [ACCURACY.md](ACCURACY.md):
@@ -400,14 +407,281 @@ galaxy. Studio adds the missing tie-break (brighter member deposits, its map tot
 already folds the companion's flux); the corresponding mod fix is filed as a background
 task.
 
+## Your telescope, not ours
+
+Everything else here answers "what would the RC20 see". Someone building an instrument has a
+different question, about **their** instrument, and that is the difference between something to look
+at and something to use.
+
+```bash
+curl -s -X POST http://127.0.0.1:5227/api/instruments/custom -H 'Content-Type: application/json' \
+  -d '{"name":"1m prototype","apertureMeters":1.0,"focalLengthMeters":6.5,
+       "secondaryObstructionFraction":0.30,"sensorWidthPx":4096,"sensorHeightPx":4096,
+       "pixelSizeMicrons":9.0,"quantumEfficiency":0.90,"fullWellElectrons":90000,
+       "readNoiseElectrons":1.2,"darkCurrentElectronsPerSecond":0.002,
+       "detectorTemperatureCelsius":-40,"coolerDeltaBelowAmbientC":60,
+       "site":{"name":"Jungfraujoch","latitudeDeg":46.5473,"longitudeDeg":7.9853,
+               "altitudeMeters":3571,"ambientTemperatureCelsius":-7.9,
+               "zenithSeeingFwhmArcsec":1.1},
+       "filters":[{"position":"Luminance","centralWavelengthNm":550,"bandwidthAngstrom":890}]}'
+```
+
+It is then a first-class instrument: it appears in `/api/telescopes`, it takes real frames through
+the same pipeline, and you can ask what it can detect.
+
+```bash
+curl -s "http://127.0.0.1:5227/api/instruments/1m%20prototype/limits?site=jungfraujoch&exposure=600&snr=5"
+```
+
+> delivered FWHM 1.11″ (diffraction 0.111, seeing 1.10), 3.9 px per FWHM, well sampled ·
+> sky 413 e⁻/px, dark 0.019, read 1.2, detector at −67.9 °C ·
+> **limiting magnitude V = 23.83 at S/N 5 in 600 s**
+
+**Nothing is ever guessed.** A quantity you do not supply is *derived* from one you did, by a stated
+relation; or *declared unmodelled*, using this pipeline's own conventions; or **refused**, when the
+frame would be meaningless without it. Aperture, focal length, pixel size, full well and quantum
+efficiency are refused with a reason. So is a dark current given without the temperature it was
+measured at, because `DarkCurrentModel`'s whole job is to scale it from there and the number alone
+says nothing.
+
+Every instrument reports its own `assumptions` and `derived` lists on every response, because a
+frame from an instrument whose dark current was never given looks exactly as authoritative as one
+whose was.
+
+**Measured curves, not just numbers.** Quantum efficiency and the R/G/B filter transmissions accept
+a curve, which is what a detector datasheet actually carries, and `SystemResponse` evaluates it per
+wavelength inside the passband integral. Against a flat 0.90, a typical back-illuminated CMOS curve
+costs **0.212 mag in blue** (where it is really 0.62) and **0.032 mag in green** (where it really is
+0.90). A curve on a position this pipeline cannot hold one for is refused rather than silently
+replaced by a top-hat, and so is a curve transcribed in percent.
+
+**And your spectrograph.** A detection instrument is specified by the precision it *achieves*, not
+by the optics that get there, because that is how its builders publish it: HARPS is "1 m/s at
+V = 9.5". So it is a separate endpoint, and the instrument is then drivable by a campaign exactly
+like HARPS or TESS.
+
+```bash
+curl -s -X POST http://127.0.0.1:5227/api/instruments/detector -H 'Content-Type: application/json' \
+  -d '{"name":"EPRV prototype","method":"RadialVelocity","referencePrecision":0.30,
+       "referenceMagnitude":8.0,"cadenceSeconds":21600,"apertureMeters":4.0,"siteId":"orm"}'
+```
+
+Run on 51 Peg b for 198 nights it collects 152 epochs and recovers P = 4.23086 d against a catalogue
+4.230797, and K = 56.42 ± 0.15 m/s against a published 55.77 ± 0.15. The exponent defaults to 0.2,
+which is derived rather than assumed: flux goes as 10^(−0.4 Δm), so a photon-limited sigma goes as
+10^(+0.2 Δm).
+
+The limits calculator is not a second model: it inverts `CcdEquation`, Core's own Merline and Howell
+form, against the same `SystemResponse`, the same collecting area, the same sky and the same cooler
+bound the exposure uses. `Verify` checks it by its **scaling**, which a wrong constant cannot
+accidentally satisfy: four times the exposure buys 1.495 mag where read noise dominates (theory
+1.505) and 0.777 mag where the sky does (theory 0.753), and a 2.4 m above the atmosphere beats an
+8.2 m under it at equal exposure while having the smaller mirror.
+
+## Bias, dark and flat
+
+Calibration frames, as an observer takes them, each downloadable as FITS with the right `IMAGETYP`.
+
+```bash
+curl -s -X POST http://127.0.0.1:5227/api/captures/<id>/calibration \
+  -H 'Content-Type: application/json' -d '{"kind":"Flat","count":16}'
+```
+
+**They remove something now, which they could not before.** Every stochastic term here used to be
+temporal, so stacking averaged it down and no calibration frame could touch it: a bias measured one
+constant, and a flat was uniform to machine precision, so dividing by it divided by 1.
+`Core/SensorNonUniformity` exists precisely to fix that and was vendored and never called. It is now
+in the detector, so a frame carries two **fixed** patterns:
+
+| | kind | removed by | published |
+|---|---|---|---|
+| photo-response non-uniformity | multiplies light | division by a flat | 0.62 % per native pixel (EMVA 1288) |
+| offset fixed-pattern noise | additive, present at zero seconds | subtraction of a bias | 0.97 e⁻; ESO trends this as QC.BIAS.FPN |
+| cosine-fourth illumination | multiplies light, large scale | division by a flat | geometric, from focal length and off-axis distance |
+| field stop and image circle | hard edged | division by a flat | FORS2's 6.8 × 6.8 arcmin stop (ESO) |
+| non-linearity | curvature against signal | **nothing in the standard set** | 1.8 % at full well (FORS2) |
+
+**FORS2 is the case that shows it.** ESO publishes a 6.8 arcmin stop against a detector spanning 8.6,
+so 62 % of the frame is lit and roughly a third sees no sky at all. A 2 s frame on M13 comes out with
+the cluster confined to the central square and the corners sitting at the bias pedestal, which is
+what a real FORS2 image looks like.
+
+Both are drawn from a seed belonging to the **silicon**, not the exposure, so the same sensor appears
+in every session and a master stored today calibrates a light taken tomorrow. Binning is in that
+seed, because binning changes the read-out grid and a flat cannot cross binnings.
+
+The test is on a second flat, where the effect is unambiguous: it carries independent temporal noise
+and the same fixed pattern, so dividing by the master must remove that pattern and nothing else.
+
+| | pixel to pixel | illumination (RedCat corner/centre) |
+|---|---|---|
+| before | 0.339 % | 0.44 % down |
+| after | 0.194 % | **0.02 %** |
+| removed | **0.278 %** against a published 0.310 % | |
+
+**Where it matters, honestly.** The pixel-to-pixel term buys aperture photometry little: an aperture
+on a well-sampled star already averages ~120 pixels, so a 0.31 % white pattern falls to about
+0.3 mmag. The **large-scale** terms are a different matter, and they are why a flat is not optional.
+A 0.43 % illumination gradient does not average down inside an aperture, because it has the same
+sign across the whole of it; it is a position-dependent photometric error of that size in every
+magnitude measured away from the centre. On FORS2 it is a hard edge past which there is no data.
+Neither is removable by stacking, by a longer exposure, or by anything but a flat.
+
+**A bug this found**: the flat was aimed at half the *full well* in electrons. The ASI294MM Pro at
+binning 4 holds 1.06 Me⁻ per binned pixel behind a 14-bit converter, so half the well is eight times
+the top of the ADC and the flat came back clipped in every pixel, corner and centre both at `MaxAdu`
+and the ratio between them exactly 1.0000: a flat that had measured nothing while looking perfectly
+reasonable. It is now aimed at half of whichever clips first, which is what an observer watching the
+histogram does.
+
+## The forward model, checked against its own inverse
+
+Everything else in this repository turns a magnitude into pixels. A model like that can be wrong in
+ways nothing catches, because the only thing it is ever compared with is itself, and
+[ACCURACY.md](ACCURACY.md) checks one *stage* against somebody else's implementation of that stage:
+it says nothing about whether the stages are wired together right.
+
+So the frame gets reduced back. Studio records every star it deposits, with the magnitude it went in
+at, then digitises the frame with real Poisson noise and reduces it the way an observer would:
+detection, aperture photometry, and a zero point fitted from the field.
+
+```bash
+curl -s "http://127.0.0.1:5227/api/captures/<id>/photometry"
+```
+
+RC20 at Roque de los Muchachos, M13, 120 s, binning 1:
+
+| | |
+|---|---|
+| **median &#124;recovered − injected&#124;** | **6.8 mmag** |
+| **zero point, from the pixels vs from the passband integral** | 22.0967 vs 22.1584, **0.062 mag apart** |
+| drift of that agreement over a factor 2 in exposure | **0.6 mmag**, so the gain enters once |
+
+**It also measured something Core says is unknown.** `CcdEquation` assumes a Gaussian encircled
+energy of 0.7226 inside the photometric aperture, and its own comment says that is optimistic
+because a real profile has heavier wings, and that the true figure is "left as a refinement rather
+than done here". A curve of growth on the frame gives **0.5659**, which is **0.265 mag** of light the
+Gaussian assumption was claiming.
+
+The raw disagreement was 0.062 mag, and chasing it down is the part worth reading.
+
+The obvious explanation, that the reduction's 4 FWHM reference aperture misses the far Kolmogorov
+wing, is testable, because the PSF kernel is rebuildable and its encircled energy integrates
+directly. It came out **a quarter right**: the reference misses 1.6 %, or 0.017 mag.
+
+What separated the rest was one number that touches no zero point at all. Each injected star carries
+the electrons the model says it delivered, so measured aperture flux over enclosed fraction, against
+expected electrons, asks only whether the **flux chain conserves flux**. It gives 0.9841, the
+kernel's own 4 FWHM figure to four decimals. The chain is clean, and half the search space went.
+
+The rest is the **colour term**. The zero point is defined on a flat photon spectrum, the same
+choice the AB system makes (Oke & Gunn 1983), and stars are not flat: a zero point defined on one
+spectrum and measured on another differs by exactly this, and carrying one is ordinary photometric
+practice rather than a fix for a fault (Bessell 2005). Measured from the field: 0.050 mag.
+
+| | |
+|---|---|
+| reference aperture | 0.017 mag |
+| colour term | 0.050 mag |
+| **sum** | **0.067** against a measured **0.062** |
+| **with the colour term applied** | **−11.7 mmag** |
+
+So **the forward model and its inverse agree to 12 millimagnitudes**, and what looked like a
+discrepancy was two textbook effects plus a comparison made on the wrong scale. The endpoint now
+serves the colour term and the colour-matched zero point alongside the raw one.
+
+A frame can also be unreducible, and the endpoint says so rather than returning a number that looks
+like every other number. An 8.2 m at 60 s saturates every star bright enough for a curve of growth;
+the RedCat at binning 2 is 7.6 arcsec/px and fragments 1221 stars into 2716 detections. Both come
+back `reliable: false` with the reason.
+
+## Reproducible runs
+
+Every campaign carries a seed, reported whether you supplied one or not. Post the same target,
+instrument, site, start date and seed, and the run repeats epoch for epoch, to 0.0 m/s.
+
+This closed a real gap rather than adding a convenience: both session constructors used an unseeded
+`new Random()`, so no radial-velocity or transit result could be reproduced by anyone, including the
+person who produced it. The imaging path never had the problem, since its seed goes into the FITS
+header as `RANDSEED`. The fix touches two vendored files and is recorded as a fork in
+[CORE_PROVENANCE.md](CORE_PROVENANCE.md); it is additive, so the mod can take it as a paste, and it
+should.
+
+## Hubble, and the orbit you fly it in
+
+The roster's two orbital instruments, WFC3/UVIS and WFC3/IR on a 2.4 m OTA, are pointable
+now. They used to be filtered out of `/api/telescopes` with a note that said the reason
+correctly: *the orbital platform's constraint model is a different observing geometry, not
+just a missing atmosphere*. `Engine/Simulation/OrbitalPlatforms.cs` is that geometry.
+
+**The spacecraft is a control panel, not a site picker,** because an orbit is not a list.
+Altitude, inclination, node and phase are all settable, and each decides something visible:
+
+| you change | it moves |
+|---|---|
+| altitude | how much sky the Earth blocks (67.3° angular radius at 535 km), and therefore what fraction of every orbit a target is occulted for |
+| inclination | where the orbit pole is, and with it the continuous-viewing zone, drawn on the sky chart as a dashed circle |
+| node | the same zone's right ascension, which also drifts on its own at −6.6°/day from the J2 nodal regression |
+| phase | where round the orbit the spacecraft is right now, which is the difference between a target being up and being behind the planet |
+
+**Five things switch off above the atmosphere, and each is set to its absent value rather
+than computed and quietly coming out small.** Airmass goes to exactly 1, which is the value
+at which `ExtinctionTransmissionAt` is unity for any coefficient, so `SystemResponse`
+integrates the passband with no extinction *through the same code path* rather than a
+parallel one. Seeing goes to 0, which is the physically correct value and which
+`VisualTelescopeCatalog` already carries for both Hubble specs. Scintillation goes to 1
+exactly. Differential refraction goes to zero, so the twelve chromatic sub-bands stack
+concentrically. And the tracking switch disappears from the interface rather than becoming
+inert, because a checkbox the server ignores is a claim that it does something.
+
+**What replaces them** is what makes an orbital PSF: WFC3's measured FWHM against
+wavelength, whose turnover near 500 nm is the OTA's mid-frequency polishing errors and is
+why Hubble is not diffraction-limited anywhere in this band, plus the spacecraft's attitude
+jitter over the exposure, in quadrature, per sub-band. The sky loses airglow, twilight and
+moonlight (each of those is something an atmosphere *does*) and keeps two terms that come
+from outside: the zodiacal light, and the sunlit face of the planet below. The zodiacal term
+is better here than on the ground, not merely different, because `SpaceObservingConditions`
+resolves the ecliptic frame and reads Leinert's angle-resolved table where the ground path is
+still stuck with the flat polar constant.
+
+**The scheduler answers a different question too.** On the ground it maximises altitude
+inside the coming night. In orbit there is no night and no altitude: a pointing is inside
+every avoidance constraint or it is not, so it returns the first legal instant, and the
+`Orbital visibility` panel shows the whole revolution as the run of yes/no with the reason
+for each no. An exposure longer than the target's remaining window is refused with the
+number, because that is what STScI's own planning turns on.
+
+Pointed at M13 for 300 s in `Luminance`, the frame comes out with the four-vane diffraction
+spikes and no seeing disc, at the WFC3/UVIS plate scale of 0.0396″/px the handbook publishes,
+under a 23.2 V mag/arcsec² sky. Pointed at M51 in mid-August it is refused: the field is 58°
+from the Sun and HST's solar avoidance is 62.5°, so M51 is out of season, which is true of
+the real telescope.
+
+The FITS header does not claim a mountain. `OBSERVAT` is the spacecraft, `SITELAT`/`SITELONG`
+are the sub-satellite point and `SITEELEV` is the orbital altitude, because OBSGEO keywords
+pointing at a mountain would send a reduction package computing a parallactic angle for an
+observer moving at 7.6 km/s.
+
+Declared omissions, served next to the frame at `/api/capture/data`: no slew (retargeting is
+instantaneous, so nothing is streaked by a repoint and no guide-star acquisition is charged);
+the orbit is circular and does not decay; the Sun is on the real ecliptic for this path where
+the ground path keeps Core's declination-0 Sun; one roll angle, where a real visit is
+scheduled at a requested ORIENT; and no South Atlantic Anomaly cosmic rays or IR-channel
+persistence.
+
+**A Studio bug found here:** `onInstrumentChange` called `refreshModeChips()`, which has never
+existed. Selecting *any* astrograph threw a `ReferenceError` on that line, so everything after
+it in that branch silently did not run: the sky chart was never redrawn for the new instrument
+and the observing forecast was never loaded.
+
 ## Not ported
 
 - Solar-system photography proper: the mod photographs KSP's own rendered planets by
   cloning `Camera ScaledSpace`; without KSP there is nothing to clone.
 - Direct imaging, which the mod itself flags `UnderConstruction`.
-- The orbital platform (space telescope) imaging path: a different constraint model,
-  not just a missing atmosphere.
-- Career, parts, vessels, unlock economy. Deliberately: this is an instrument tool.
+- Career, parts, vessels, unlock economy. Deliberately: this is an instrument tool. The
+  spacecraft below is an orbit and a constraint model, not a vessel you build, launch,
+  power, slew or downlink from.
 
 ## Next
 

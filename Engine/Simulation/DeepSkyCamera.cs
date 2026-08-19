@@ -31,9 +31,26 @@ namespace ExoStudio.Simulation
             "No solar-system bodies: the mod photographs KSP's own rendered planets, and there is no KSP here. Deep sky only.",
             "Zodiacal light uses the flat polar constant, not the angle-resolved Leinert table (up to ~2 mag brighter near the ecliptic at low elongation).",
             "New moon is assumed: no moonlight term in the sky background.",
-            "Detector cosmetics are omitted: flat-field/PRNU, offset fixed pattern, fringing, cosmic rays, charge-transfer smear, hot pixels. Shot noise, dark current, read noise, bias, blooming and digitisation are the real chain.",
+            "Photo-response non-uniformity and offset fixed-pattern noise ARE modelled, from the published EMVA figures, drawn once per sensor so a flat and a bias really remove them (see CalibrationFrames). Still omitted: fringing, cosmic rays, charge-transfer smear, hot pixels, and dark-current non-uniformity, which no device in this roster publishes.",
+            "The photo-response is white. Real thick back-illuminated CCDs also show tree rings and brick walls (Luo et al. 2024, AJ 168, 251); neither pattern is published for any detector here, and borrowing another device's would put specific, visible, wrong structure into every frame.",
             "Gain is fixed at unity; no ND filters (deep-sky targets never need one).",
             "Scintillation multiplier is 1+N(0,sigma) clamped at zero, sigma from the real Young relation.",
+        };
+
+        /// <summary>
+        /// What the ORBITAL path leaves out, over and above the common list. Reported next to it
+        /// whenever a space telescope is selected, and deliberately kept separate: two of the
+        /// entries above do not apply in orbit at all (there is no scintillation, and the zodiacal
+        /// light comes off Leinert's table rather than the polar constant, because
+        /// SpaceObservingConditions resolves the ecliptic frame the ground path does not).
+        /// </summary>
+        public static readonly string[] DeclaredSpaceSimplifications =
+        {
+            "The spacecraft does not slew: retargeting is instantaneous, so no exposure is streaked by a repoint and no guide-star acquisition is charged. What is left is the platform's own jitter floor.",
+            "The orbit is circular and only its J2 nodal regression is propagated; drag does not decay it.",
+            "The Sun is placed on the real ecliptic for this path, where the ground path keeps Core's declination-0 Sun; the Moon is on the ecliptic too, ignoring its 5.1 deg inclination.",
+            "One roll angle: the sensor is laid out with the spacecraft's local zenith up. A real visit is scheduled at an ORIENT the observer asks for.",
+            "No detector effects specific to the orbit: no cosmic-ray hits (heavy in the South Atlantic Anomaly) and, on the IR channel, no persistence from the previous exposure.",
         };
 
         // ------------------------------------------------------------------ request/result
@@ -42,6 +59,16 @@ namespace ExoStudio.Simulation
         {
             public VisualTelescopeSpec Spec;
             public ObservingSites.Site Site;
+
+            /// <summary>
+            /// The spacecraft, when this instrument flies on one. Non-null is the single branch
+            /// the whole orbital path turns on, exactly as Spec.IsSpaceBased is in the mod: above
+            /// the atmosphere there is no airmass, no extinction, no scintillation, no seeing and
+            /// no twilight, and each is set to its ABSENT value rather than computed and quietly
+            /// coming out small. Site is then ignored except as a label.
+            /// </summary>
+            public OrbitalPlatforms.Platform Platform;
+
             public double Ut;
             public double RaDeg;
             public double DecDeg;
@@ -82,6 +109,28 @@ namespace ExoStudio.Simulation
             public double RequestedUt = double.NaN;
         }
 
+        /// <summary>
+        /// The air this instrument's cooler has to pump against, at the site it is being used from.
+        ///
+        /// Core's figure is on the INSTRUMENT, keyed to the one place that telescope stands in the
+        /// mod. Studio lets an astrograph be pointed from any of five sites, so the instrument's
+        /// own figure is only right when it happens to be at home; everywhere else it describes
+        /// the wrong mountain. The site's is preferred, and Core's is the fallback for a site that
+        /// carries none rather than a silent zero.
+        /// </summary>
+        public static double AmbientAt(VisualTelescopeSpec spec, ObservingSites.Site site) =>
+            site != null && !double.IsNaN(site.AmbientTemperatureCelsius)
+                ? site.AmbientTemperatureCelsius
+                : spec.SiteAmbientTemperatureCelsius;
+
+        /// <summary>Coldest setpoint this cooler can hold at that site. The TEC's published delta is a DELTA, so where it lands depends on where it starts.</summary>
+        public static double CoolerMinimumAt(VisualTelescopeSpec spec, ObservingSites.Site site) =>
+            AmbientAt(spec, site) - spec.CoolerDeltaBelowAmbientC;
+
+        /// <summary>Warmest setpoint worth offering: ambient, since a cooler cannot heat the sensor above the air around it.</summary>
+        public static double CoolerMaximumAt(VisualTelescopeSpec spec, ObservingSites.Site site) =>
+            AmbientAt(spec, site);
+
         /// <summary>Widest field this instrument covers, degrees across the sensor's long axis. Independent of binning: halving the width doubles the plate scale.</summary>
         public static double MaxFovDeg(VisualTelescopeSpec spec) =>
             spec.NativeSensorWidthPx * spec.NativePixelSizeMeters / spec.FocalLengthMeters
@@ -115,6 +164,32 @@ namespace ExoStudio.Simulation
 
             /// <summary>When the frame was actually taken: the scheduler's pick, not the request's clock.</summary>
             public string ObservedUtc;
+
+            // --- orbital only, null/NaN on the ground ------------------------------------
+
+            /// <summary>The spacecraft's name, and the flag the API branches its readout on.</summary>
+            public string PlatformName;
+
+            /// <summary>The constraint model's verdict at the instant the frame was taken.</summary>
+            public SpaceConditionsSnapshot SpaceConditions;
+
+            /// <summary>The attitude budget the exposure ran under. Its EquivalentFwhmArcsec is inside the PSF.</summary>
+            public PointingBudget Pointing;
+
+            /// <summary>Where the spacecraft was: altitude, and the sub-satellite point that set the frame's roll.</summary>
+            public double PlatformAltitudeKm = double.NaN;
+            public double SubSatelliteRaDeg = double.NaN;
+            public double SubSatelliteDecDeg = double.NaN;
+
+            /// <summary>The sky as its two orbital terms, V mag/arcsec^2, so the readout can say which dominates.</summary>
+            public double SkyVMagPerArcsec2 = double.NaN;
+            public double ZodiacalVMagPerArcsec2 = double.NaN;
+            public double EarthshineVMagPerArcsec2 = double.NaN;
+            public bool ZodiacalIsPublished;
+
+            /// <summary>Longest exposure the orbit allows before the Earth cuts it off. Infinite inside the continuous-viewing zone.</summary>
+            public double MaxContiguousExposureSeconds = double.NaN;
+            public double OccultedOrbitFraction = double.NaN;
         }
 
         /// <summary>
@@ -131,6 +206,12 @@ namespace ExoStudio.Simulation
         {
             public VisualTelescopeSpec Spec;
             public ObservingSites.Site Site;
+
+            /// <summary>The spacecraft this exposure was taken from, null on the ground. Drives the FITS header's observatory keywords.</summary>
+            public OrbitalPlatforms.Platform Platform;
+            public OrbitalPlatforms.State PlatformState;
+            public PointingBudget Pointing;
+
             public CameraFilter Filter;
             public double ExposureSeconds;
             public int Binning;
@@ -159,8 +240,45 @@ namespace ExoStudio.Simulation
             public double ApertureAreaCm2;
             public double PhotometricZeroPoint;
 
+            /// <summary>
+            /// Every catalogue star deposited into this frame, with the magnitude it went in at and
+            /// the pixel it landed on. The ground truth a reduction is scored against; see
+            /// Simulation/FrameReduction.cs.
+            /// </summary>
+            public List<InjectedStar> Injected;
+
+            /// <summary>
+            /// The sensor's two fixed patterns: photo-response (multiplies light, removed by a
+            /// flat) and readout offset (additive, removed by a bias). Properties of the silicon,
+            /// identical in every exposure it takes, which is exactly why calibration frames can
+            /// remove them and stacking cannot. Null when the device publishes no figure.
+            /// </summary>
+            public ushort[] PhotoResponseMap;
+            public ushort[] OffsetMap;
+
+            /// <summary>
+            /// The focal plane's illumination, cosine-fourth and the instrument's stops. Multiplies
+            /// light exactly as the photo response does, and is removed by the same flat, which is
+            /// why the two travel together.
+            /// </summary>
+            public float[] IlluminationMap;
+            public double CornerIlluminationFalloff = 1.0;
+
             /// <summary>The capture metadata as the API reports it, noise-independent fields filled.</summary>
             public Result Meta;
+        }
+
+        /// <summary>One star as it was put into the frame, before any noise or any reduction.</summary>
+        public struct InjectedStar
+        {
+            public double X, Y;
+            public double VMag;
+            public double ColourBv;
+            public double ReddeningEBv;
+            public double RaDeg, DecDeg;
+
+            /// <summary>Total electrons this star contributed, over the whole PSF. What an infinite aperture would recover.</summary>
+            public double Electrons;
         }
 
         // ------------------------------------------------------------------ capture
@@ -207,6 +325,10 @@ namespace ExoStudio.Simulation
             double plateScale = spec.NativePixelSizeMeters * bin / focal * 206264.80624709636;
             double fovDeg = w * plateScale / 3600.0;
 
+            // THE ONE BRANCH THE ORBITAL PATH TURNS ON, and everything below that reads it says
+            // why it is doing so at the point it does. See Request.Platform.
+            bool space = req.Platform != null;
+
             // A robotic scheduler, which is what every telescope on this roster really runs
             // behind: within the coming 25 hours, the instant that maximises the target's
             // altitude while the Sun is below nautical twilight. Asking at noon does not
@@ -214,7 +336,35 @@ namespace ExoStudio.Simulation
             ImagingObserverContext siteCtx = ObservingSites.ContextFor(req.Site);
             double obsUt;
 
-            if (!double.IsNaN(req.RequestedUt))
+            if (space)
+            {
+                // The orbital scheduler answers a different question, so it is a different search
+                // rather than the same one with the atmosphere removed. There is no night to wait
+                // for and no altitude to maximise: a pointing is either inside every avoidance
+                // constraint or it is not, and OrbitalPlatforms.TryFindWindow returns the first
+                // instant it is. See its own comment for why the horizon is a day.
+                if (!double.IsNaN(req.RequestedUt))
+                {
+                    SpaceConditionsSnapshot at = OrbitalPlatforms.Evaluate(
+                        req.Platform, req.RequestedUt, req.RaDeg, req.DecDeg);
+                    if (!at.Observable)
+                    {
+                        res.Error = $"{req.Platform.Name} cannot point there then: {at.BlockingConstraint}.";
+                        return new PreparedExposure { Meta = res };
+                    }
+                    obsUt = req.RequestedUt;
+                }
+                else if (!OrbitalPlatforms.TryFindWindow(req.Platform, req.Ut, req.RaDeg, req.DecDeg,
+                                                         out obsUt, out _, out string blockedBy))
+                {
+                    res.Error = $"{req.Platform.Name} cannot reach that field in the next 24 hours: {blockedBy}."
+                              + (blockedBy != null && blockedBy.Contains("solar")
+                                  ? " The solar avoidance cone is set by where the Earth is on its own orbit, so it clears in weeks, not orbits."
+                                  : "");
+                    return new PreparedExposure { Meta = res };
+                }
+            }
+            else if (!double.IsNaN(req.RequestedUt))
             {
                 // The observer booked a slot. Honour it, and refuse plainly if the sky is shut
                 // then rather than silently observing at some other time.
@@ -259,9 +409,37 @@ namespace ExoStudio.Simulation
             }
             res.ObservedUtc = SimulationClock.UtToUtc(obsUt).ToString("yyyy-MM-dd HH:mm 'UTC'");
 
-            double meridianRa = SkyCoordinates.ComputeLocalMeridianRaDeg(
-                obsUt, ObservingSites.EarthSiderealDaySeconds, ObservingSites.GmstAtJ2000Deg,
-                req.Site.LongitudeDeg);
+            // THE FRAME THE SENSOR IS LAID OUT IN, and in orbit the "site" is the spacecraft.
+            //
+            // Every deposit stage below (DepositStars, DepositGalaxies, DepositEmission) and
+            // FitsWcs.Build take a meridian RA and a latitude and convert each source through the
+            // horizontal frame those two define. That machinery is not atmospheric: it is just an
+            // orthonormal basis with one axis nailed to a direction, and the direction it wants is
+            // the observer's local zenith. A spacecraft has one of those, pointing straight up from
+            // the sub-satellite point, so the orbital path hands in the sub-satellite RA and
+            // geocentric declination and every stage runs UNCHANGED.
+            //
+            // What it fixes is the roll, which a space telescope has no natural choice for anyway;
+            // a real visit is scheduled at a requested ORIENT and this build has no such control
+            // (declared in DeclaredSpaceSimplifications). What it must NOT be read as is an
+            // altitude above a horizon: there is no horizon up there, and every constraint that
+            // decides whether this pointing is legal comes from SpaceObservingConditions instead.
+            OrbitalPlatforms.State platformState = default;
+            double observerLatitudeDeg;
+            double meridianRa;
+            if (space)
+            {
+                platformState = OrbitalPlatforms.StateAt(req.Platform.Orbit, obsUt);
+                meridianRa = platformState.SubSatelliteRaDeg;
+                observerLatitudeDeg = platformState.SubSatelliteDecDeg;
+            }
+            else
+            {
+                meridianRa = SkyCoordinates.ComputeLocalMeridianRaDeg(
+                    obsUt, ObservingSites.EarthSiderealDaySeconds, ObservingSites.GmstAtJ2000Deg,
+                    req.Site.LongitudeDeg);
+                observerLatitudeDeg = req.Site.LatitudeDeg;
+            }
 
             // TWO FRAMES, ON PURPOSE, AND THE SPLIT IS WHERE IT IS FOR A REASON.
             //
@@ -284,18 +462,28 @@ namespace ExoStudio.Simulation
             // one, which reaches the image only through the direction of atmospheric dispersion
             // and of the trail. A third of a degree of position angle is far below a pixel.
             HorizontalCoordinates altAz = SkyCoordinates.EquatorialToHorizontal(
-                req.RaDeg, req.DecDeg, meridianRa, req.Site.LatitudeDeg);
+                req.RaDeg, req.DecDeg, meridianRa, observerLatitudeDeg);
 
             SkyCoordinates.PrecessFromJ2000(req.RaDeg, req.DecDeg,
                 obsUt * SkyCoordinates.JulianCenturiesPerSecond,
                 out double aimRaOfDate, out double aimDecOfDate);
             HorizontalCoordinates altAzOfDate = SkyCoordinates.EquatorialToHorizontal(
-                aimRaOfDate, aimDecOfDate, meridianRa, req.Site.LatitudeDeg);
+                aimRaOfDate, aimDecOfDate, meridianRa, observerLatitudeDeg);
             res.TargetAltitudeDeg = altAzOfDate.AltitudeDeg;
 
-            double zenithDistance = 90.0 - altAz.AltitudeDeg;
-            double airmass = ImagingObservingConditions.AirmassAt(altAzOfDate.AltitudeDeg);
+            // AIRMASS 1 IN ORBIT, not 0 and not NaN, and this is the load-bearing choice of the
+            // whole space path. Every relation downstream that takes an airmass reduces exactly to
+            // no atmosphere at 1: ExtinctionTransmissionAt is 10^(-0.4 k (X-1)), which is unity at
+            // X = 1 whatever the coefficient, so SystemResponse integrates the passband with no
+            // extinction without a second code path to keep in step with the first. The mod makes
+            // the identical choice for the identical reason (GatherFrameInputs).
+            //
+            // Zenith distance goes to 0 for the same purpose: it feeds only the differential
+            // refraction in BuildSubBands, and there is nothing up there to refract.
+            double zenithDistance = space ? 0.0 : 90.0 - altAz.AltitudeDeg;
+            double airmass = space ? 1.0 : ImagingObservingConditions.AirmassAt(altAzOfDate.AltitudeDeg);
             res.AirmassX = airmass;
+            if (space) res.TargetAltitudeDeg = double.NaN;   // no horizon to be above
 
             // Boresight frame with up toward the zenith, exactly as the harness builds it; the
             // atmospheric-dispersion offsets below are then purely vertical by construction.
@@ -310,8 +498,12 @@ namespace ExoStudio.Simulation
                                                    up.X * boresight.Y - up.Y * boresight.X);
             var projection = new GnomonicProjection(boresight, up, right, fovDeg, w, h);
 
-            // The instrument's own seeing at its own site, degraded by the field's airmass.
-            double seeing = spec.ZenithSeeingFwhmArcsec * Math.Pow(airmass, 0.6);
+            // The instrument's own seeing at its own site, degraded by the field's airmass. Zero in
+            // orbit, and zero is the physically correct value rather than a stand-in: the two
+            // Hubble specs already carry ZenithSeeingFwhmArcsec = 0 for exactly this reason. What
+            // broadens the PSF up there instead is the OTA's residual wavefront error and the
+            // spacecraft's attitude jitter, and both go in through the sub-bands below.
+            double seeing = space ? 0.0 : spec.ZenithSeeingFwhmArcsec * Math.Pow(airmass, 0.6);
             res.SeeingFwhmArcsec = seeing;
             res.PlateScaleArcsec = plateScale;
             res.Width = w; res.Height = h;
@@ -324,45 +516,104 @@ namespace ExoStudio.Simulation
                            * (1.0 - spec.SecondaryObstructionFraction * spec.SecondaryObstructionFraction);
 
             // Scintillation: sigma from the real Young relation; one multiplier per frame for
-            // resolved light, a separate draw for point sources, as the camera does.
-            double scintSigma = AtmosphericImagingNoise.ScintillationExcessSigma(
-                spec.ApertureMeters, spec.SiteAltitudeMeters, airmass, req.ExposureSeconds);
+            // resolved light, a separate draw for point sources, as the camera does. In orbit it
+            // does not exist: scintillation IS the atmosphere, so both multipliers are exactly 1
+            // rather than a draw from a small sigma.
+            double scintSigma = space
+                ? 0.0
+                : AtmosphericImagingNoise.ScintillationExcessSigma(
+                      spec.ApertureMeters, spec.SiteAltitudeMeters, airmass, req.ExposureSeconds);
             var rngScint = new Pcg32(req.Seed, Pcg32.StreamScintillation);
-            double scint = Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
-            double starScint = Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
+            double scint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
+            double starScint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
 
             const double nonAtmTransmission = 1.0;   // no cloud, no ND filter here
 
-            // --- sky background, the camera's own two-group sum ---------------------------
-            // Scattered-sunlight terms carry the solar shape; airglow is ESO's measured line
-            // spectrum through Core/Airglow. Extinction on the zodiacal term only, as in
-            // GatherSkyBackground; twilight and moonlight are calibrated post-extinction.
             double wavelength = FilterCentralWavelengthMeters(spec, req.Filter);
-            double transmission = AtmosphericImagingNoise.ExtinctionTransmissionAt(
-                airmass, wavelength, spec.SiteAltitudeMeters);
+            double skyElectrons;
 
-            double sunRa = ImagingObservingConditions.ComputeSunRaDeg(obsUt, siteCtx);
-            double sunAlt = SkyCoordinates.EquatorialToHorizontal(sunRa, 0.0, meridianRa, req.Site.LatitudeDeg).AltitudeDeg;
+            if (space)
+            {
+                // --- the orbital sky: two terms, and nothing else -------------------------
+                //
+                // The ground path's four terms all vanish for one reason, which is that each is
+                // MADE by an atmosphere: airglow is emitted by one, twilight is scattered through
+                // one, moonlight reaches the detector by being scattered in one, and extinction
+                // needs one to absorb. What is left comes from outside: interplanetary dust, and
+                // the sunlit face of the planet the telescope is orbiting.
+                //
+                // Both are scattered SUNLIGHT, so both are integrated with the solar spectral
+                // shape, which is the same convention the ground path already applies to its own
+                // scattered-sunlight terms. Transmission is 1: there is nothing in the way.
+                //
+                // And the zodiacal term here is BETTER than the ground path's, not merely
+                // different: SpaceObservingConditions resolves the ecliptic frame, so it reads
+                // Leinert's angle-resolved table rather than the flat polar constant the ground
+                // path is stuck with (see DeclaredSimplifications). Near the ecliptic at small
+                // elongation that is close to two magnitudes.
+                SpaceConditionsSnapshot sky = OrbitalPlatforms.Evaluate(
+                    req.Platform, obsUt, req.RaDeg, req.DecDeg);
 
-            double fluxSolar = Math.Pow(10.0, -0.4 * SkyBrightnessModel.ZodiacalVMagPerArcsec2) * transmission;
-            fluxSolar = SkyBrightnessModel.AddMagnitude(fluxSolar, SkyBrightnessModel.TwilightVMagPerArcsec2(sunAlt));
+                double skyPerSecond = SkyBrightnessModel.ElectronsPerPixelPerSecond(
+                    sky.SkyVMagPerArcsec2, plateScale, response,
+                    areaCm2, 1.0, SourceSpectra.SolarPhotosphereTemperatureK);
+                skyElectrons = skyPerSecond * req.ExposureSeconds;
 
-            double airglowPerSecond = Airglow.ElectronsPerPixelPerSecond(
-                response, plateScale, areaCm2, zenithDistance);
-            double solarPerSecond = SkyBrightnessModel.ElectronsPerPixelPerSecond(
-                SkyBrightnessModel.FluxToMagPerArcsec2(fluxSolar), plateScale, response,
-                areaCm2, 1.0, SourceSpectra.SolarPhotosphereTemperatureK);
-            double skyElectrons = (airglowPerSecond + solarPerSecond) * req.ExposureSeconds;
+                res.SpaceConditions = sky;
+                res.PlatformName = req.Platform.Name;
+                res.PlatformAltitudeKm = platformState.AltitudeKm;
+                res.SubSatelliteRaDeg = platformState.SubSatelliteRaDeg;
+                res.SubSatelliteDecDeg = platformState.SubSatelliteDecDeg;
+                res.SkyVMagPerArcsec2 = sky.SkyVMagPerArcsec2;
+                res.ZodiacalVMagPerArcsec2 = sky.ZodiacalVMagPerArcsec2;
+                res.EarthshineVMagPerArcsec2 = sky.EarthshineVMagPerArcsec2;
+                res.ZodiacalIsPublished = sky.ZodiacalIsPublished;
+                res.MaxContiguousExposureSeconds = sky.MaxContiguousExposureSeconds;
+                res.OccultedOrbitFraction = sky.OccultedOrbitFraction;
+
+                // An exposure longer than the target's remaining visibility does not happen: the
+                // Earth comes across the aperture and the shutter closes. Refusing is the honest
+                // answer, and it is the number STScI's own exposure-time planning turns on.
+                if (req.ExposureSeconds > sky.MaxContiguousExposureSeconds)
+                {
+                    res.Error = $"{sky.MaxContiguousExposureSeconds:F0} s is all this orbit gives on that field "
+                              + $"({sky.OccultedOrbitFraction * 100.0:F0}% of every {platformState.PeriodSeconds / 60.0:F0}-minute "
+                              + "orbit is occulted). Shorten the exposure, or raise the altitude so the Earth subtends less.";
+                    return new PreparedExposure { Meta = res };
+                }
+            }
+            else
+            {
+                // --- sky background, the camera's own two-group sum -----------------------
+                // Scattered-sunlight terms carry the solar shape; airglow is ESO's measured line
+                // spectrum through Core/Airglow. Extinction on the zodiacal term only, as in
+                // GatherSkyBackground; twilight and moonlight are calibrated post-extinction.
+                double transmission = AtmosphericImagingNoise.ExtinctionTransmissionAt(
+                    airmass, wavelength, spec.SiteAltitudeMeters);
+
+                double sunRa = ImagingObservingConditions.ComputeSunRaDeg(obsUt, siteCtx);
+                double sunAlt = SkyCoordinates.EquatorialToHorizontal(sunRa, 0.0, meridianRa, observerLatitudeDeg).AltitudeDeg;
+
+                double fluxSolar = Math.Pow(10.0, -0.4 * SkyBrightnessModel.ZodiacalVMagPerArcsec2) * transmission;
+                fluxSolar = SkyBrightnessModel.AddMagnitude(fluxSolar, SkyBrightnessModel.TwilightVMagPerArcsec2(sunAlt));
+
+                double airglowPerSecond = Airglow.ElectronsPerPixelPerSecond(
+                    response, plateScale, areaCm2, zenithDistance);
+                double solarPerSecond = SkyBrightnessModel.ElectronsPerPixelPerSecond(
+                    SkyBrightnessModel.FluxToMagPerArcsec2(fluxSolar), plateScale, response,
+                    areaCm2, 1.0, SourceSpectra.SolarPhotosphereTemperatureK);
+                skyElectrons = (airglowPerSecond + solarPerSecond) * req.ExposureSeconds;
+            }
             res.SkyElectronsPerPixel = skyElectrons;
 
-            // The setpoint the observer asked for, clamped to what this cooler can actually
-            // hold at this site. An instrument with no adjustable cooler keeps its own figure.
+            // The setpoint the observer asked for, clamped to what this cooler can actually hold
+            // AT THE SITE THEY CHOSE. An instrument with no adjustable cooler keeps its own figure.
             double detectorTempC = spec.DetectorTemperatureCelsius;
             if (!double.IsNaN(req.DetectorTemperatureCelsius) && spec.HasAdjustableCooler)
             {
                 detectorTempC = Math.Clamp(req.DetectorTemperatureCelsius,
-                                           spec.CoolerMinimumTemperatureCelsius,
-                                           spec.CoolerMaximumTemperatureCelsius);
+                                           CoolerMinimumAt(spec, req.Site),
+                                           CoolerMaximumAt(spec, req.Site));
             }
             double darkPerSecond = DarkCurrentModel.ElectronsPerSecond(
                 spec.DarkCurrentElectronsPerSecond, spec.DetectorTemperatureCelsius, detectorTempC);
@@ -376,12 +627,20 @@ namespace ExoStudio.Simulation
 
             // Unguided drift: the meridian advances over the exposure and DepositStars trails
             // every star between its start and end positions. Tracking freezes the two together.
-            double endMeridianRa = req.Tracking
+            //
+            // In orbit there is nothing to track and nothing to fail to track. The spacecraft
+            // holds inertial attitude on its own gyros and guide stars, so the field does not
+            // move over the exposure however long it runs; what motion is left is the jitter,
+            // which is arcseconds and belongs in the PSF rather than as a trail. The tracking
+            // switch is therefore ignored rather than honoured, which is why the API refuses to
+            // offer it for a space telescope instead of quietly having no effect.
+            double endMeridianRa = req.Tracking || space
                 ? meridianRa
                 : meridianRa + 360.0 * req.ExposureSeconds / ObservingSites.EarthSiderealDaySeconds;
 
             // --- signal plane ------------------------------------------------------------
             var signal = new float[w * h];
+            List<InjectedStar> injected = null;
             double fieldRadiusDeg = 0.5 * Math.Sqrt((double)w * w + (double)h * h) * plateScale / 3600.0;
 
             // Galaxies first, like the camera: they are resolved, so they take the quiet
@@ -392,7 +651,7 @@ namespace ExoStudio.Simulation
             if (data.Galaxies != null)
             {
                 res.GalaxiesDrawn = DepositGalaxies(
-                    signal, w, h, projection, endMeridianRa, req.Site.LatitudeDeg,
+                    signal, w, h, projection, endMeridianRa, observerLatitudeDeg,
                     data, req.RaDeg, req.DecDeg, fieldRadiusDeg,
                     response, double.IsNaN(fieldEBv) ? 0.0 : fieldEBv,
                     areaCm2, req.ExposureSeconds, nonAtmTransmission * scint,
@@ -409,9 +668,48 @@ namespace ExoStudio.Simulation
                 var reddening = new ReddenedResponseCache(response);
                 double exposure = req.ExposureSeconds;
                 double starTransmission = nonAtmTransmission * starScint;
+
+                // THE TRUTH, RECORDED WHILE IT IS STILL KNOWN.
+                //
+                // Every star about to be deposited, with the magnitude it was deposited AT and the
+                // pixel it lands on, so a reduction of the finished frame can be compared against
+                // what actually went in. That comparison is the only check on the forward model
+                // that does not consult the forward model: put a star of known magnitude in, reduce
+                // the frame the way an observer would, and see whether the magnitude comes back.
+                // See Simulation/FrameReduction.cs, which is where it is spent.
+                //
+                // Projected here with the SAME call DepositStars uses one line below, deliberately:
+                // a second projection written by hand would be a second thing to keep in step, and
+                // a truth catalogue half a pixel from the pixels is worse than none.
+                injected = new List<InjectedStar>(stars.Count);
+                foreach (RenderedStar star in stars)
+                {
+                    HorizontalCoordinates altAzStar = SkyCoordinates.EquatorialToHorizontal(
+                        star.RaDeg, star.DecDeg, meridianRa, observerLatitudeDeg);
+                    if (!projection.TryProject(
+                            SkyVector.FromHorizontal(altAzStar.AltitudeDeg, altAzStar.AzimuthDeg),
+                            out double px, out double py))
+                        continue;
+                    if (px < 0 || py < 0 || px >= w || py >= h) continue;
+
+                    injected.Add(new InjectedStar
+                    {
+                        X = px,
+                        Y = py,
+                        VMag = star.VMag,
+                        ColourBv = star.ColorIndexBV,
+                        ReddeningEBv = star.ReddeningEBv,
+                        RaDeg = star.RaDeg,
+                        DecDeg = star.DecDeg,
+                        Electrons = StellarPhotometry.CollectedElectrons(
+                            star.VMag, star.ColorIndexBV, star.ReddeningEBv,
+                            response, reddening, areaCm2, exposure, starTransmission),
+                    });
+                }
+
                 res.StarsDrawn = StarFieldRenderer.DepositStars(
                     signal, w, h, stars, projection,
-                    meridianRa, endMeridianRa, req.Site.LatitudeDeg, cutoff,
+                    meridianRa, endMeridianRa, observerLatitudeDeg, cutoff,
                     star => StellarPhotometry.CollectedElectrons(
                         star.VMag, star.ColorIndexBV, star.ReddeningEBv,
                         response, reddening, areaCm2, exposure, starTransmission));
@@ -419,7 +717,7 @@ namespace ExoStudio.Simulation
 
             // Diffuse emission, independent of any star landing in the field.
             res.EmissionLinesRendered = DepositEmission(
-                signal, w, h, bin, projection, endMeridianRa, req.Site.LatitudeDeg,
+                signal, w, h, bin, projection, endMeridianRa, observerLatitudeDeg,
                 data, req.RaDeg, req.DecDeg, fieldRadiusDeg,
                 response, plateScale, areaCm2, req.ExposureSeconds * nonAtmTransmission);
 
@@ -427,13 +725,30 @@ namespace ExoStudio.Simulation
             // The chromatic PSF across the passband with Filippenko dispersion, the harness's
             // twelve sub-bands, then one convolution over the whole plane.
             double bandwidthA = FilterBandwidthAngstrom(spec, req.Filter);
-            var subBands = BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale, spec.SiteAltitudeMeters);
+            PointingBudget pointing = default;
+            ChromaticSubBand[] subBands;
+            if (space)
+            {
+                pointing = OrbitalPlatforms.PointingFor(req.Platform, req.ExposureSeconds);
+                res.Pointing = pointing;
+                subBands = BuildSpaceSubBands(spec, req.Platform.Spec, response, wavelength,
+                                              bandwidthA, plateScale, pointing.EquivalentFwhmArcsec);
+            }
+            else
+            {
+                subBands = BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale, spec.SiteAltitudeMeters);
+            }
             float[] kernel = OpticalPsf.BuildChromaticKernel(
                 plateScale, spec.ApertureMeters, spec.SecondaryObstructionFraction, seeing,
                 wavelength, 0.0, spec.SpiderVaneCount, spec.SpiderVaneWidthMeters,
                 spec.PrimaryMirrorPads, subBands, out int psfRadius);
             res.PsfKernelRadiusPx = psfRadius;
             FourierConvolution.Convolve(signal, w, h, kernel, psfRadius);
+
+            // The silicon's own fixed patterns, drawn from a seed that depends on the instrument
+            // and the binning rather than on this exposure. See BuildFixedPatterns.
+            BuildFixedPatterns(spec, bin, w * h, out ushort[] photoResponseMap, out ushort[] offsetMap);
+            float[] illuminationMap = BuildIlluminationMap(spec, w, h, bin, zoom, out double cornerFalloff);
 
             // --- detector constants and header photometry -----------------------------------
             double epa = spec.ElectronsPerAduAtUnityGain > 0 ? spec.ElectronsPerAduAtUnityGain : 1.0;
@@ -443,7 +758,7 @@ namespace ExoStudio.Simulation
 
             // Where the aimed target landed on the sensor, the registration the stack aligns on.
             HorizontalCoordinates aimAltAz = SkyCoordinates.EquatorialToHorizontal(
-                req.RaDeg, req.DecDeg, endMeridianRa, req.Site.LatitudeDeg);
+                req.RaDeg, req.DecDeg, endMeridianRa, observerLatitudeDeg);
             double targetPx = double.NaN, targetPy = double.NaN;
             projection.TryProject(SkyVector.FromHorizontal(aimAltAz.AltitudeDeg, aimAltAz.AzimuthDeg),
                                   out targetPx, out targetPy);
@@ -470,10 +785,13 @@ namespace ExoStudio.Simulation
             {
                 Spec = spec,
                 Site = req.Site,
+                Platform = req.Platform,
+                PlatformState = platformState,
+                Pointing = pointing,
                 Filter = req.Filter,
                 ExposureSeconds = req.ExposureSeconds,
                 Binning = bin,
-                Tracking = req.Tracking,
+                Tracking = req.Tracking || space,
                 DetectorTemperatureCelsius = detectorTempC,
                 ZoomFactor = zoom,
                 Signal = signal,
@@ -486,14 +804,19 @@ namespace ExoStudio.Simulation
                 BiasAdu = bias,
                 MaxAdu = maxAdu,
                 ObservedUt = obsUt,
-                Wcs = FitsWcs.Build(projection, endMeridianRa, req.Site.LatitudeDeg),
-                Trailed = !req.Tracking,
+                Wcs = FitsWcs.Build(projection, endMeridianRa, observerLatitudeDeg),
+                Trailed = !space && !req.Tracking,
                 TargetPixelX = targetPx,
                 TargetPixelY = targetPy,
                 EffectiveWidthAngstromFlat = widthFlat,
                 OpticalThroughput = throughput,
                 ApertureAreaCm2 = areaCm2,
                 PhotometricZeroPoint = zeroPoint,
+                Injected = injected,
+                PhotoResponseMap = photoResponseMap,
+                OffsetMap = offsetMap,
+                IlluminationMap = illuminationMap,
+                CornerIlluminationFalloff = cornerFalloff,
                 Meta = res,
             };
         }
@@ -510,8 +833,19 @@ namespace ExoStudio.Simulation
             var rng = new Pcg32(seed, Pcg32.StreamShotNoise);
             for (int i = 0; i < n; i++)
             {
-                double mean = Math.Max(0.0, p.Signal[i]) + p.SkyElectronsPerPixel + p.DarkElectronsPerPixel;
-                raw[i] = (float)NoiseSampler.Poisson(rng, mean);
+                // PRNU MULTIPLIES LIGHT AND NOTHING ELSE. It is a photo-response: the pixel's own
+                // quantum efficiency, fill factor and microlens, so it scales the star and the sky
+                // and leaves the thermally generated dark charge alone. Applied to the MEAN before
+                // the Poisson draw rather than to the draw, because a pixel that collects 0.6 %
+                // more light also carries the shot noise of 0.6 % more light.
+                //
+                // Dark-current non-uniformity (DSNU) is the matching fixed pattern on the dark
+                // term. No device in this roster publishes it, so it is absent rather than
+                // invented, and a master dark here corrects the dark's LEVEL but not its structure.
+                double light = (Math.Max(0.0, p.Signal[i]) + p.SkyElectronsPerPixel)
+                             * SensorNonUniformity.PhotoResponse(p.PhotoResponseMap, i)
+                             * Illumination(p.IlluminationMap, i);
+                raw[i] = (float)NoiseSampler.Poisson(rng, light + p.DarkElectronsPerPixel);
             }
 
             ApplyBlooming(raw, p.W, p.H, (float)p.FullWellElectrons);
@@ -523,11 +857,136 @@ namespace ExoStudio.Simulation
             {
                 double e = raw[i];
                 if (e >= p.FullWellElectrons) { e = p.FullWellElectrons; saturated++; }
+
+                // Offset fixed-pattern noise is ADDITIVE and belongs after saturation and before
+                // the amplifier: it is where the pixel reads out FROM, not what it collected. This
+                // is what makes a bias frame carry structure rather than one constant, and it is
+                // the component ESO's FORS2 bias recipe isolates as QC.BIAS.FPN.
+                // NON-LINEARITY, and it goes HERE for a reason: it is a property of the output
+                // amplifier's sense node, so it acts on the charge after transfer and before the
+                // read noise, not on the photon count (Janesick 2001). It is also the one detector
+                // effect that survives the whole standard calibration set, because a bias, a dark
+                // and a flat each sit at their own signal level and carry their own curvature.
+                // Uncorrected it biases exactly the bright stars a zero point is measured from.
+                e = DetectorLinearity.Measured(e, p.FullWellElectrons, p.Spec.LinearityDeviationAtFullWell);
+
+                e += SensorNonUniformity.OffsetElectrons(p.OffsetMap, i);
+
                 e += NoiseSampler.Gaussian(rngRead, p.Spec.ReadNoiseElectrons);
                 adu[i] = (float)Math.Min(p.MaxAdu, Math.Max(0.0, Math.Floor(e / p.ElectronsPerAdu + p.BiasAdu)));
             }
             saturatedFraction = (double)saturated / n;
             return adu;
+        }
+
+        /// <summary>
+        /// The illumination the focal plane actually receives, pixel by pixel: the cosine-fourth
+        /// falloff away from the optical axis, and zero outside whatever stops the instrument has.
+        ///
+        /// WHY THIS BELONGS IN THE FLAT AND NOT ONLY IN THE PICTURE. A flat removes everything
+        /// multiplicative between the sky and the counts, and on a real instrument that is
+        /// dominated by large-scale ILLUMINATION structure rather than by pixel-to-pixel response.
+        /// Modelling only the white PRNU floor made a flat look like a 0.3 % correction; with the
+        /// illumination in, the flat carries the shape a real one has.
+        ///
+        /// cos^4 is the geometric term every off-axis point pays (Kingslake, "Optics in
+        /// Photography"): the ray bundle is longer, tilted at both ends, and its solid angle falls.
+        /// Computed rather than tuned, so it is honest about being small for THIS roster, where
+        /// every instrument is long-focus relative to its sensor.
+        ///
+        /// WHAT IS NOT HERE, and is why a real amateur flat has deep corners: ACCESSORY vignetting
+        /// from an undersized filter, a narrow drawtube or an off-axis guider, and DUST MOTES.
+        /// Neither is published for any instrument here, and inventing a donut would put a
+        /// specific, visible, wrong feature into every frame. The route to those is a flat the
+        /// observer actually took; see Core.MeasuredFlatField.
+        /// </summary>
+        public static float[] BuildIlluminationMap(VisualTelescopeSpec spec, int w, int h, int binning,
+                                                   double zoomFactor, out double cornerFalloff)
+        {
+            cornerFalloff = 1.0;
+            if (spec == null || w <= 0 || h <= 0) return null;
+
+            double focal = spec.FocalLengthMeters * (double.IsNaN(zoomFactor) ? 1.0 : Math.Max(1.0, zoomFactor));
+            double pixel = spec.NativePixelSizeMeters * Math.Max(1, binning);
+            if (!(focal > 0.0) || !(pixel > 0.0)) return null;
+
+            bool hasStop = !double.IsNaN(spec.FieldStopSquareArcmin) || !double.IsNaN(spec.ImageCircleMillimetres);
+
+            var map = new float[w * h];
+            double cx = (w - 1) * 0.5, cy = (h - 1) * 0.5;
+            double worst = 1.0;
+            bool any = false;
+
+            for (int y = 0; y < h; y++)
+            {
+                double dy = (y - cy) * pixel;
+                for (int x = 0; x < w; x++)
+                {
+                    double dx = (x - cx) * pixel;
+                    double f = FocalPlaneIllumination.Factor(
+                        dx, dy, focal, spec.FieldStopSquareArcmin, spec.ImageCircleMillimetres);
+                    map[y * w + x] = (float)f;
+                    if (f < worst) worst = f;
+                    if (f < 0.999999) any = true;
+                }
+            }
+
+            cornerFalloff = worst;
+            return any || hasStop ? map : null;
+        }
+
+        /// <summary>
+        /// The two fixed patterns of one sensor, drawn once from a seed that is a property of the
+        /// SILICON rather than of the exposure.
+        ///
+        /// That is the whole point and it is not an optimisation: if these were redrawn per frame
+        /// they would be temporal noise wearing a fixed pattern's name, a flat taken on Tuesday
+        /// would not correct a light taken on Wednesday, and calibration would silently do nothing.
+        /// The seed is derived from the instrument's name and the binning, so the same instrument
+        /// gives the same silicon in every session and on every machine, and a master flat stored
+        /// from one run calibrates a light from another.
+        ///
+        /// Returns nulls when the device publishes no figure, which is what SensorNonUniformity's
+        /// accessors read as "uniform" rather than as zero.
+        /// </summary>
+        public static void BuildFixedPatterns(VisualTelescopeSpec spec, int binning, int pixelCount,
+                                              out ushort[] photoResponse, out ushort[] offset)
+        {
+            photoResponse = null;
+            offset = null;
+            if (spec == null || pixelCount <= 0) return;
+
+            // The catalogue's PRNU and FPN are quoted for the sensor's NATIVE pixel. A read-out
+            // pixel that sums n x n of them is more uniform in response (1/n) and less uniform in
+            // offset (x n), and Core carries both scalings; the amateur camera here is already
+            // binned 2x2 in silicon before any binning the observer asks for.
+            int nativePerSide = Math.Max(1, spec.SensorNativePixelsPerSide) * Math.Max(1, binning);
+
+            double prnu = SensorNonUniformity.BinnedPhotoResponseSigma(
+                spec.PhotoResponseNonUniformity, nativePerSide);
+            double fpn = SensorNonUniformity.BinnedOffsetSigmaElectrons(
+                spec.OffsetFixedPatternElectrons, nativePerSide);
+
+            ulong serial = SensorSerialSeed(spec, binning);
+            if (prnu > 0.0) photoResponse = SensorNonUniformity.BuildPhotoResponseMap(serial, pixelCount, prnu);
+            if (fpn > 0.0) offset = SensorNonUniformity.BuildOffsetMap(serial, pixelCount, fpn);
+        }
+
+        /// <summary>
+        /// A stable identifier for this piece of silicon at this binning. Binning is in the seed
+        /// because binning changes the read-out pixel grid, so the maps are not the same array
+        /// resampled but a different set of pixels, and a flat taken at one binning cannot
+        /// calibrate a light taken at another. A real observer knows this; the seed enforces it.
+        /// </summary>
+        private static ulong SensorSerialSeed(VisualTelescopeSpec spec, int binning)
+        {
+            ulong h = 1469598103934665603UL;                     // FNV-1a, 64-bit
+            foreach (char c in (spec.Name ?? "") + "|" + (spec.CameraName ?? "") + "|bin" + binning)
+            {
+                h ^= c;
+                h *= 1099511628211UL;
+            }
+            return h;
         }
 
         /// <summary>The FITS header for a frame off this exposure, filled from what Prepare measured.</summary>
@@ -550,10 +1009,15 @@ namespace ExoStudio.Simulation
                 UtcTimestamp = SimulationClock.UtToUtc(p.ObservedUt),
                 TelescopeName = p.Spec.Name,
                 InstrumentName = p.Spec.CameraName,
-                ObservatoryName = p.Site.Name,
-                SiteLatitudeDeg = p.Site.LatitudeDeg,
-                SiteLongitudeDeg = p.Site.LongitudeDeg,
-                SiteElevationMeters = p.Site.AltitudeMeters,
+                // AN ORBITAL FRAME MUST NOT CLAIM A MOUNTAIN. OBSGEO/SITE keywords on a frame taken
+                // from LEO would send a reduction package computing a parallactic angle and a
+                // barycentric correction for a telescope that was 535 km above the ground and
+                // moving at 7.6 km/s. The sub-satellite point IS the honest answer to "where was
+                // the observer", so it goes in, with the altitude as the elevation.
+                ObservatoryName = p.Platform != null ? p.Platform.Name : p.Site.Name,
+                SiteLatitudeDeg = p.Platform != null ? p.PlatformState.SubSatelliteDecDeg : p.Site.LatitudeDeg,
+                SiteLongitudeDeg = p.Platform != null ? p.PlatformState.SubSatelliteRaDeg : p.Site.LongitudeDeg,
+                SiteElevationMeters = p.Platform != null ? p.PlatformState.AltitudeKm * 1000.0 : p.Site.AltitudeMeters,
                 BinningFactor = p.Binning,
                 ReadNoiseElectrons = p.Spec.ReadNoiseElectrons,
                 DarkCurrentElectronsPerSecond = p.Spec.DarkCurrentElectronsPerSecond,
@@ -562,7 +1026,9 @@ namespace ExoStudio.Simulation
                 Airmass = p.Meta.AirmassX,
                 SeeingFwhmArcsec = p.Meta.SeeingFwhmArcsec,
                 DiffractionFwhmArcsec = double.NaN,
-                SkyBrightnessVMagPerArcsec2 = double.NaN,
+                // Known in orbit and not on the ground, because the orbital sky is computed as a
+                // surface brightness and the ground sky is accumulated straight into electrons.
+                SkyBrightnessVMagPerArcsec2 = p.Meta.SkyVMagPerArcsec2,
                 GalacticReddeningEBv = double.NaN,
                 LineSurfaceBrightnessRayleighs = double.NaN,
                 EmissionMeasuredLines = p.Meta.EmissionLinesRendered,
@@ -984,6 +1450,93 @@ namespace ExoStudio.Simulation
             }
             return bands;
         }
+
+        /// <summary>
+        /// The passband split for a telescope above the atmosphere, transplanted from the mod's
+        /// BuildSpaceSubBands.
+        ///
+        /// SAME STRUCTURE AS THE GROUND VERSION, AND FOR THE SAME REASON: the quantity varying
+        /// across one filter is chromatic, so summing monochromatic kernels with their photon
+        /// weights and convolving once is not an approximation of a chromatic PSF, it is one.
+        /// What changes is WHICH term is chromatic. On the ground it is differential refraction,
+        /// which smears a source toward the zenith; there is no atmosphere here to refract
+        /// anything, so every offset is zero and the sub-bands stack concentrically. In their
+        /// place go two Gaussian terms:
+        ///
+        ///   * THE DELIVERED PSF, from the platform's own measured curve. For HST that is WFC3's
+        ///     published FWHM against wavelength, and its turnover near 500 nm, the OTA's
+        ///     mid-frequency polishing errors, is why Hubble is not diffraction-limited anywhere
+        ///     in this band and why this has to be per sub-band rather than one number.
+        ///     GaussianFwhmForDelivered backs the diffraction core out of the measured width so
+        ///     the two are not counted twice.
+        ///
+        ///   * THE ATTITUDE JITTER over this exposure, from PointingStability. Achromatic, so it
+        ///     is the same in every sub-band, and it is added in quadrature because the two are
+        ///     independent broadenings of the same image.
+        /// </summary>
+        private static ChromaticSubBand[] BuildSpaceSubBands(
+            VisualTelescopeSpec spec, SpacePlatformSpec platform, SystemResponse response,
+            double centreMeters, double bandwidthAngstrom, double plateScale, double pointingFwhmArcsec)
+        {
+            double bandwidthMeters = bandwidthAngstrom * 1e-10;
+            double lo = Math.Max(150e-9, centreMeters - 0.75 * bandwidthMeters);
+            double hi = Math.Min(1200e-9, centreMeters + 0.75 * bandwidthMeters);
+            if (!(hi > lo)) { lo = centreMeters; hi = centreMeters * 1.0001; }
+
+            // Weighted by the same 6000 K continuum the ground path uses, for the same reason: one
+            // kernel is shared by every source in the frame, so it is built on one spectrum.
+            ChromaticSubBand[] bands = AtmosphericRefraction.SplitPassband(
+                response,
+                l => Colorimetry.PlanckSpectralRadiance(l * 1e9, 6000.0) * l,
+                lo, hi, 12,
+                0.0, plateScale,     // zero zenith distance: nothing to disperse
+                0.0, 0.0,
+                centreMeters,
+                0.0, 0.0, 0.0);
+
+            if (bands == null)
+            {
+                // No response to weight with. Fall back to a flat split so the two Gaussian terms
+                // still reach the kernel rather than being silently dropped.
+                bands = new ChromaticSubBand[12];
+                for (int i = 0; i < bands.Length; i++)
+                    bands[i] = new ChromaticSubBand
+                    {
+                        WavelengthMeters = lo + (i + 0.5) * (hi - lo) / bands.Length,
+                        Weight = 1.0,
+                    };
+            }
+
+            SpectralCurve delivered = platform?.DeliveredPsfFwhmArcsec;
+            for (int i = 0; i < bands.Length; i++)
+            {
+                if (!(bands[i].Weight > 0.0)) continue;
+
+                double wavefront = 0.0;
+                if (delivered != null)
+                {
+                    double lambdaM = bands[i].WavelengthMeters;
+                    double deliveredFwhm = delivered.At(lambdaM);
+                    if (deliveredFwhm > 0.0)
+                    {
+                        wavefront = OpticalPsf.GaussianFwhmForDelivered(
+                            deliveredFwhm, plateScale, spec.ApertureMeters,
+                            spec.SecondaryObstructionFraction, lambdaM,
+                            spec.SpiderVaneCount, spec.SpiderVaneWidthMeters);
+                    }
+                }
+
+                bands[i].GaussianFwhmArcsec =
+                    Math.Sqrt(wavefront * wavefront + pointingFwhmArcsec * pointingFwhmArcsec);
+                bands[i].OffsetX = 0.0;
+                bands[i].OffsetY = 0.0;
+            }
+            return bands;
+        }
+
+        /// <summary>The illumination factor of one pixel, or 1 for an instrument with no falloff and no stops.</summary>
+        public static double Illumination(float[] map, int index)
+            => map == null || index < 0 || index >= map.Length ? 1.0 : map[index];
 
         /// <summary>SolarSystemCameraTexture.ApplyBlooming verbatim: full-well overflow spills down the CCD columns.</summary>
         private static void ApplyBlooming(float[] raw, int w, int h, float fullWellElectrons)
