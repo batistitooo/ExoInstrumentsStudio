@@ -32,6 +32,7 @@
     <Compile Include="$(StudioRoot)\Simulation\VisualizationBoundary.cs" />
     <Compile Include="$(StudioRoot)\Simulation\UnityShims.cs" />
     <Compile Include="$(StudioRoot)\Simulation\DeepSkyCamera.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\StarFieldCatalogs.cs" />
     <!-- DeepSkyCamera's orbital branch needs the spacecraft, its orbit and the constraints. -->
     <Compile Include="$(StudioRoot)\Simulation\OrbitalPlatforms.cs" />
     <Compile Include="$(StudioRoot)\Simulation\PngWriter.cs" />

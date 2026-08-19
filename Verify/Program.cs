@@ -1203,6 +1203,148 @@ Section("13. Bias, dark and flat, and whether they remove anything");
     }
 }
 
+// =====================================================================================
+Section("14. Which star catalogue serves a field, when more than one is installed");
+// =====================================================================================
+{
+    // Every catalogue here is SYNTHETIC and written into a temporary directory, so this section
+    // runs without the Gaia files installed and cannot be perturbed by which ones are. What it
+    // exercises is the rule in StarFieldCatalogs: a deep patch replaces the all-sky catalogue
+    // over its own ground, but only when it covers the WHOLE of a field and only when doing so
+    // adds stars rather than losing them.
+    string sandbox = Path.Combine(Path.GetTempPath(), "exostudio-patch-verify-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(sandbox);
+    try
+    {
+        const double centreRa = 100.0, centreDec = 20.0;
+
+        // A base of bright stars over a wide area, and a deep patch that contains every one of
+        // them plus many fainter ones: the relationship a real G < 13 base and a real G < 20
+        // patch stand in, since a deeper cut of the same archive is a superset of a shallower one.
+        var baseStars = SyntheticField(centreRa, centreDec, 3.0, 6000, 6.0, 13.0, seed: 11);
+        var deep = new List<(double ra, double dec, double v)>(baseStars.Where(s =>
+            StarFieldLayer.SeparationDeg(centreRa, centreDec, s.ra, s.dec) <= 1.0));
+        deep.AddRange(SyntheticField(centreRa, centreDec, 1.0, 3000, 13.0, 20.0, seed: 12));
+
+        string basePath = Path.Combine(sandbox, "Base.starcat");
+        WriteCatalogue(basePath, baseStars);
+        var allSky = new RenderedStarCatalog();
+        allSky.Load(basePath);
+        Check("the synthetic all-sky base loads", allSky.IsLoaded, $"{allSky.Count:N0} stars");
+
+        WriteCatalogue(Path.Combine(sandbox, "GaiaPatch-Deep.starcat"), deep);
+        File.WriteAllText(Path.Combine(sandbox, StarFieldCatalogs.ManifestName),
+            "allsky 13\n" +
+            $"GaiaPatch-Deep.starcat  {centreRa:0.####}  {centreDec:0.####}  1.0  20\n");
+
+        var fields = new StarFieldCatalogs();
+        fields.SetAllSky(allSky, basePath);
+        fields.LoadPatches(new[] { sandbox });
+
+        Check("the deep patch is accepted", fields.Patches.Count == 1,
+              string.Join(" | ", fields.Report.Where(r => r.StartsWith("WARNING"))));
+
+        // COVERAGE. A field is served by the patch only when the whole of its search cone is
+        // inside the patch, tested as exact spherical containment rather than a bounding box.
+        Check("a field at the patch's centre is served by the patch",
+              fields.Select(centreRa, centreDec, 0.25)?.Name == "GaiaPatch-Deep");
+        Check("a field wholly inside the patch is served by the patch",
+              fields.Select(centreRa, centreDec + 0.7, 0.25)?.Name == "GaiaPatch-Deep");
+        Check("a field straddling the patch edge falls back to the all sky catalogue",
+              fields.Select(centreRa, centreDec + 0.9, 0.25)?.IsAllSky == true);
+        Check("and the frame is told which patch fell short, and by how much",
+              fields.NearMiss(centreRa, centreDec + 0.9, 0.25)?.Contains("GaiaPatch-Deep") == true,
+              fields.NearMiss(centreRa, centreDec + 0.9, 0.25));
+        Check("a field nowhere near any patch is not told about them",
+              fields.NearMiss(centreRa + 40.0, centreDec, 0.25) == null);
+
+        // The deep patch must genuinely hold more of the sky's stars over its own ground.
+        var viaPatch = new List<RenderedStar>();
+        var viaBase = new List<RenderedStar>();
+        fields.Select(centreRa, centreDec, 0.25).Catalog.Search(centreRa, centreDec, 0.25, 30.0, viaPatch);
+        allSky.Search(centreRa, centreDec, 0.25, 30.0, viaBase);
+        Check("the patch deepens the field rather than merely moving it",
+              viaPatch.Count > viaBase.Count, $"{viaPatch.Count} stars against {viaBase.Count}");
+
+        // NO MERGING. Two layers over the same ground hold the same bright stars, so a frame
+        // that consulted both would deposit every shared star twice at twice its flux.
+        // Select returns exactly one layer, which is what makes that impossible.
+        int shared = viaPatch.Count(p => viaBase.Any(b =>
+            StarFieldLayer.SeparationDeg(p.RaDeg, p.DecDeg, b.RaDeg, b.DecDeg) < 1.0 / 3600.0));
+        Check("the two layers really do share stars, so merging them would double count",
+              shared > 0, $"{shared} stars in both");
+
+        // A SHALLOWER patch must never displace the base, or the field would lose stars.
+        {
+            var shallow = new List<(double ra, double dec, double v)>(baseStars.Where(s =>
+                StarFieldLayer.SeparationDeg(centreRa, centreDec, s.ra, s.dec) <= 1.0 && s.v < 10.0));
+            WriteCatalogue(Path.Combine(sandbox, "GaiaPatch-Shallow.starcat"), shallow);
+            File.WriteAllText(Path.Combine(sandbox, StarFieldCatalogs.ManifestName),
+                "allsky 13\n" +
+                $"GaiaPatch-Shallow.starcat  {centreRa:0.####}  {centreDec:0.####}  1.0  10\n");
+            var f2 = new StarFieldCatalogs();
+            f2.SetAllSky(allSky, basePath);
+            f2.LoadPatches(new[] { sandbox });
+            Check("a patch shallower than the base never wins its field",
+                  f2.Select(centreRa, centreDec, 0.25)?.IsAllSky == true);
+        }
+
+        // A patch MISSING stars the base already has is refused outright, because a patch
+        // replaces rather than adds and would take them out of the frame.
+        {
+            var lossy = new List<(double ra, double dec, double v)>(deep.Where(s => s.v > 11.0));
+            WriteCatalogue(Path.Combine(sandbox, "GaiaPatch-Lossy.starcat"), lossy);
+            File.WriteAllText(Path.Combine(sandbox, StarFieldCatalogs.ManifestName),
+                "allsky 13\n" +
+                $"GaiaPatch-Lossy.starcat  {centreRa:0.####}  {centreDec:0.####}  1.0  20\n");
+            var f3 = new StarFieldCatalogs();
+            f3.SetAllSky(allSky, basePath);
+            f3.LoadPatches(new[] { sandbox });
+            Check("a deeper patch that drops bright stars is refused, not used",
+                  f3.Patches.Count == 0 && f3.Select(centreRa, centreDec, 0.25)?.IsAllSky == true,
+                  f3.Report.FirstOrDefault(r => r.StartsWith("WARNING")));
+        }
+
+        // A manifest line that does not describe its file is refused: here the file covers a
+        // degree but the line claims a tenth of one, so trusting it would render the outer
+        // nine tenths of every field inside it as bare sky.
+        {
+            File.WriteAllText(Path.Combine(sandbox, StarFieldCatalogs.ManifestName),
+                "allsky 13\n" +
+                $"GaiaPatch-Deep.starcat  {centreRa:0.####}  {centreDec:0.####}  0.1  20\n");
+            var f4 = new StarFieldCatalogs();
+            f4.SetAllSky(allSky, basePath);
+            f4.LoadPatches(new[] { sandbox });
+            Check("a patch whose stars fall outside the cone the manifest claims is refused",
+                  f4.Patches.Count == 0,
+                  f4.Report.FirstOrDefault(r => r.StartsWith("WARNING")));
+        }
+
+        // The declination index is what every cone search stands on, and a wrong one renders an
+        // empty sky while the file loads, counts and decodes perfectly. For a patch that is
+        // caught exactly: a search of the whole sky has to reach every star in the file.
+        {
+            string broken = Path.Combine(sandbox, "GaiaPatch-Broken.starcat");
+            WriteCatalogue(broken, deep, corruptBandIndex: true);
+            File.WriteAllText(Path.Combine(sandbox, StarFieldCatalogs.ManifestName),
+                "allsky 13\n" +
+                $"GaiaPatch-Broken.starcat  {centreRa:0.####}  {centreDec:0.####}  1.0  20\n");
+            var f5 = new StarFieldCatalogs();
+            f5.SetAllSky(allSky, basePath);
+            f5.LoadPatches(new[] { sandbox });
+            Check("a patch whose declination index contradicts its own records is refused",
+                  f5.Patches.Count == 0,
+                  f5.Report.FirstOrDefault(r => r.StartsWith("WARNING")));
+        }
+
+        allSky.Dispose();
+    }
+    finally
+    {
+        try { Directory.Delete(sandbox, recursive: true); } catch { }
+    }
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"
@@ -1260,6 +1402,102 @@ static string Arg(string flag)
     string[] a = Environment.GetCommandLineArgs();
     int i = Array.IndexOf(a, flag);
     return i >= 0 && i + 1 < a.Length ? a[i + 1] : null;
+}
+
+/// <summary>
+/// Stars scattered evenly over a cone, for section 14. Even in SOLID ANGLE rather than in
+/// declination, so a patch near a pole is not quietly denser at its top than at its bottom and
+/// the coverage tests are not measuring an artefact of the generator.
+/// </summary>
+static List<(double ra, double dec, double v)> SyntheticField(
+    double centreRaDeg, double centreDecDeg, double radiusDeg, int count,
+    double brightestV, double faintestV, int seed)
+{
+    var rng = new Random(seed);
+    var outp = new List<(double, double, double)>(count);
+
+    double d2r = Math.PI / 180.0;
+    double cosR = Math.Cos(radiusDeg * d2r);
+    double cd = Math.Cos(centreDecDeg * d2r), sd = Math.Sin(centreDecDeg * d2r);
+
+    for (int i = 0; i < count; i++)
+    {
+        // Uniform inside the cone: cos(theta) uniform on [cos R, 1], azimuth uniform.
+        double cosTheta = cosR + (1.0 - cosR) * rng.NextDouble();
+        double sinTheta = Math.Sqrt(Math.Max(0.0, 1.0 - cosTheta * cosTheta));
+        double phi = 2.0 * Math.PI * rng.NextDouble();
+
+        // Rotate the offset onto the cone's centre.
+        double x = sinTheta * Math.Cos(phi), y = sinTheta * Math.Sin(phi), z = cosTheta;
+        double xr = x * sd + z * cd;
+        double zr = z * sd - x * cd;
+        double dec = Math.Asin(Math.Clamp(zr, -1.0, 1.0)) / d2r;
+        double ra = centreRaDeg + Math.Atan2(y, xr) / d2r;
+        if (ra < 0.0) ra += 360.0;
+        if (ra >= 360.0) ra -= 360.0;
+
+        outp.Add((ra, dec, brightestV + (faintestV - brightestV) * rng.NextDouble()));
+    }
+    return outp;
+}
+
+/// <summary>
+/// Writes a packed catalogue the way tools/pack_gaia_catalog.py does, so section 14 can build the
+/// files it needs without the archive. The encoding is RenderedStarCatalog's own, and if the two
+/// ever disagree this harness stops loading its own output, which is the failure it should have.
+///
+/// corruptBandIndex reproduces the real fault the format has actually suffered: every record
+/// correct, every count correct, and a declination index that does not point at them, which makes
+/// cone searches return nothing while nothing anywhere reports an error.
+/// </summary>
+static void WriteCatalogue(string path, List<(double ra, double dec, double v)> stars,
+                           bool corruptBandIndex = false)
+{
+    const int bandCount = 1800;
+    const float bandWidth = 0.1f;
+    const double raUnits = 4294967296.0 / 360.0;
+    const double decUnits = 4294967296.0 / 180.0;
+
+    // Banded by declination, sorted in right ascension inside each band: the order the reader's
+    // binary search depends on.
+    var sorted = stars
+        .Select(s => (band: Math.Clamp((int)((s.dec + 90.0) / bandWidth), 0, bandCount - 1), s))
+        .OrderBy(t => t.band).ThenBy(t => t.s.ra)
+        .ToList();
+
+    var bandStart = new uint[bandCount + 1];
+    {
+        int i = 0;
+        for (int b = 0; b <= bandCount; b++)
+        {
+            while (i < sorted.Count && sorted[i].band < b) i++;
+            bandStart[b] = (uint)i;
+        }
+    }
+    if (corruptBandIndex)
+    {
+        // Everything in one band, which is exactly the shape the broken packer produced.
+        for (int b = 1; b <= bandCount; b++) bandStart[b] = (uint)sorted.Count;
+        bandStart[0] = 0;
+        bandStart[1] = (uint)sorted.Count;
+        for (int b = 2; b <= bandCount; b++) bandStart[b] = (uint)sorted.Count;
+    }
+
+    using var w = new BinaryWriter(File.Create(path));
+    w.Write(new[] { (byte)'E', (byte)'X', (byte)'O', (byte)'S', (byte)'T', (byte)'A', (byte)'R', (byte)'1' });
+    w.Write(3);                       // format version
+    w.Write(sorted.Count);
+    w.Write(bandCount);
+    w.Write(bandWidth);
+    for (int b = 0; b <= bandCount; b++) w.Write(bandStart[b]);
+    foreach ((int _, (double ra, double dec, double v) s) in sorted)
+    {
+        w.Write((uint)(s.ra * raUnits));
+        w.Write((int)(s.dec * decUnits));
+        w.Write((ushort)Math.Clamp((s.v + 2.0) * 1000.0, 0, 65535));
+        w.Write((short)600);          // B-V, a plausible solar colour
+        w.Write((ushort)65535);       // reddening not estimated
+    }
 }
 
 

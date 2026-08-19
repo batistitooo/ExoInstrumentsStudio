@@ -152,6 +152,19 @@ namespace ExoStudio.Simulation
             public double AirmassX;
             public double TargetAltitudeDeg;
             public int StarsDrawn;
+
+            /// <summary>
+            /// Which star catalogue this frame's stars came from, so the depth behind a field is
+            /// on the frame rather than left to be inferred from how crowded it looks.
+            /// </summary>
+            public string StarCatalogUsed;
+
+            /// <summary>
+            /// Set when a deeper patch exists but did not cover the whole field, naming it and
+            /// saying by how much it fell short. Null the rest of the time.
+            /// </summary>
+            public string StarCatalogNote;
+
             public int GalaxiesDrawn;
             public List<string> GalaxiesFromImages = new();
             public string EmissionLinesRendered;
@@ -660,10 +673,22 @@ namespace ExoStudio.Simulation
 
             // Stars: cone search wide enough for the trails, photometry through the same
             // response the galaxies used, deposited by Core's own renderer.
-            if (data.Stars != null && data.Stars.IsLoaded)
+            //
+            // Which catalogue serves this field. The search cone is the frame's own radius with
+            // the trailing margin already on it, and that WHOLE cone is what a deep patch has to
+            // cover before it may be used: a patch that reaches part of the frame would put stars
+            // on one side and bare sky on the other, which reads as data rather than as absence.
+            // See StarFieldCatalogs. Exactly one layer serves a frame, never two, or every star
+            // the two share would be deposited twice.
+            double starSearchRadiusDeg = fieldRadiusDeg * 1.3;
+            StarFieldLayer starLayer = data.Fields.Select(req.RaDeg, req.DecDeg, starSearchRadiusDeg);
+            res.StarCatalogUsed = starLayer?.Describe();
+            res.StarCatalogNote = data.Fields.NearMiss(req.RaDeg, req.DecDeg, starSearchRadiusDeg);
+
+            if (starLayer != null && starLayer.Catalog.IsLoaded)
             {
                 var stars = new List<RenderedStar>();
-                data.Stars.Search(req.RaDeg, req.DecDeg, fieldRadiusDeg * 1.3, 30.0, stars);
+                starLayer.Catalog.Search(req.RaDeg, req.DecDeg, starSearchRadiusDeg, 30.0, stars);
 
                 var reddening = new ReddenedResponseCache(response);
                 double exposure = req.ExposureSeconds;
@@ -1657,10 +1682,22 @@ namespace ExoStudio.Simulation
     /// </summary>
     public sealed class DeepSkyData
     {
+        /// <summary>
+        /// The all-sky catalogue on its own, which is what the sky chart draws and clicks into.
+        /// The chart is a picture of the whole sky, so it is the wrong place for a deep patch
+        /// over one field; frames go through <see cref="Fields"/> instead.
+        /// </summary>
         public RenderedStarCatalog Stars { get; private set; }
 
         /// <summary>Where the Gaia file was found, so the all-sky chart can stream it (see GaiaCatalogReader).</summary>
         public string StarCatalogPath { get; private set; }
+
+        /// <summary>
+        /// Every installed star catalogue and the rule that picks between them for one field.
+        /// Never null: with nothing installed it simply selects nothing, which is the honestly
+        /// empty sky the camera already handles.
+        /// </summary>
+        public StarFieldCatalogs Fields { get; } = new();
         public DustMap Dust { get; private set; }
         public EmissionMap Emission { get; private set; }
         public EmissionPatchSet EmissionPatches { get; private set; }
@@ -1702,12 +1739,18 @@ namespace ExoStudio.Simulation
                 c.Load(p);
                 Stars = c;
                 StarCatalogPath = p;
+                Fields.SetAllSky(c, p);
 
                 // A catalogue whose band index is wrong loads, counts and decodes perfectly and
                 // then renders an empty sky in total silence. Say so instead.
                 string fault = Data.GaiaCatalogReader.ValidateBandIndex(p);
                 if (fault != null) Report.Add($"WARNING, Gaia star field: {fault}");
             });
+
+            // Deep patches over individual fields, if any are installed. Loaded after the all-sky
+            // file so the manifest's 'allsky' line has something to attach its depth to.
+            Fields.LoadPatches(dirs);
+            Report.AddRange(Fields.Report);
             Load("DustMap.dustmap", "SFD dust map", p => { var m = new DustMap(); m.Load(p); Dust = m; });
             Load("HalphaMap.emission", "H-alpha emission map", p => { var m = new EmissionMap(); m.Load(p); Emission = m; });
             Load("HalphaPatches.patchset", "high-resolution emission patches", p => { var s = new EmissionPatchSet(); s.Load(p); EmissionPatches = s; });

@@ -99,6 +99,111 @@ namespace ExoStudio.Data
             }
         }
 
+        /// <summary>
+        /// Checks the declination index against the records it indexes, exactly, by reading them.
+        /// Returns null when the index is sound, or a sentence naming the first record that
+        /// contradicts it.
+        ///
+        /// WHY THE CHEAP TEST IS NOT ENOUGH, AND WHY THIS IS NOT THE DEFAULT. ValidateBandIndex
+        /// below looks only at the shape of the offset table: how many bands hold anything, and
+        /// whether one holds an implausible share. That catches the fault the packer actually
+        /// produced, and it costs a few kilobytes, which is what lets it run against an all-sky
+        /// catalogue at startup without reading gigabytes.
+        ///
+        /// It is still a heuristic, and the obvious stronger test is not one at all: asking the
+        /// catalogue for a cone of 180 degrees scans EVERY band, so it returns every record
+        /// whatever the index says, and agreeing with the header proves nothing. What has to be
+        /// checked is the thing a real cone search depends on, which is that a record's
+        /// declination puts it in the band whose range contains it, and that right ascension does
+        /// not go backwards inside a band, since the search brackets each band by binary search.
+        ///
+        /// That costs one full read, so it is for files small enough to afford it: patches, which
+        /// are megabytes.
+        /// </summary>
+        public static string ValidateBandIndexExactly(string path)
+        {
+            using var stream = File.OpenRead(path);
+            using var reader = new BinaryReader(stream);
+
+            byte[] magic = reader.ReadBytes(Magic.Length);
+            if (magic.Length != Magic.Length) return "not an ExoInstruments packed star catalogue";
+            for (int i = 0; i < Magic.Length; i++)
+                if (magic[i] != Magic[i]) return "not an ExoInstruments packed star catalogue";
+
+            int version = reader.ReadInt32();
+            if (version < OldestSupportedVersion || version > NewestSupportedVersion)
+                return $"unsupported catalogue version {version}";
+            bool hasReddening = version >= 3;
+
+            int count = reader.ReadInt32();
+            int bandCount = reader.ReadInt32();
+            float bandWidthDeg = reader.ReadSingle();
+            if (count <= 0 || bandCount <= 0 || bandWidthDeg <= 0f) return null;
+
+            var bandStart = new uint[bandCount + 1];
+            for (int i = 0; i <= bandCount; i++) bandStart[i] = reader.ReadUInt32();
+            if (bandStart[bandCount] != (uint)count)
+                return $"the declination index ends at {bandStart[bandCount]:N0} but the file holds "
+                     + $"{count:N0} stars, so the last {count - bandStart[bandCount]:N0} are in no band "
+                     + "and no cone search can reach them.";
+
+            int recordBytes = hasReddening ? 14 : 12;
+            const int starsPerBlock = 65536;
+            var block = new byte[starsPerBlock * recordBytes];
+
+            int index = 0, band = 0;
+            uint previousRa = 0;
+            int remaining = count;
+            while (remaining > 0)
+            {
+                int take = Math.Min(remaining, starsPerBlock);
+                int want = take * recordBytes, got = 0;
+                while (got < want)
+                {
+                    int n = stream.Read(block, got, want - got);
+                    if (n <= 0) return "the file ends before the star count in its header.";
+                    got += n;
+                }
+
+                for (int i = 0; i < take; i++, index++)
+                {
+                    int o = i * recordBytes;
+                    uint raFixed = BitConverter.ToUInt32(block, o);
+                    int decFixed = BitConverter.ToInt32(block, o + 4);
+
+                    // The band this record's OFFSET puts it in. Offsets rise, so this walks
+                    // forward rather than searching. Empty bands are stepped over.
+                    while (band < bandCount - 1 && index >= bandStart[band + 1])
+                    {
+                        band++;
+                        previousRa = 0;
+                    }
+
+                    // The band its DECLINATION puts it in, banded exactly as the reader bands it:
+                    // from the decoded value, not from whatever float the packer started with, so
+                    // a star on a boundary cannot be sorted one way and searched the other.
+                    double dec = decFixed * DecDegPerUnit;
+                    int wanted = (int)((dec + 90.0) / bandWidthDeg);
+                    if (wanted < 0) wanted = 0;
+                    if (wanted >= bandCount) wanted = bandCount - 1;
+
+                    if (wanted != band)
+                        return $"star {index:N0} sits at declination {dec:+0.####;-0.####}, which belongs to "
+                             + $"band {wanted}, but the index files it under band {band} "
+                             + $"({-90.0 + band * bandWidthDeg:+0.##;-0.##} deg). Every cone search reads the "
+                             + "bands its field overlaps, so records in the wrong band are invisible to it.";
+
+                    if (raFixed < previousRa)
+                        return $"star {index:N0} has a lower right ascension than the star before it inside "
+                             + $"band {band}. Each band is bracketed by binary search on right ascension, "
+                             + "which needs them sorted, so an unsorted band silently loses stars.";
+                    previousRa = raFixed;
+                }
+                remaining -= take;
+            }
+            return null;
+        }
+
         /// <summary>Header only, for the panel's own statement of what it is drawing.</summary>
         public static (int Count, int Version) ReadHeader(string path)
         {

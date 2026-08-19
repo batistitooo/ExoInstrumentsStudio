@@ -97,6 +97,77 @@ Point it at them with `EXOINSTRUMENTS_DATA=/path/to/PluginData`, or drop them in
 built by the mod's `tools/setup_data.py`; a KSP install that already has them is found
 automatically.
 
+## Star field depth, and the sky you cannot download
+
+The catalogue depth that matters is set by the instrument, not by taste. Ask Studio what the
+instrument can see:
+
+```bash
+curl 'http://localhost:5227/api/instruments/RC20/limits?site=OHP&exposure=300&binning=1'
+```
+
+The RC20 at OHP over 300 s reaches **V = 22.2** at signal to noise 5. A catalogue complete to
+G = 13, which is the depth most people build first, is nine magnitudes short of that, and it shows:
+that file holds 179 stars per square degree, so an RC20 frame of 0.0685 square degrees contains
+about twelve. A real 300 s sub holds hundreds.
+
+Depth all the way to the detection limit cannot be had for the whole sky. Gaia DR3 is 1.81 billion
+sources, essentially complete to G = 20; that is roughly 17 GB in this format, which a disk can
+hold, but no archive query delivers 1.2 billion rows in any useful time, and the bulk release is
+753 GB of gzipped CSV to extract the five columns this format keeps. Measured against a real
+target list, the depth is also wildly uneven, which is the part that makes an all-sky number
+misleading:
+
+| field | stars per deg^2 at G < 20 | per RC20 frame | 0.5 deg patch |
+|---|---|---|---|
+| M51 (Whirlpool) | 1,696 | 116 | 19 kB |
+| M42 (Orion) | 4,907 | 336 | 53 kB |
+| M31 (Andromeda) | 12,549 | 860 | 135 kB |
+| Veil (Cygnus) | 58,134 | 3,982 | 0.6 MB |
+| Scutum star cloud | 92,399 | 6,329 | 1.0 MB |
+| Carina Nebula | 124,928 | 8,558 | 1.3 MB |
+| Omega Centauri | 261,843 | 17,936 | 2.7 MB |
+
+A hundred and fifty fold spread, and every one of those patches is small. So the arrangement is
+layered: a shallow catalogue over the whole sky so no pointing is ever empty, and deep patches over
+the fields actually being photographed.
+
+**A patch is not an approximation.** It holds exactly the rows an all-sky build of the same depth
+would hold over the same ground: same archive query, same conversions, same records. Nothing is
+sampled, thinned or interpolated. The M51 patch above is 1,332 stars, and `SELECT COUNT(*)` over
+the identical region returns 1,332.
+
+**What a patch can do wrong is not reach far enough**, and that failure is silent in the worst way:
+a frame half inside the patch comes out with stars on one side and bare sky on the other, which
+reads as data rather than as absence. `Simulation/StarFieldCatalogs.cs` removes it by construction.
+
+- **A patch serves a frame only if it covers all of it**, tested as exact spherical containment
+  against the same search cone the camera uses, trailing margin included. A frame that hangs over
+  the edge falls back to the all-sky catalogue, which is shallower but never partial, and the
+  capture says which patch fell short and by how much.
+- **Exactly one catalogue serves a frame.** Layers are never merged: two files over the same ground
+  hold the same bright stars, and depositing both would draw every shared star twice at twice its
+  flux.
+- **A patch that would lose stars is refused.** Replacement is only safe while the patch is a
+  superset, which it is when both come from the same archive with the same cut, since G < 20
+  contains G < 13. It is checked rather than assumed: every star the all-sky file has inside the
+  patch must be in the patch, or the patch is rejected and says which star it dropped.
+- **A patch that does not match its own manifest line is refused**, and so is one whose declination
+  index contradicts its records, checked exactly by reading them. That last one is the fault that
+  renders an empty sky while the file loads, counts and decodes perfectly.
+
+Build them with `tools/fetch_star_patch.py`, which writes the coverage line from the arguments it
+actually passed to the packer rather than leaving it to be typed in afterwards:
+
+```bash
+python3 tools/fetch_star_patch.py --name M51 --ra 202.4696 --dec 47.1952 --radius 0.5 --gmax 20 --fov-arcmin 19.0 13.0
+```
+
+`--fov-arcmin` is worth passing: it computes the radius the frame actually needs, which is half its
+diagonal times the camera's 1.3 search margin, and refuses anything smaller. Record the base's own
+depth once with `--allsky-limit 13`, or Studio cannot tell whether a patch is deeper than the file
+it would replace. Anonymous archive access is fine at this size; the M51 field took 16 seconds.
+
 ## Why a local server rather than WebAssembly
 
 WebAssembly buys one thing: distribution as a bare URL. It costs a port of every
