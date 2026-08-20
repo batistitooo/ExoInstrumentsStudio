@@ -86,6 +86,9 @@ namespace ExoStudio.Research
         /// common (a sector can yield only target pixels or a data validation report), so they
         /// are skipped rather than treated as failures.
         /// </summary>
+        /// <summary>How many observations the position query listed, before any were opened.</summary>
+        public int LastObservationCount { get; private set; }
+
         public async Task<List<LightCurveProduct>> FindLightCurvesAsync(
             double raDeg, double decDeg, double radiusDeg = 0.02, int maxObservations = 8)
         {
@@ -128,6 +131,8 @@ namespace ExoStudio.Research
                 }
             }
 
+            LastObservationCount = observations.Count;
+
             // Mission products first when they exist, because they are the best calibrated, then
             // the full frame extractions; newest sector first inside each group.
             observations.Sort((a, b) =>
@@ -138,34 +143,131 @@ namespace ExoStudio.Research
                 return b.sector.CompareTo(a.sector);
             });
 
-            var products = new List<LightCurveProduct>();
-            foreach ((string obsid, string target, int sector, double exp,
-                      string collection, string provider) in observations.Take(maxObservations))
-            {
-                JsonElement list;
-                try { list = await InvokeAsync("Mast.Caom.Products", new { obsid }); }
-                catch (InvalidOperationException) { continue; }
-                if (!list.TryGetProperty("data", out JsonElement items)) continue;
+            // STOPS AT THE FIRST OBSERVATION THAT YIELDS A LIGHT CURVE, and that is a large part
+            // of what makes a sweep possible at all.
+            //
+            // MAST separates "what was observed here" from "what files that produced", so each
+            // candidate observation costs its own round trip, and those round trips are the whole
+            // cost of a search. Measured: a star whose field held no usable product spent 198
+            // seconds discovering that, all of it in eight sequential product queries, against a
+            // few seconds of actual computation. Only one product is ever used, so asking about
+            // the rest is asking for nothing.
+            //
+            // The observations are already ordered by preference, mission products first and
+            // newest sector inside that, so the first that answers is the one that would have
+            // been picked anyway.
+            // ONE QUERY FOR ALL OF THEM, not one per observation.
+            //
+            // MAST separates "what was observed here" from "what files that produced", and those
+            // product queries were the entire cost of a search: a star at one position spent 198
+            // seconds in eight sequential ones against a few seconds of computation. The service
+            // accepts a comma separated list, which turned eight round trips into one and 8 times
+            // 17 seconds into 6.6.
+            var chosen = observations.Take(maxObservations).ToList();
+            var byId = chosen.ToDictionary(o => o.obsid, o => o);
 
-                foreach (JsonElement item in items.EnumerateArray())
+            JsonElement list;
+            try
+            {
+                list = await InvokeAsync("Mast.Caom.Products",
+                    new { obsid = string.Join(",", chosen.Select(o => o.obsid)) });
+            }
+            catch (InvalidOperationException) { return new List<LightCurveProduct>(); }
+
+            var products = new List<LightCurveProduct>();
+            if (!list.TryGetProperty("data", out JsonElement items)) return products;
+
+            foreach (JsonElement item in items.EnumerateArray())
+            {
+                string file = Text(item, "productFilename");
+                if (file == null || !IsLightCurve(file)) continue;
+
+                string owner = Text(item, "obsID") ?? Text(item, "obs_id") ?? Text(item, "parent_obsid");
+                if (owner == null || !byId.TryGetValue(owner, out var o))
                 {
-                    string file = Text(item, "productFilename");
-                    if (file == null || !file.EndsWith("_lc.fits", StringComparison.OrdinalIgnoreCase)) continue;
-                    products.Add(new LightCurveProduct
-                    {
-                        ObsId = obsid,
-                        Target = target,
-                        Sector = sector,
-                        ExposureSeconds = exp,
-                        FileName = file,
-                        DataUri = Text(item, "dataURI"),
-                        SizeBytes = (long)Number(item, "size"),
-                        Provider = string.IsNullOrEmpty(provider) ? collection : provider,
-                        IsMissionProduct = collection.Equals("TESS", StringComparison.OrdinalIgnoreCase),
-                    });
+                    // The product list does not always name its observation in a field this can
+                    // match. Falling back to the first observation keeps the file rather than
+                    // dropping it, and only its sector label is then approximate.
+                    o = chosen[0];
                 }
+
+                products.Add(new LightCurveProduct
+                {
+                    ObsId = o.obsid,
+                    Target = o.target,
+                    Sector = o.sector,
+                    ExposureSeconds = o.exp,
+                    FileName = file,
+                    DataUri = Text(item, "dataURI"),
+                    SizeBytes = (long)Number(item, "size"),
+                    Provider = string.IsNullOrEmpty(o.provider) ? o.collection : o.provider,
+                    IsMissionProduct = o.collection.Equals("TESS", StringComparison.OrdinalIgnoreCase),
+                });
             }
             return products;
+        }
+
+        /// <summary>
+        /// Every distinct star in a region that has full frame light curves, with how many
+        /// sectors each was observed in.
+        ///
+        /// THIS IS WHAT A SWEEP NEEDS AND A SEARCH DOES NOT. Looking at one star will not find a
+        /// planet; the work is getting through enough of them for small odds to add up, which is
+        /// exactly what the people who find these things actually do. Sectors are counted because
+        /// they are the baseline: a transit with a period past about nine days shows once or not
+        /// at all in a 27 day sector, and the fields observed sector after sector are where a
+        /// single event has any chance of being caught.
+        /// </summary>
+        public sealed class RegionTarget
+        {
+            public string Name { get; init; }
+            public double RaDeg { get; init; }
+            public double DecDeg { get; init; }
+            public int Sectors { get; init; }
+        }
+
+        public async Task<List<RegionTarget>> FindTargetsAsync(
+            double raDeg, double decDeg, double radiusDeg, int minSectors)
+        {
+            JsonElement found = await InvokeAsync("Mast.Caom.Filtered.Position", new
+            {
+                columns = "target_name,s_ra,s_dec,sequence_number",
+                filters = new object[]
+                {
+                    new { paramName = "dataproduct_type", values = new[] { "timeseries" } },
+                    new { paramName = "obs_collection", values = new[] { "HLSP" } },
+                },
+                position = FormattableString.Invariant($"{raDeg},{decDeg},{radiusDeg}"),
+            });
+
+            var byTarget = new Dictionary<string, (double ra, double dec, HashSet<int> sectors)>();
+            if (found.TryGetProperty("data", out JsonElement rows))
+            {
+                foreach (JsonElement row in rows.EnumerateArray())
+                {
+                    string name = Text(row, "target_name");
+                    if (string.IsNullOrEmpty(name)) continue;
+                    double ra = Number(row, "s_ra"), dec = Number(row, "s_dec");
+                    if (ra == 0 && dec == 0) continue;
+                    int sector = (int)Number(row, "sequence_number");
+
+                    if (!byTarget.TryGetValue(name, out var entry))
+                        byTarget[name] = entry = (ra, dec, new HashSet<int>());
+                    if (sector > 0) entry.sectors.Add(sector);
+                }
+            }
+
+            return byTarget
+                .Where(kv => kv.Value.sectors.Count >= minSectors)
+                .Select(kv => new RegionTarget
+                {
+                    Name = kv.Key,
+                    RaDeg = kv.Value.ra,
+                    DecDeg = kv.Value.dec,
+                    Sectors = kv.Value.sectors.Count,
+                })
+                .OrderByDescending(t => t.Sectors)
+                .ToList();
         }
 
         /// <summary>
@@ -191,6 +293,21 @@ namespace ExoStudio.Research
             File.Move(partial, path, overwrite: true);
             return path;
         }
+
+
+        /// <summary>
+        /// Whether a product file name is a light curve.
+        ///
+        /// NOT JUST "_lc.fits". The mission's own products end that way, but the full frame
+        /// extractions do not agree with each other: QLP writes "_llc.fits", with two l's, for
+        /// "long cadence light curve". Matching only the mission's spelling silently discarded an
+        /// entire provider, which is why a star observed in nineteen sectors reported that the
+        /// archive held no light curve for it at all.
+        /// </summary>
+        private static bool IsLightCurve(string file)
+            => file.EndsWith("_lc.fits", StringComparison.OrdinalIgnoreCase)
+            || file.EndsWith("_llc.fits", StringComparison.OrdinalIgnoreCase)
+            || file.EndsWith("_slc.fits", StringComparison.OrdinalIgnoreCase);
 
         private static string Text(JsonElement row, string name)
             => row.TryGetProperty(name, out JsonElement v)

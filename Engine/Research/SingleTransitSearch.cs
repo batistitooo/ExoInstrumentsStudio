@@ -90,41 +90,47 @@ namespace ExoStudio.Research
             {
                 // The baseline is taken from a window either side, each as wide as the dip, with a
                 // gap between so ingress and egress do not contaminate what they are compared to.
-                double flank = dur;
+                double half = dur * 0.5;
                 double guard = dur * 0.5;
+                double flank = dur;
 
-                for (int i = 0; i < n; i++)
+                // SLIDING, NOT RESCANNING. The first version of this walked the whole light curve
+                // for every trial position, which is quadratic: 10 durations over 10,730 cadences
+                // came to 1.15 billion iterations and took 194 seconds for ONE star. The samples
+                // are time ordered, so every window boundary only ever moves forward, and six
+                // indices chasing the centre turn the same search into a linear pass.
+                //
+                // Trial centres also step by a quarter of the duration rather than by one cadence.
+                // A box offset by less than that overlaps its neighbour almost entirely and finds
+                // the same event; the overlapping hits were being merged afterwards anyway.
+                int leftOuter = 0, leftInner = 0, dipLo = 0, dipHi = 0, rightInner = 0, rightOuter = 0;
+                double step = Math.Max(dur * 0.25, curve.CadenceMinutes / (24.0 * 60.0));
+
+                for (double centre = curve.TimeDays[0] + half + guard + flank;
+                     centre <= curve.TimeDays[n - 1] - half - guard - flank;
+                     centre += step)
                 {
-                    double centre = curve.TimeDays[i];
-                    double half = dur * 0.5;
+                    // Each boundary advances to where it belongs; none ever goes backwards.
+                    while (leftOuter < n && curve.TimeDays[leftOuter] < centre - half - guard - flank) leftOuter++;
+                    while (leftInner < n && curve.TimeDays[leftInner] < centre - half - guard) leftInner++;
+                    while (dipLo < n && curve.TimeDays[dipLo] < centre - half) dipLo++;
+                    while (dipHi < n && curve.TimeDays[dipHi] <= centre + half) dipHi++;
+                    while (rightInner < n && curve.TimeDays[rightInner] < centre + half + guard) rightInner++;
+                    while (rightOuter < n && curve.TimeDays[rightOuter] <= centre + half + guard + flank) rightOuter++;
 
-                    var inDip = new List<double>();
-                    var baseline = new List<double>();
-                    for (int j = 0; j < n; j++)
-                    {
-                        double dt = curve.TimeDays[j] - centre;
-                        double adt = Math.Abs(dt);
-                        if (adt <= half) inDip.Add(curve.Flux[j]);
-                        else if (adt > half + guard && adt <= half + guard + flank) baseline.Add(curve.Flux[j]);
-                    }
+                    int inDip = dipHi - dipLo;
+                    int before = leftInner - leftOuter;
+                    int after = rightOuter - rightInner;
+                    // Enough of both, and baseline on BOTH sides rather than all on one, which is
+                    // what the edge of a data gap looks like.
+                    if (inDip < 4 || before < 4 || after < 4) continue;
 
-                    // Enough of both, and the baseline present on both sides rather than all on one,
-                    // which is what a data gap edge looks like.
-                    if (inDip.Count < 4 || baseline.Count < 12) continue;
-                    int before = 0;
-                    for (int j = 0; j < n; j++)
-                    {
-                        double dt = curve.TimeDays[j] - centre;
-                        if (dt < -(half + guard) && dt >= -(half + guard + flank)) before++;
-                    }
-                    if (before < 4 || baseline.Count - before < 4) continue;
-
-                    double b = Median(baseline);
-                    double d = Median(inDip);
+                    double b = MedianOf(curve.Flux, leftOuter, leftInner, rightInner, rightOuter);
+                    double d = MedianOf(curve.Flux, dipLo, dipHi, 0, 0);
                     double depth = b - d;
                     if (depth <= 0) continue;
 
-                    double sigma = noise / Math.Sqrt(inDip.Count);
+                    double sigma = noise / Math.Sqrt(inDip);
                     double snr = depth / sigma;
                     if (snr < snrThreshold) continue;
 
@@ -135,8 +141,8 @@ namespace ExoStudio.Research
                         DepthPpm = depth * 1e6,
                         DepthUncertaintyPpm = sigma * 1e6,
                         Snr = snr,
-                        PointsInDip = inDip.Count,
-                        PointsInBaseline = baseline.Count,
+                        PointsInDip = inDip,
+                        PointsInBaseline = before + after,
                     });
                 }
             }
@@ -208,6 +214,25 @@ namespace ExoStudio.Research
                             + "probably came from a neighbouring star, not this one.");
                 }
             }
+        }
+
+
+        /// <summary>
+        /// Median over one or two index ranges of an array, copying only what those ranges hold.
+        ///
+        /// Called once per trial position, so it must not touch the whole light curve: the ranges
+        /// are the dip, or the two baseline flanks, and each is a few tens of cadences.
+        /// </summary>
+        private static double MedianOf(double[] v, int aFrom, int aTo, int bFrom, int bTo)
+        {
+            int count = (aTo - aFrom) + (bTo - bFrom);
+            if (count <= 0) return 0.0;
+            var buffer = new double[count];
+            int k = 0;
+            for (int i = aFrom; i < aTo; i++) buffer[k++] = v[i];
+            for (int i = bFrom; i < bTo; i++) buffer[k++] = v[i];
+            Array.Sort(buffer);
+            return count % 2 == 1 ? buffer[count / 2] : 0.5 * (buffer[count / 2 - 1] + buffer[count / 2]);
         }
 
         private static double Scatter(double[] v)

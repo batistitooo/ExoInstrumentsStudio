@@ -550,3 +550,199 @@ table.signals tr.miss td { color: var(--ink-faint); }
 .orbitkey i.occ  { background: #2b3543; }
 .orbitkey i.sun  { background: var(--amber); }
 .orbitkey i.moon { background: var(--violet); }
+
+/* -------------------------------------------------------------------- modes */
+/* The first choice on the page, and the only control that changes what the other
+   controls are. Sized to read as a pair of destinations rather than as a toggle. */
+
+.modes {
+  display: flex; gap: 6px;
+  padding: 3px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: calc(var(--r) + 3px);
+}
+
+.modes .mode {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 7px 16px;
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--r);
+  text-align: left; cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+
+.modes .mode:hover { background: var(--bg-hover); }
+
+.modes .mode .mode-name {
+  font-size: 13px; font-weight: 650; letter-spacing: .01em;
+  color: var(--ink-dim);
+}
+.modes .mode .mode-sub {
+  font-size: 10.5px; color: var(--ink-faint); letter-spacing: .02em;
+}
+
+.modes .mode.on {
+  background: rgba(255,180,84,.09);
+  border-color: rgba(255,180,84,.30);
+}
+.modes .mode.on .mode-name { color: var(--amber); }
+.modes .mode.on .mode-sub  { color: var(--ink-dim); }
+
+@media (max-width: 1100px) {
+  .modes .mode .mode-sub { display: none; }
+}
+
+/* -------------------------------------------------------------- calibration */
+
+.calrow {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 9px;
+  margin-top: 11px;
+}
+
+.calrow .lbl {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--ink-faint);
+}
+
+.calcount {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--ink-faint);
+}
+.calcount input {
+  width: 58px; padding: 5px 7px;
+  background: var(--bg-sunken); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 5px;
+  font-family: var(--mono); font-size: 12px;
+}
+
+.calupload {
+  padding-top: 11px; margin-top: 13px;
+  border-top: 1px solid var(--line-soft);
+}
+.calupload select {
+  padding: 5px 8px; font-size: 12px;
+  background: var(--bg-sunken); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 5px;
+}
+.calupload input[type=file] { font-size: 11.5px; color: var(--ink-dim); max-width: 260px; }
+.calupload input[type=file]::file-selector-button {
+  padding: 5px 11px; margin-right: 9px;
+  background: transparent; color: var(--ink-dim);
+  border: 1px solid var(--line); border-radius: 5px;
+  font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.calupload input[type=file]::file-selector-button:hover {
+  background: var(--bg-hover); color: var(--ink); border-color: #2a3441;
+}
+
+.masters {
+  width: 100%; margin-top: 12px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.masters th {
+  padding: 5px 9px; text-align: left;
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--ink-faint); border-bottom: 1px solid var(--line);
+}
+.masters td {
+  padding: 6px 9px; border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-dim);
+}
+.masters td.mkind { color: var(--ink); font-weight: 600; }
+.masters td.mono, .masters td .mono { font-family: var(--mono); }
+.masters a { color: var(--amber); text-decoration: none; border-bottom: 1px dotted rgba(255,180,84,.5); }
+.masters a:hover { border-bottom-style: solid; }
+
+/* Notes are where the value is: each one is a way a master can be wrong while the
+   arithmetic still succeeds. Warnings are not dim. */
+.calnotes { list-style: none; margin: 12px 0 0; padding: 0; }
+.calnotes:empty { display: none; }
+.calnotes li {
+  position: relative;
+  padding: 4px 0 4px 15px;
+  font-size: 11.5px; line-height: 1.5;
+  color: var(--ink-faint);
+}
+.calnotes li::before {
+  content: ""; position: absolute; left: 3px; top: 11px;
+  width: 3px; height: 3px; border-radius: 50%;
+  background: var(--ink-faint);
+}
+.calnotes li.warn { color: var(--amber); }
+.calnotes li.warn::before { background: var(--amber); }
+
+#reduceOut { font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim); }
+
+/* ------------------------------------------------------------------ stretch */
+/* The picture is a display choice, so the choice is visible above the picture. */
+
+.stretchbar {
+  display: flex; align-items: center; gap: 11px;
+  margin: 2px 0 10px;
+}
+.stretchbar .lbl {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--ink-faint); white-space: nowrap;
+}
+.stretchbar .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+#stretchNote { font-size: 11.5px; line-height: 1.55; color: var(--ink-faint); }
+
+
+/* The deep sky data report: one chip per file rather than a paragraph of paths. The full path
+   is on the title attribute, because it matters when something is missing and never otherwise. */
+.dataItem {
+  display: inline-block;
+  margin: 0 0.9em 0.15em 0;
+  white-space: nowrap;
+}
+.dataItem b {
+  font-weight: 600;
+  opacity: 0.75;
+}
+.dataItem b::after { content: ':'; }
+
+/* ===================== REAL EXOPLANET RESEARCH ===================== */
+/* Research shares the two column layout with the other modes, so there is no grid override
+   here: only the blocks inside those columns change. */
+#rsSetup .capgrid, #rsSearchBlock .capgrid { margin-bottom: 8px; }
+.rsBlock h3 { margin: 1rem 0 0.4rem; font-size: 0.92em; }
+.rsBlock { margin: 0 0 1.2rem; }
+.rsBlock h4 { margin: 0 0 0.5rem; font-size: 0.95em; }
+.rsRow { display: flex; gap: 0.8rem; padding: 0.22rem 0; align-items: baseline; flex-wrap: wrap; }
+.rsLabel { min-width: 11rem; opacity: 0.7; font-size: 0.88em; }
+.rsValue { font-variant-numeric: tabular-nums; font-weight: 600; }
+.rsNote { opacity: 0.6; font-size: 0.82em; }
+.rsPass { color: #6bbf8a; }
+.rsWarn { color: #d8a657; }
+.rsConcerns, .rsKnown { margin: 0.5rem 0 0; padding-left: 1.1rem; line-height: 1.5; font-size: 0.88em; }
+.rsConcerns li { margin-bottom: 0.4rem; }
+.rsKnown li { margin-bottom: 0.6rem; }
+.rsCaveat {
+  margin: 1rem 0; padding: 0.75rem 0.9rem;
+  border-left: 3px solid #d8a657; opacity: 0.85; font-size: 0.88em; line-height: 1.5;
+}
+.researchRuns { display: flex; flex-direction: column; gap: 0.35rem; }
+.rsRun {
+  display: flex; gap: 1rem; align-items: baseline; text-decoration: none;
+  padding: 0.45rem 0.7rem; border-left: 3px solid transparent; font-size: 0.87em;
+  /* Without an explicit colour these anchors fall back to the browser's blue,
+     which is close to unreadable against the panel. */
+  color: var(--ink);
+}
+.rsRun:hover { background: var(--bg-hover); }
+.rsRun.hit { border-left-color: #6bbf8a; }
+.rsRun.null { border-left-color: #55606b; }
+.rsRun.hit span { color: var(--green); }
+.rsRun.null span { color: var(--ink-dim); }
+.rsRun b { min-width: 10rem; color: var(--ink); }
+.rsRun time { margin-left: auto; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+
+/* Visual inspection: the step where a person, not the pipeline, decides. */
+.rsVerdict { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.rsVerdict input, .rsVerdict textarea { width: 100%; max-width: 34rem; }
+#rsEventChips { margin-bottom: 10px; }
+
+/* Sweep progress, in the setup column under its button. */
+.rsProgress { margin-top: 10px; font-size: 0.85em; opacity: 0.8; line-height: 1.4; }

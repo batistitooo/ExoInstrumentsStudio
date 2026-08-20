@@ -597,6 +597,74 @@ app.MapPost("/api/captures/{id}/calibration", (string id, CalibrationRequest req
 });
 
 /// <summary>
+/// A master calibration frame the OBSERVER supplies, as a FITS file, instead of one this pipeline
+/// generated.
+///
+/// WHY THIS ENDPOINT IS THE MOST USEFUL ONE ON THE CALIBRATION PATH. Every master the endpoint
+/// above builds comes out of the same model that wrote the light, so a reduction using them checks
+/// that the arithmetic is consistent and nothing else: a defect the forward model does not have
+/// cannot be caught by a calibration frame the forward model wrote. Uploading a real one breaks
+/// that circle. A flat off a real camera brings dust motes, accessory vignetting and tree rings -
+/// structure this model declines to invent - and dividing a simulated frame by it is the one
+/// calibration here that is not marking its own homework.
+///
+/// The body is the FITS file itself, raw. Everything the import checks and refuses, and why each
+/// check is worth its lines, is in Simulation/MasterFrameImport.cs.
+///
+///     curl -X POST --data-binary @masterbias.fits \
+///          'http://localhost:5227/api/captures/&lt;id&gt;/masters?kind=Bias'
+/// </summary>
+app.MapPost("/api/captures/{id}/masters", async (string id, string kind, HttpRequest http) =>
+{
+    CaptureStore.Stored s = captureStore.Get(id);
+    if (s == null) return Results.NotFound(new { error = "That frame has expired from the store; capture again." });
+    if (s.Exposure == null) return Results.BadRequest(new { error = "That frame was stored without its exposure, so an uploaded master cannot be checked against it." });
+
+    if (!Enum.TryParse(kind ?? "Bias", true, out CalibrationFrames.Kind masterKind))
+        return Results.BadRequest(new { error = $"Unknown master kind '{kind}'. Use Bias, Dark or Flat." });
+
+    // Buffered rather than streamed: the reader seeks, and a FITS primary HDU at this roster's
+    // largest format is a few tens of megabytes, which is already the size of a frame this process
+    // holds two dozen of.
+    using var body = new MemoryStream();
+    await http.Body.CopyToAsync(body);
+    if (body.Length == 0)
+        return Results.BadRequest(new { error = "The request body was empty. Send the FITS file as the raw body." });
+    body.Position = 0;
+
+    MasterFrameImport.Result m;
+    try
+    {
+        m = MasterFrameImport.Read(body, http.Headers["X-File-Name"].ToString(), masterKind, s.Exposure);
+    }
+    catch (MasterFrameImport.RefusedException e)
+    {
+        return Results.BadRequest(new { error = e.Message });
+    }
+
+    // Stored exactly as a generated master is, so the photometry endpoint takes it by id with no
+    // special case and the two kinds of master are interchangeable from there on.
+    ExoInstruments.Visualization.FitsWriter.FitsHeaderInfo header = DeepSkyCamera.HeaderFor(
+        s.Exposure, 0, CalibrationFrames.ImageTypeFor(masterKind), 1, calibratedAdu: false);
+    header.ImageType = CalibrationFrames.ImageTypeFor(masterKind);
+    header.ExposureSeconds = m.HeaderExposureSeconds ?? (masterKind == CalibrationFrames.Kind.Bias ? 0.0 : s.Exposure.ExposureSeconds);
+    header.ObjectName = "Imported " + CalibrationFrames.ImageTypeFor(masterKind);
+    header.Wcs = default;                    // a calibration frame points nowhere and must not claim to
+
+    CaptureStore.Stored stored = captureStore.Add(new CaptureStore.Stored
+    {
+        Adu = m.Adu,
+        W = m.W,
+        H = m.H,
+        Header = header,
+        ObjectName = "imported_" + masterKind.ToString().ToLowerInvariant(),
+        Kind = masterKind.ToString().ToLowerInvariant(),
+    });
+
+    return Results.Json(Dto.ImportedMaster(m, stored.Id));
+});
+
+/// <summary>
 /// Reduce a stored frame back into magnitudes, and score the answer against what went in.
 ///
 /// THE ONLY CHECK ON THE FORWARD MODEL THAT DOES NOT CONSULT IT. Everything else here turns a
@@ -619,11 +687,17 @@ app.MapGet("/api/captures/{id}/photometry", (string id, double? thresholdSigma, 
     if (bias != null || dark != null || flat != null)
     {
         float[] Master(string mid) => mid == null ? null : captureStore.Get(mid)?.Adu;
+
+        // The smear constant travels with the exposure, so the reduction removes exactly what the
+        // forward model put in rather than a fitted approximation to it. Zero on every detector
+        // that cannot smear, which skips the step.
         light = CalibrationFrames.Calibrate(s.Adu, Master(bias), Master(dark), Master(flat),
-                                            s.Exposure.BiasAdu);
+                                            s.Exposure.BiasAdu,
+                                            s.Exposure.SmearConstant, s.W, s.H);
         applied = string.Join(" + ", new[]
         {
             bias != null ? "bias" : null, dark != null ? "dark" : null, flat != null ? "flat" : null,
+            s.Exposure.SmearConstant > 0.0 ? "desmear" : null,
         }.Where(x => x != null));
     }
 
@@ -634,6 +708,125 @@ app.MapGet("/api/captures/{id}/photometry", (string id, double? thresholdSigma, 
     if (applied != null) reduced.Notes.Insert(0, $"Calibrated with {applied}.");
 
     return Results.Json(Dto.Photometry(reduced));
+});
+
+/// <summary>
+/// The stored frame rendered between a CHOSEN pair of levels, so the difference between the
+/// picture and the data stops being a mystery.
+///
+/// THE QUESTION THIS ANSWERS. The frame the browser shows always looks right, and the same frame
+/// opened as FITS usually looks black or grey. Nothing is wrong with either: a deep-sky exposure
+/// puts its subject in a few tens of ADU on top of a sky pedestal, out of a converter that counts
+/// to tens of thousands, so where BLACK and WHITE sit dominates the picture completely and the
+/// browser has been choosing them from the frame while a viewer opened with defaults has not.
+///
+/// The three modes are the three honest answers, and the numbers are returned with the picture:
+///
+///   * `raw` maps the converter's FULL range, 0 to MaxAdu. This is what a viewer with no stretch
+///     shows, and it is deliberately unflattering, because that is the actual content of the file.
+///   * `zscale` puts black and white where DS9, IRAF and Siril put them on opening: Core/ZScale,
+///     Tody's algorithm, fitted to the sorted pixel distribution with rejection. Still perfectly
+///     LINEAR between them - the only thing that changed is the two levels.
+///   * `asinh` is what the capture endpoint returns and what the page shows by default: zscale's
+///     job done by a robust sky estimate, plus the Lupton asinh curve.
+///
+/// Between the first two lies the whole of the observer's complaint, and neither involves any
+/// change to the pixels. `Core/ZScale` has been vendored and verified against astropy's
+/// ZScaleInterval since it arrived and nothing called it; this is what it is for.
+/// </summary>
+app.MapGet("/api/captures/{id}/render", (string id, string stretch) =>
+{
+    CaptureStore.Stored s = captureStore.Get(id);
+    if (s == null) return Results.NotFound(new { error = "That frame has expired from the store; capture again." });
+
+    string mode = (stretch ?? "asinh").Trim().ToLowerInvariant();
+    double maxAdu = s.Exposure?.MaxAdu ?? 65535.0;
+    byte[] png;
+    double black, white;
+    string note;
+
+    switch (mode)
+    {
+        case "raw":
+        case "linear":
+            mode = "raw";
+            black = 0.0;
+            white = maxAdu;
+            png = PngWriter.GrayscaleLinear(s.Adu, s.W, s.H, black, white);
+            note = $"Linear over the converter's whole range, 0 to {maxAdu:F0} ADU. This is the file "
+                 + "as a viewer with no stretch shows it, and on a deep-sky frame it is mostly black "
+                 + "because that is where the data is.";
+            break;
+
+        // zscale's white point comes from the SKY's own noise, on the assumption that sources are a
+        // small minority of pixels. A galaxy or a nebula filling the middle of the frame breaks
+        // that outright: the limits stop just above the sky, the subject clips to flat white, and
+        // what should be spiral structure becomes a featureless blob. Core/ZScale answers the two
+        // halves separately for exactly this - black still from zscale, which is what it is good
+        // at, white from a high percentile of a block-MEDIAN copy, which a star cannot move and an
+        // extended source can. Linear between them, so it is still the data and not a curve.
+        case "extended":
+            if (!ExoInstruments.Core.ZScale.TryExtendedSourceLimits(s.Adu, s.W, s.H, out black, out white))
+            {
+                black = 0.0;
+                white = maxAdu;
+                note = "This frame carries too little structure for the fit to mean anything, so the "
+                     + "plain extremes are used.";
+            }
+            else
+            {
+                note = $"Linear between {black:F1} and {white:F1} ADU. Black is zscale's; white comes "
+                     + "from a block median, so it is set by the brightest EXTENDED structure rather "
+                     + "than by a star. This is the linear view that does not clip the galaxy to a "
+                     + "white blob, and the stars clip instead - which is what every astrophotograph "
+                     + "does.";
+            }
+            png = PngWriter.GrayscaleLinear(s.Adu, s.W, s.H, black, white);
+            break;
+
+        case "zscale":
+            if (!ExoInstruments.Core.ZScale.TryLimits(s.Adu, out black, out white))
+            {
+                black = 0.0;
+                white = maxAdu;
+                note = "This frame carries too little structure for zscale's fit to mean anything, so "
+                     + "the plain extremes are used. A flat or a bias looks like this.";
+            }
+            else
+            {
+                note = $"Linear between zscale's limits, {black:F1} and {white:F1} ADU, which is "
+                     + $"{(white - black) / Math.Max(1.0, maxAdu) * 100:F2} % of the converter's range. "
+                     + "This is what DS9, IRAF or Siril show when they open the FITS. The pixels are "
+                     + "identical to the raw view; only the two levels moved.";
+            }
+            png = PngWriter.GrayscaleLinear(s.Adu, s.W, s.H, black, white);
+            break;
+
+        default:
+            // The levels come back out of the stretch rather than being recomputed here: this path
+            // sets black from a median and a MAD and white from the 99.9th percentile, which are
+            // NOT zscale's numbers, and quoting zscale's beside this picture would be citing
+            // figures that were never applied to it.
+            mode = "asinh";
+            png = PngWriter.GrayscaleFromAdu(s.Adu, s.W, s.H, out black, out white);
+            note = "The display stretch, and what the page shows by default: black sits just above "
+                 + "the sky found by a median and a MAD, white at the 99.9th percentile, and the "
+                 + "Lupton asinh curve runs between them - linear near the noise, logarithmic on the "
+                 + "bright end so a saturated star stops erasing everything else. This is a way of "
+                 + "LOOKING at the frame, not the frame. Reduce the FITS, not this.";
+            break;
+    }
+
+    return Results.Json(new
+    {
+        id = s.Id,
+        stretch = mode,
+        png = Convert.ToBase64String(png),
+        blackAdu = black,
+        whiteAdu = white,
+        maxAdu,
+        note,
+    });
 });
 
 // The stored frame as a real 16-bit FITS, written by the mod's own FitsWriter: WCS, EGAIN,
@@ -652,6 +845,104 @@ app.MapGet("/api/captures/{id}/fits", (string id) =>
 // keeps its own overlay on top; pointing goes through the cone search below, not the image,
 // so every star in the catalogue stays individually selectable.
 var gaia = new Lazy<GaiaLayerService>(() => new GaiaLayerService(deepSky.Value));
+
+// --- real exoplanet research ------------------------------------------------------
+//
+// The other side of the tool. Everything else here is a FORWARD model: known parameters in,
+// synthetic frames out. This runs the inverse on data nobody synthesised, fetched from MAST,
+// and keeps the record either way. See Research/ResearchService.
+//
+// The detector it uses is Core/TransitDetector, unchanged and blind: handed a real TESS light
+// curve of WASP-18 it returns 0.94176 days against a published 0.94145223.
+var researchHttp = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+researchHttp.DefaultRequestHeaders.UserAgent.ParseAdd("ExoInstrumentsStudio/1.0");
+var research = new Lazy<ExoStudio.Research.ResearchService>(() => new ExoStudio.Research.ResearchService(
+    researchHttp,
+    Path.Combine(Path.GetTempPath(), "exostudio-lightcurves"),
+    // Beside the data directory rather than the working directory: dotnet run leaves the current
+    // directory wherever it was invoked from, and research records landing in Engine/ or wherever
+    // the shell happened to be is how a dataset gets scattered across a machine.
+    Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(catalogPath) ?? ".") ?? ".", "research")));
+
+app.MapPost("/api/research/search", async (ExoStudio.Research.ResearchService.Request req) =>
+{
+    if (req == null || double.IsNaN(req.RaDeg) || double.IsNaN(req.DecDeg))
+        return Results.BadRequest(new { error = "a right ascension and declination are required" });
+    if (req.MinPeriodDays <= 0 || req.MaxPeriodDays <= req.MinPeriodDays)
+        return Results.BadRequest(new { error = "the period range must be positive and increasing" });
+    try
+    {
+        return Results.Json(await research.Value.RunAsync(req));
+    }
+    catch (Exception e)
+    {
+        return Results.Json(new { ok = false, stage = "run", message = e.Message });
+    }
+});
+
+app.MapGet("/api/research/runs", () => Results.Json(research.Value.List()));
+
+// A SWEEP runs the same search over every star in a field, which is the thing that actually finds
+// a planet: the odds on any one star are small and the work is getting through enough of them.
+// Background, because a field is minutes to hours; the page polls it.
+app.MapPost("/api/research/sweep", (SweepRequest req) =>
+{
+    if (req == null || req.RadiusDeg <= 0 || req.RadiusDeg > 2.0)
+        return Results.BadRequest(new { error = "a radius between 0 and 2 degrees is needed" });
+    ExoStudio.Research.ResearchService.Sweep s = research.Value.StartSweep(
+        req.RaDeg, req.DecDeg, req.RadiusDeg,
+        Math.Max(1, req.MinSectors), Math.Clamp(req.Limit <= 0 ? 25 : req.Limit, 1, 400),
+        new ExoStudio.Research.ResearchService.Request
+        {
+            MinPeriodDays = req.MinPeriodDays > 0 ? req.MinPeriodDays : 1.0,
+            MaxPeriodDays = req.MaxPeriodDays > 0 ? req.MaxPeriodDays : 20.0,
+            DetrendWindowDays = req.DetrendWindowDays > 0 ? req.DetrendWindowDays : 1.0,
+            SnrThreshold = req.SnrThreshold > 0 ? req.SnrThreshold : 8.0,
+        });
+    return Results.Json(new { id = s.Id });
+});
+
+app.MapGet("/api/research/sweep/{id}", (string id) =>
+{
+    object status = research.Value.SweepStatus(id);
+    return status == null ? Results.NotFound() : Results.Json(status);
+});
+
+app.MapGet("/api/research/runs/{id}", (string id) =>
+{
+    string record = research.Value.ReadRecord(id);
+    return record == null ? Results.NotFound() : Results.Text(record, "application/json");
+});
+
+app.MapGet("/api/research/export.csv", () =>
+    Results.Text(research.Value.ExportCsv(), "text/csv"));
+
+// The human verdict, which is the step the page exists for: a candidate nobody looked at is what
+// the mission pipeline already produces, and the eye is what community submissions add.
+app.MapPost("/api/research/runs/{id}/review", (string id, ReviewRequest req) =>
+    research.Value.Review(id, req?.Verdict, req?.Note, req?.Reviewer)
+        ? Results.Json(new { ok = true })
+        : Results.BadRequest(new { error = "unknown run, or verdict not one of real, unsure, noise, systematic, eclipsing-binary" }));
+
+// PREPARES a CTOI submission. Never sends one: see Research/CtoiSubmission for why that boundary
+// is deliberate. Refuses outright when the run is not fit to submit, and says what is wrong.
+app.MapGet("/api/research/runs/{id}/ctoi", (string id, string submitter) =>
+{
+    (ExoStudio.Research.CtoiSubmission.Readiness readiness, string file) = research.Value.Ctoi(id, submitter);
+    if (readiness == null) return Results.NotFound();
+    return readiness.Ready
+        ? Results.Text(file, "text/csv")
+        : Results.Json(new { ready = false, blocking = readiness.Blocking, warnings = readiness.Warnings });
+});
+
+app.MapGet("/api/research/runs/{id}/readiness", (string id) =>
+{
+    (ExoStudio.Research.CtoiSubmission.Readiness readiness, _) = research.Value.Ctoi(id, null);
+    return readiness == null
+        ? Results.NotFound()
+        : Results.Json(new { ready = readiness.Ready, blocking = readiness.Blocking, warnings = readiness.Warnings });
+});
+
 
 app.MapGet("/api/gaia", () => Results.Json(new
 {
@@ -958,3 +1249,10 @@ static string ResolveWebRoot(string contentRoot)
     }
     return Path.Combine(contentRoot, "web");
 }
+
+
+record ReviewRequest(string Verdict, string Note, string Reviewer);
+
+record SweepRequest(double RaDeg, double DecDeg, double RadiusDeg, int MinSectors, int Limit,
+                    double MinPeriodDays, double MaxPeriodDays, double DetrendWindowDays,
+                    double SnrThreshold);

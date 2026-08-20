@@ -61,9 +61,17 @@ namespace ExoStudio.Research
 
         public async Task<object> RunAsync(Request request)
         {
+            // TIMED PER STAGE, and surfaced in the log rather than kept for a profiler. A run that
+            // takes minutes is a sweep that takes hours, and the only way to know which stage owns
+            // the time is to measure it where it happens.
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             var log = new List<string>();
+            double mark = 0;
+            string Took() { double t = clock.Elapsed.TotalSeconds - mark; mark = clock.Elapsed.TotalSeconds; return $"{t:0.0} s"; }
+
             List<MastClient.LightCurveProduct> products = await mast.FindLightCurvesAsync(
                 request.RaDeg, request.DecDeg);
+            string listing = Took();
             if (products.Count == 0)
             {
                 return new
@@ -80,8 +88,8 @@ namespace ExoStudio.Research
                 ? products.FirstOrDefault(p => p.Sector == request.Sector) ?? products[0]
                 : products[0];
             int fromFfi = products.Count(p => !p.IsMissionProduct);
-            log.Add($"MAST holds {products.Count} light curve(s) here, {products.Count - fromFfi} from the "
-                  + $"mission's two minute targets and {fromFfi} extracted from the full frame images");
+            log.Add($"the archive lists {mast.LastObservationCount} observation(s) at this position; "
+                  + $"opened the first that carried a light curve [{listing}]");
             log.Add($"using {(chosen.IsMissionProduct ? "the mission product" : chosen.Provider)}, "
                   + $"sector {chosen.Sector}, {chosen.ExposureSeconds:0} s cadence, {chosen.FileName}");
             if (!chosen.IsMissionProduct)
@@ -89,20 +97,23 @@ namespace ExoStudio.Research
                       + "the mission's own pipeline never examined this star individually");
 
             string path = await mast.FetchAsync(chosen);
+            string fetched = Took();
             TransitSearchPipeline.LightCurve raw = TransitSearchPipeline.Load(path);
             log.Add($"{raw.Count:N0} cadences the mission did not flag, spanning {raw.BaselineDays:0.0} days "
-                  + $"at {raw.CadenceMinutes:0.#} minutes, scatter {raw.ScatterPpm:0} ppm");
+                  + $"at {raw.CadenceMinutes:0.#} minutes, scatter {raw.ScatterPpm:0} ppm "
+                  + $"[fetch {fetched}, read {Took()}]");
 
             TransitSearchPipeline.LightCurve flat =
                 TransitSearchPipeline.Detrend(raw, request.DetrendWindowDays);
             log.Add($"detrended on a {request.DetrendWindowDays:0.##} day running median; "
-                  + $"scatter {flat.ScatterPpm:0} ppm afterwards");
+                  + $"scatter {flat.ScatterPpm:0} ppm afterwards [{Took()}]");
 
             // The search never sees anything but times, fluxes and errors.
             List<FluxSample> samples = TransitSearchPipeline.ToSamples(flat);
             DetectionResult found = TransitDetector.Detect(
                 samples, request.MinPeriodDays, request.MaxPeriodDays,
                 snrThreshold: request.SnrThreshold);
+            log.Add($"box least squares over {request.MinPeriodDays:0.#} to {request.MaxPeriodDays:0.#} days [{Took()}]");
 
             if (!found.Detected)
             {
@@ -110,6 +121,7 @@ namespace ExoStudio.Research
                 List<SingleTransitSearch.Event> alone = request.SingleTransits
                     ? SingleTransitSearch.Find(flat)
                     : new List<SingleTransitSearch.Event>();
+                log.Add($"single transit search [{Took()}]");
                 foreach (SingleTransitSearch.Event e in alone)
                     log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
                           + $"{e.DepthPpm:0} ppm over {e.DurationHours:0.#} h, SNR {e.Snr:0.#}");
@@ -144,8 +156,10 @@ namespace ExoStudio.Research
                       + (e.Concerns.Count > 0 ? $" ({e.Concerns.Count} concern(s))" : ""));
 
             TransitSearchPipeline.Vetting vetting = TransitSearchPipeline.Vet(flat, found);
+            log.Add($"single transit search [{Took()}]");
             KnownObjects.Report registry = await known.LookUpAsync(
                 request.RaDeg, request.DecDeg, found.BestPeriodDays);
+            log.Add($"cross matched against the registers [{Took()}]");
 
             log.Add($"candidate at {found.BestPeriodDays:0.#####} d, {found.BestDepthPpm:0} ppm, "
                   + $"SNR {found.Snr:0.#}");
@@ -352,6 +366,190 @@ namespace ExoStudio.Research
             using JsonDocument d = JsonDocument.Parse(record);
             CtoiSubmission.Readiness readiness = CtoiSubmission.Assess(d.RootElement);
             return (readiness, readiness.Ready ? CtoiSubmission.Build(d.RootElement, submitter) : null);
+        }
+
+        // ------------------------------------------------------------------ sweeps
+        //
+        // A sweep is the same search run over every star in a field, and it is the thing that
+        // actually finds a planet: the odds on any one star are small, and the work is getting
+        // through enough of them. It runs in the background because a field is minutes to hours,
+        // and the page polls it, so a browser tab closing does not lose the run.
+
+        public sealed class Sweep
+        {
+            public string Id { get; init; }
+            public double RaDeg { get; init; }
+            public double DecDeg { get; init; }
+            public double RadiusDeg { get; init; }
+            public int MinSectors { get; init; }
+            public int Limit { get; init; }
+            public string State { get; set; } = "listing";
+            public int Total { get; set; }
+            public int Done { get; set; }
+            public string Current { get; set; } = "";
+            public string Error { get; set; }
+            public DateTime StartedUtc { get; } = DateTime.UtcNow;
+            public List<Hit> Hits { get; } = new();
+        }
+
+        public sealed class Hit
+        {
+            public string RunId { get; init; }
+            public string Target { get; init; }
+            public double RaDeg { get; init; }
+            public double DecDeg { get; init; }
+            public int Sectors { get; init; }
+            public double Score { get; init; }
+            public string Why { get; init; }
+            public bool Known { get; init; }
+        }
+
+        private readonly Dictionary<string, Sweep> sweeps = new();
+
+        public Sweep StartSweep(double ra, double dec, double radius, int minSectors, int limit,
+                                Request template)
+        {
+            var sweep = new Sweep
+            {
+                Id = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture),
+                RaDeg = ra, DecDeg = dec, RadiusDeg = radius,
+                MinSectors = minSectors, Limit = limit,
+            };
+            lock (sweeps) sweeps[sweep.Id] = sweep;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    List<MastClient.RegionTarget> targets =
+                        await mast.FindTargetsAsync(ra, dec, radius, minSectors);
+                    sweep.Total = Math.Min(limit, targets.Count);
+                    sweep.State = sweep.Total == 0 ? "empty" : "searching";
+
+                    foreach (MastClient.RegionTarget t in targets.Take(limit))
+                    {
+                        sweep.Current = $"TIC {t.Name}, {t.Sectors} sectors";
+                        try
+                        {
+                            object raw = await RunAsync(new Request
+                            {
+                                RaDeg = t.RaDeg, DecDeg = t.DecDeg,
+                                Label = $"TIC {t.Name} ({t.Sectors} sectors)",
+                                MinPeriodDays = template.MinPeriodDays,
+                                MaxPeriodDays = template.MaxPeriodDays,
+                                DetrendWindowDays = template.DetrendWindowDays,
+                                SnrThreshold = template.SnrThreshold,
+                            });
+                            Hit hit = ScoreRun(raw, t);
+                            if (hit != null) lock (sweep.Hits) sweep.Hits.Add(hit);
+                        }
+                        catch { /* one bad star does not end a field */ }
+                        sweep.Done++;
+                    }
+                    sweep.State = "done";
+                    sweep.Current = "";
+                }
+                catch (Exception e)
+                {
+                    sweep.State = "failed";
+                    sweep.Error = e.Message;
+                }
+            });
+            return sweep;
+        }
+
+        /// <summary>
+        /// How much of a person's attention a result deserves. An ordering, not a probability.
+        ///
+        /// An isolated event outranks a repeating one, because a repeating transit in a field the
+        /// pipelines have swept is far more likely to be already known than missed, while an
+        /// isolated one is the case they cannot trigger on at all. Anything already registered at
+        /// the position sinks, and so does anything the vetting objected to.
+        /// </summary>
+        private static Hit ScoreRun(object raw, MastClient.RegionTarget t)
+        {
+            using JsonDocument d = JsonDocument.Parse(JsonSerializer.Serialize(raw,
+                new JsonSerializerOptions { IncludeFields = true }));
+            JsonElement r = d.RootElement;
+
+            if (!(r.TryGetProperty("ok", out JsonElement ok) && ok.ValueKind == JsonValueKind.True))
+                return null;
+
+            string runId = r.TryGetProperty("id", out JsonElement idv) ? idv.GetString() : null;
+            JsonElement matches = default;
+            bool known = r.TryGetProperty("known", out JsonElement k)
+                      && k.TryGetProperty("matches", out matches)
+                      && matches.ValueKind == JsonValueKind.Array && matches.GetArrayLength() > 0;
+
+            var singles = new List<JsonElement>();
+            if (r.TryGetProperty("singleTransits", out JsonElement st) && st.ValueKind == JsonValueKind.Array)
+                singles.AddRange(st.EnumerateArray());
+
+            double score; string why;
+            if (known)
+            {
+                string first = matches.EnumerateArray().First().TryGetProperty("name", out JsonElement n)
+                    ? n.GetString() : "?";
+                score = -1; why = $"already registered here: {first}";
+            }
+            else if (singles.Any(e => Bool(e, "passed")))
+            {
+                JsonElement best = singles.Where(e => Bool(e, "passed"))
+                                          .OrderByDescending(e => Dbl(e, "snr")).First();
+                score = Dbl(best, "snr") * 2.0;
+                why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
+                    + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}";
+            }
+            else if (singles.Count > 0)
+            {
+                JsonElement best = singles.OrderByDescending(e => Dbl(e, "snr")).First();
+                score = Dbl(best, "snr") * 0.5;
+                why = "isolated dip, but vetting raised something";
+            }
+            else if (r.TryGetProperty("detected", out JsonElement det) && det.ValueKind == JsonValueKind.True)
+            {
+                JsonElement c = r.GetProperty("candidate");
+                bool passed = r.TryGetProperty("vetting", out JsonElement v) && Bool(v, "passed");
+                score = passed ? Dbl(c, "snr") : 0.1;
+                why = passed
+                    ? $"repeating, P {Dbl(c, "periodDays"):0.####} d, {Dbl(c, "depthPpm"):0} ppm"
+                    : "repeating, but vetting raised something";
+            }
+            else { score = 0; why = "nothing above threshold"; }
+
+            return new Hit
+            {
+                RunId = runId, Target = t.Name, RaDeg = t.RaDeg, DecDeg = t.DecDeg,
+                Sectors = t.Sectors, Score = score, Why = why, Known = known,
+            };
+        }
+
+        private static double Dbl(JsonElement e, string name)
+            => e.TryGetProperty(name, out JsonElement v) && v.ValueKind == JsonValueKind.Number
+               ? v.GetDouble() : 0.0;
+
+        private static bool Bool(JsonElement e, string name)
+            => e.TryGetProperty(name, out JsonElement v) && v.ValueKind == JsonValueKind.True;
+
+        public object SweepStatus(string id)
+        {
+            Sweep s;
+            lock (sweeps) if (!sweeps.TryGetValue(id, out s)) return null;
+            List<Hit> ranked;
+            lock (s.Hits) ranked = s.Hits.OrderByDescending(h => h.Score).ToList();
+            return new
+            {
+                id = s.Id, state = s.State, total = s.Total, done = s.Done,
+                current = s.Current, error = s.Error,
+                field = new { ra = s.RaDeg, dec = s.DecDeg, radius = s.RadiusDeg,
+                              minSectors = s.MinSectors },
+                worthLooking = ranked.Count(h => h.Score > 0),
+                hits = ranked.Select(h => new
+                {
+                    runId = h.RunId, target = h.Target, ra = h.RaDeg, dec = h.DecDeg,
+                    sectors = h.Sectors, score = h.Score, why = h.Why, known = h.Known,
+                }),
+            };
         }
 
         public IEnumerable<object> List()

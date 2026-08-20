@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ExoStudio.Research
@@ -30,7 +31,40 @@ namespace ExoStudio.Research
 
         private readonly HttpClient http;
 
+        /// <summary>
+        /// The ExoFOP tables, held once.
+        ///
+        /// THESE ARE WHOLE CATALOGUES, NOT QUERIES. ExoFOP publishes its TOI and CTOI lists as
+        /// complete CSV downloads with no positional filter, so checking one candidate means
+        /// fetching every row and searching it locally. Doing that per star made a sweep of forty
+        /// stars fetch them forty times, which was the entire reason a field took hours: the
+        /// searches were fast and the cross match was re-downloading megabytes for each one.
+        ///
+        /// Cached for an hour. The registers change on the scale of days, a sweep runs for
+        /// minutes, and a candidate that was not in the list an hour ago is not going to be
+        /// missed by this.
+        /// </summary>
+        private static readonly TimeSpan TableLifetime = TimeSpan.FromHours(1);
+        private static readonly SemaphoreSlim TableLock = new(1, 1);
+        private static readonly Dictionary<string, (DateTime fetched, string csv)> Tables = new();
+
         public KnownObjects(HttpClient http) => this.http = http;
+
+        private async Task<string> TableAsync(string url)
+        {
+            await TableLock.WaitAsync();
+            try
+            {
+                if (Tables.TryGetValue(url, out var held)
+                    && DateTime.UtcNow - held.fetched < TableLifetime)
+                    return held.csv;
+
+                string csv = await http.GetStringAsync(url);
+                Tables[url] = (DateTime.UtcNow, csv);
+                return csv;
+            }
+            finally { TableLock.Release(); }
+        }
 
         public sealed class Match
         {
@@ -105,7 +139,7 @@ namespace ExoStudio.Research
         {
             try
             {
-                string csv = await http.GetStringAsync(url);
+                string csv = await TableAsync(url);
                 string[] lines = csv.Split('\n');
                 if (lines.Length < 2) return;
                 string[] header = SplitCsv(lines[0]);

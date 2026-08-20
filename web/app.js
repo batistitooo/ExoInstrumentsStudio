@@ -9,6 +9,10 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   boot: null,
+  mode: 'astro',     // astro | exo. The landing mode is astrophotography; see setMode.
+  modeSeq: 0,        // bumped on every mode change; the receipt a late await checks. See ofThisMode.
+  capture: null,     // the stored frame the calibration panel is working against
+  masters: {},       // {Bias|Dark|Flat: {id, ...}} chosen for the next reduction
   target: null,      // selected catalogue entry
   campaign: null,    // live campaign snapshot
   points: [],        // [ut, value, sigma][]
@@ -65,10 +69,6 @@ async function boot() {
   const b = await (await fetch('/api/bootstrap')).json();
   state.boot = b;
 
-  $('catalogueLine').textContent =
-    `${fmt.int(b.catalogue.planets)} planets · ${fmt.int(b.catalogue.rvDetectable)} with a reflex signal · ` +
-    `${fmt.int(b.catalogue.transiting)} transiting · source ${b.catalogue.source}`;
-
   const notes = [...b.simplifications];
   if (b.catalogue.minimumMassCorrections) {
     notes.unshift(
@@ -82,29 +82,179 @@ async function boot() {
   // mod's own capture pipeline reads (VisualTelescopeCatalog via /api/telescopes).
   const scopes = await (await fetch('/api/telescopes')).json();
   state.telescopes = scopes;
-  const inst = $('instrument');
-  inst.innerHTML =
-    `<optgroup label="Exoplanet detection">` +
-    b.instruments.map((i) => `<option value="${i.name}">${i.displayName}</option>`).join('') +
-    `</optgroup><optgroup label="Astrographs, deep-sky imaging">` +
-    scopes.map((t) => `<option value="visual:${t.name}">${t.displayName}</option>`).join('') +
-    `</optgroup>`;
-  inst.value = 'HARPS';
-  inst.onchange = onInstrumentChange;
+  $('instrument').onchange = onInstrumentChange;
 
   const site = $('site');
   site.innerHTML = b.sites.map((s) => `<option value="${s.id}">${s.name} · ${s.country}</option>`).join('');
   site.onchange = onSiteChange;
 
-  onInstrumentChange();
+  for (const btn of document.querySelectorAll('#modeBar .mode')) {
+    btn.onclick = () => setMode(btn.dataset.mode);
+  }
+
+  // ASTROPHOTOGRAPHY IS WHERE THE PAGE LANDS. setMode fills the instrument list, so nothing
+  // before this point may assume a selection exists.
+  setMode('astro', { initial: true });
   onSiteChange();
 
   // The chart data loads in parallel with the opening search; neither waits on the other.
   loadSky();
 
-  // Open on the demo the whole thing was built around.
-  $('search').value = '51 Peg b';
-  await search('51 Peg b');
+  await openingTarget();
+}
+
+/**
+ * The two modes, and what actually differs between them. This is not a filter on one list: the
+ * two halves of this studio point different instruments at different questions, and the map wants
+ * to show different things for each.
+ *
+ *   * ASTROPHOTOGRAPHY offers the astrographs, and every layer the sky has - the whole Gaia
+ *     catalogue, the bright-star background, and the planet hosts over the top of them, because
+ *     a host star is just another star to point a camera at.
+ *   * EXOPLANET DETECTION offers the detection instruments, and draws HOST STARS ONLY. The Gaia
+ *     layer comes off, and so does the bright-star background. That is not decoration: in this
+ *     mode every target is a host, so 7.4 million stars behind them are 7.4 million things that
+ *     cannot be selected, and they hide the few thousand that can.
+ */
+function setMode(mode, opts = {}) {
+  if (mode !== 'astro' && mode !== 'exo' && mode !== 'research') mode = 'astro';
+  if (!opts.initial && mode === state.mode) return;
+  state.mode = mode;
+  state.modeSeq++;
+
+  for (const btn of document.querySelectorAll('#modeBar .mode')) {
+    const on = btn.dataset.mode === mode;
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  document.body.dataset.mode = mode;
+
+  // The instrument list holds only this mode's instruments. Leaving the other mode's in and
+  // hiding them would let a stale selection survive a mode change, which is how you end up
+  // photographing with a spectrograph.
+  const inst = $('instrument');
+  inst.innerHTML = mode === 'astro'
+    ? state.telescopes.map((t) => `<option value="visual:${t.name}">${t.displayName}</option>`).join('')
+    : state.boot.instruments.map((i) => `<option value="${i.name}">${i.displayName}</option>`).join('');
+  inst.value = mode === 'astro'
+    ? `visual:${(state.telescopes.find((t) => !t.isSpaceBased) || state.telescopes[0]).name}`
+    : (state.boot.instruments.find((i) => i.name === 'HARPS') || state.boot.instruments[0]).name;
+
+  // Anything the other mode put on the page goes, rather than lingering under the new one.
+  stopCampaign();
+  state.target = null;
+  state.freePoint = null;
+  state.skySel = null;
+  state.capture = null;
+  state.masters = {};
+  $('targetCard').hidden = true;
+  $('calibrationPanel').hidden = true;
+  $('capturePanel').hidden = true;
+  for (const id of ['clockbar', 'skyPanel', 'seriesPanel', 'foldPanel', 'resultPanel', 'orbitPanel']) {
+    $(id).hidden = true;
+  }
+
+  // RESEARCH USES THE SAME TWO COLUMNS as the other modes: what to look at on the left, what came
+  // back on the right. It takes no instrument, site or clock, because the observation already
+  // happened and belongs to somebody else, so those blocks are the ones that go rather than the
+  // whole layout. The page is not a different application in this mode, only a different question.
+  const research = mode === 'research';
+  for (const id of ['rsSetup', 'rsSearchBlock', 'rsSweepBlock', 'rsRun', 'rsAboutPanel', 'rsRunsPanel']) {
+    $(id).hidden = !research;
+  }
+  $('rsSweepPanel').hidden = true;
+  for (const id of ['rsCurvePanel', 'rsFoldPanel', 'rsResultPanel', 'rsInspectPanel', 'rsSubmitPanel'])
+    $(id).hidden = true;
+  $('rsError').hidden = true;
+
+  // The simulator's own setup blocks, which have no meaning against an archive observation.
+  for (const el of document.querySelectorAll('.panel.setup > section.block')) {
+    if (!el.id.startsWith('rs')) el.hidden = research ? true : el.hidden;
+  }
+  $('observe').hidden = research;
+  $('chartPanel').hidden = research;
+  if (research) {
+    $('forecastPanel').hidden = true;
+    $('siteBlock').hidden = true;
+    $('captureSetup').hidden = true;
+    loadResearchRuns();
+    return;
+  }
+  // Coming back out of research: the simulator's blocks return, and hidden state is recomputed
+  // by onInstrumentChange below rather than remembered here.
+  for (const el of document.querySelectorAll('.panel.setup > section.block')) {
+    if (!el.id.startsWith('rs') && !['targetCard', 'spacecraftBlock', 'captureSetup'].includes(el.id)) {
+      el.hidden = false;
+    }
+  }
+  $('siteBlock').hidden = false;
+
+  onInstrumentChange();
+  applyGaiaVisibility();
+  drawSkyStatic();
+  drawSkyOverlay();
+  if (!opts.initial) openingTarget();
+}
+
+/**
+ * ONE MODE OWNS THE PAGE AT A TIME, INCLUDING THE ANSWERS STILL IN THE AIR. Every panel on the
+ * right is filled by something that was awaited - a capture, a forecast, an archive search, a
+ * stream message - and an await outlives a click on the mode bar. Whatever was in flight when
+ * the mode changed was asked for by a page that no longer exists, so it is dropped rather than
+ * drawn: this is what stops an exoplanet detection table from appearing under the
+ * astrophotography chart a moment after the mode changed.
+ *
+ * Take the receipt before the await, check it after:
+ *
+ *     const mine = modeReceipt();
+ *     const d = await (await fetch(...)).json();
+ *     if (!ofThisMode(mine)) return;
+ *
+ * A counter rather than the mode name, because leaving a mode and coming back builds a fresh
+ * page too: the target, the frame and the run are all cleared on the way out, so an answer from
+ * the previous visit describes nothing that is still on screen.
+ */
+function modeReceipt() { return state.modeSeq; }
+function ofThisMode(receipt) { return state.modeSeq === receipt; }
+
+/** Whether the Gaia layer belongs on the chart at all right now. See setMode. */
+function gaiaWanted() {
+  return state.mode === 'astro' && !!(state.gaia && state.gaia.loaded);
+}
+
+function applyGaiaVisibility() {
+  const want = gaiaWanted();
+  $('gaiaBar').hidden = !want;
+  const img = $('gaiaLayer');
+  if (!want) img.hidden = true;
+  else if (img.getAttribute('src')) img.hidden = false;
+  else loadGaiaLayer();
+  $('starLayerLabel').textContent =
+    state.mode === 'exo' ? 'planet hosts only'
+      : (state.gaia && state.gaia.loaded ? 'Gaia DR3' : 'Bright Star Catalogue');
+
+  // The host and selection keys describe marks that exist in exoplanet mode only, so they go with
+  // them. A legend entry for something never drawn is an instruction to look for it.
+  const exo = state.mode === 'exo';
+  if ($('hostKey')) $('hostKey').hidden = !exo;
+  if ($('selKey')) $('selKey').hidden = !exo;
+
+  updateChartNote();
+}
+
+function updateChartNote() {
+  if (!state.sky) return;
+  $('chartNote').textContent = state.mode === 'exo'
+    ? `${fmt.int(state.sky.hosts.length)} planet hosts · north up, east left · click a host to observe it`
+    : (gaiaWanted() ? `${fmt.int(state.gaia.stars)} Gaia stars` : 'Bright Star Catalogue') +
+      ' · north up, east left · click any patch of sky to aim at it';
+}
+
+/** The demo each mode opens on: a real object, so the page is never staring at an empty chart. */
+async function openingTarget() {
+  const q = state.mode === 'astro' ? 'M 51' : '51 Peg b';
+  $('search').value = q;
+  await search(q);
   const first = document.querySelector('#results li');
   if (first) first.click();
 }
@@ -126,16 +276,23 @@ function selectedScope() {
  * spectrograph had taken it.
  */
 function showPanelsFor(isAstrograph) {
-  for (const id of ['capturePanel']) $(id).hidden = !isAstrograph;
+  // The frame panel only reappears once there IS a frame; showing it empty after an instrument
+  // change would present the last telescope's picture as this one's.
+  if (!isAstrograph || !state.capture) $('capturePanel').hidden = true;
+  if (!isAstrograph || !state.capture) $('calibrationPanel').hidden = true;
+
   for (const id of ['clockbar', 'skyPanel', 'seriesPanel', 'foldPanel', 'resultPanel']) {
     if (isAstrograph) $(id).hidden = true;
   }
   // Leaving astrograph mode drops the frame itself, not just its panel: the next capture
-  // starts from nothing rather than replacing a picture of a different telescope.
+  // starts from nothing rather than replacing a picture of a different telescope. The masters
+  // go with it, since each was checked against that exposure and describes no other.
   if (!isAstrograph) {
     $('captureImg').removeAttribute('src');
     $('captureLinks').innerHTML = '';
     $('captureReport').textContent = '';
+    state.capture = null;
+    state.masters = {};
   }
 }
 
@@ -224,12 +381,14 @@ const SEARCH_LIMIT = 200;
 async function search(q) {
   if (selectedScope()) return pointingSearch(q);
 
+  const mine = modeReceipt();
   const qs = new URLSearchParams({ q: q || '', limit: SEARCH_LIMIT });
   if (state.filter === 'rv') qs.set('rv', 'true');
   if (state.filter === 'transit') qs.set('transiting', 'true');
 
   const r = await fetch(`/api/targets?${qs}`);
   const hits = await r.json();
+  if (!ofThisMode(mine)) return;
   const ul = $('results');
   ul.innerHTML = hits.map((t) => `
     <li data-name="${encodeURIComponent(t.name)}">
@@ -256,10 +415,12 @@ async function search(q) {
    NGC/IC, the BSC, IAU names, galaxies, with its query language (type:nebula, in:Ori,
    mag:<9, alt:>30). Clicking a row aims the telescope. */
 async function pointingSearch(q) {
+  const mine = modeReceipt();
   const qs = new URLSearchParams({ q: q || 'type:nebula', site: $('site').value, limit: 60 });
   const r = await fetch(`/api/pointing-search?${qs}`);
   if (!r.ok) return;
   const d = await r.json();
+  if (!ofThisMode(mine)) return;
   const ul = $('results');
 
   ul.innerHTML = d.rows.map((t, i) => `
@@ -310,9 +471,11 @@ document.querySelectorAll('#targetChips .chip').forEach((chip) => {
 });
 
 async function selectTarget(name) {
+  const mine = modeReceipt();
   const r = await fetch(`/api/targets/${encodeURIComponent(name)}`);
   if (!r.ok) return;
   const { target, system } = await r.json();
+  if (!ofThisMode(mine)) return;
   state.target = target;
   state.system = system;
   renderTargetCard(target, system);
@@ -432,13 +595,43 @@ function openStream(id) {
   if (state.stream) state.stream.close();
   const es = new EventSource(`/api/campaigns/${id}/stream`);
   state.stream = es;
+  const mine = modeReceipt();
   es.onmessage = (ev) => {
+    if (!ofThisMode(mine)) { es.close(); return; }
     const msg = JSON.parse(ev.data);
     state.campaign = msg.campaign;
     if (msg.points && msg.points.length) state.points.push(...msg.points);
     render();
   };
   es.onerror = () => { /* the browser retries on its own */ };
+}
+
+/**
+ * End the observing run and forget it.
+ *
+ * Hiding its panels is not enough, and that was the bug: the stream stayed open, every message
+ * called render(), and render() unhides the series, the fold and the detection table. A run left
+ * behind in exoplanet mode therefore re-opened its own panels a second or two after the mode
+ * changed, and the detection sat under the astrophotography chart as though it belonged there.
+ *
+ * The run is stopped on the server rather than merely dropped here, because its id goes with the
+ * mode: nothing can ever show it again, and a campaign nobody is watching would otherwise go on
+ * collecting epochs for as long as the page is open.
+ */
+function stopCampaign() {
+  if (state.stream) { state.stream.close(); state.stream = null; }
+  if (state.campaign) {
+    fetch(`/api/campaigns/${state.campaign.id}/stop`, { method: 'POST' }).catch(() => {});
+  }
+  state.campaign = null;
+  state.points = [];
+  state.startUt = null;
+  $('signalRows').innerHTML = '';
+  $('verdict').innerHTML = '';
+  $('analyse').textContent = 'Analyse';
+  $('analyse').disabled = true;
+  $('pause').disabled = true;
+  $('warp').disabled = true;
 }
 
 /* ------------------------------------------------------------------- warp */
@@ -866,6 +1059,7 @@ function currentObjectName() {
 ['capRa', 'capDec'].forEach((id) => $(id).addEventListener('change', scheduleForecast));
 
 $('capture').onclick = async () => {
+  const mine = modeReceipt();
   const scope = selectedScope();
   if (!scope) return;
   const btn = $('capture');
@@ -897,6 +1091,7 @@ $('capture').onclick = async () => {
       }),
     });
     const data = await r.json();
+    if (!ofThisMode(mine)) return;
     if (!r.ok) {
       $('captureError').hidden = false;
       $('captureError').textContent = data.error || 'Capture failed.';
@@ -905,6 +1100,20 @@ $('capture').onclick = async () => {
 
     $('capturePanel').hidden = false;
     $('captureImg').src = 'data:image/png;base64,' + data.png;
+
+    // A new frame invalidates every master chosen for the old one: they were checked against
+    // that exposure's geometry, binning and pedestal, and silently carrying them over is how a
+    // master from a different binning ends up subtracted pixel for pixel from something it does
+    // not describe.
+    state.capture = data.id;
+    state.masters = {};
+    renderMasters();
+    applyStretch();          // re-render this frame in whichever view is selected
+    $('calibrationPanel').hidden = false;
+    $('calNote').textContent =
+      `bias, dark and flat for this ${$('capExp').value} s frame at binning ${$('capBin').value}`;
+    $('reduceOut').textContent = '';
+    $('calError').hidden = true;
     $('captureTitle').textContent =
       `${scope.displayName}, ${currentObjectName()}, ${$('capFilter').value}, ${$('capExp').value} s`;
     $('captureNote').textContent =
@@ -976,7 +1185,29 @@ $('capture').onclick = async () => {
     const warnings = d.files.filter(f => /^WARNING/i.test(f));
     const paths = d.files.filter(f => !/^WARNING/i.test(f));
 
-    $('captureData').textContent = paths.join(' · ');
+    // GROUPED, NOT CONCATENATED. This used to be every entry joined with a middle dot, which on
+    // a full install is a paragraph of absolute paths with the interesting part buried in it. The
+    // label is what matters; the directory is the same for all of them and is available on hover.
+    // Deep sky patches collapse to a count, because six lines saying the same thing is not six
+    // pieces of information.
+    const esc = (t) => String(t).replace(/[&<>"]/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const patches = [];
+    const rows = [];
+    for (const line of paths) {
+      const at = line.indexOf(': ');
+      const label = at > 0 ? line.slice(0, at) : line;
+      const value = at > 0 ? line.slice(at + 2) : '';
+      if (/^star field patch$/i.test(label)) { patches.push(value.split(',')[0].trim()); continue; }
+      const leaf = value.includes('/') ? value.slice(value.lastIndexOf('/') + 1) : value;
+      rows.push(`<span class="dataItem" title="${esc(value)}"><b>${esc(label)}</b>${
+        value ? ' ' + esc(leaf) : ''}</span>`);
+    }
+    if (patches.length) {
+      rows.push(`<span class="dataItem" title="${esc(patches.join(', '))}">` +
+        `<b>deep star field patches</b> ${patches.length} installed</span>`);
+    }
+    $('captureData').innerHTML = rows.join('');
     const box = $('captureDataWarnings');
     if (box) {
       box.innerHTML = '';
@@ -1014,6 +1245,7 @@ function scheduleForecast() {
 }
 
 async function loadForecast() {
+  const mine = modeReceipt();
   const scope = selectedScope();
   const qs = new URLSearchParams({ site: $('site').value, nights: 30, cols: 96 });
 
@@ -1031,6 +1263,7 @@ async function loadForecast() {
   const r = await fetch(`/api/forecast?${qs}`);
   if (!r.ok) { $('forecastPanel').hidden = true; return; }
   const f = await r.json();
+  if (!ofThisMode(mine)) return;
   if (f.spaceBased) { $('forecastPanel').hidden = true; return; }
 
   lastForecast = f;
@@ -1311,6 +1544,35 @@ function redrawChart() {
   drawSkyOverlay();
 }
 
+/**
+ * Redraw the chart whenever its BOX changes, not only when the WINDOW does.
+ *
+ * THE GAP THIS CLOSES. Two things are stacked here and they scale differently: the Gaia layer is
+ * an `<img>` that CSS resizes continuously and for free, and the graticule, labels and overlay
+ * are canvas BITMAPS sized from clientWidth at the moment they were drawn. Let the element's box
+ * change without a redraw and the two disagree, so every star sits slightly off the overlay drawn
+ * on top of it. Until now the only trigger was `window.resize`, which is not the same event: the
+ * chart's box can change because a neighbour reflowed, and the window never moved.
+ *
+ * NOT REPRODUCED ON THIS MACHINE, and worth saying so rather than inventing a symptom. macOS
+ * draws overlay scrollbars, so the capture and calibration panels appearing below do not narrow
+ * the column - measured, 833 px before and after. On a platform with classic scrollbars that same
+ * reflow takes about 15 px off the width, which is exactly the case `window.resize` misses. This
+ * is here for that, and it costs one observer that no-ops whenever the size has not changed.
+ */
+if (typeof ResizeObserver !== 'undefined') {
+  let lastW = 0, lastH = 0, pending = null;
+  new ResizeObserver((entries) => {
+    const box = entries[0].contentRect;
+    const w = Math.round(box.width), h = Math.round(box.height);
+    if (w === lastW && h === lastH) return;      // a reflow that did not move this element
+    lastW = w; lastH = h;
+    if (!w || !h) return;
+    clearTimeout(pending);
+    pending = setTimeout(redrawChart, 60);
+  }).observe($('skychart'));
+}
+
 function skyXY(raDeg, decDeg, geo) {
   const p = hammer(raDeg, decDeg);
   return { x: geo.cx + p.x * geo.s, y: geo.cy - p.y * geo.s };
@@ -1361,8 +1623,6 @@ async function loadGaia() {
     return;
   }
 
-  $('gaiaBar').hidden = false;
-  $('starLayerLabel').textContent = 'Gaia DR3';
   state.gaiaClasses = new Set(g.classes);
 
   $('classChips').innerHTML = g.classes.map((c) =>
@@ -1388,7 +1648,7 @@ async function loadGaia() {
   }));
 
   updateMagOut();
-  loadGaiaLayer();
+  applyGaiaVisibility();     // which decides whether the layer is wanted in this mode at all
 }
 
 function updateMagOut() {
@@ -1403,7 +1663,7 @@ function scheduleGaiaLayer() {
 }
 
 function loadGaiaLayer() {
-  if (!state.gaia || !state.gaia.loaded) return;
+  if (!gaiaWanted()) return;
   const qs = new URLSearchParams({
     magMin: $('magMin').value,
     magMax: $('magMax').value,
@@ -1425,8 +1685,7 @@ function loadGaiaLayer() {
 async function loadSky() {
   const r = await fetch('/api/sky');
   state.sky = await r.json();
-  $('chartNote').textContent =
-    `${fmt.int(state.sky.hosts.length)} planet hosts · north up, east left · click any star to point at it`;
+  updateChartNote();
   drawSkyStatic();
   drawSkyOverlay();
   wireSkyEvents();
@@ -1542,7 +1801,11 @@ function drawSkyStatic() {
   // Only when there is no Gaia layer underneath. With one, drawing the Bright Star
   // Catalogue again would paint 9 000 stars a second time, half a pixel off the
   // 7.4 million already rendered beneath them.
-  if (!state.gaia || !state.gaia.loaded) {
+  //
+  // And not at all in exoplanet mode, where every selectable object is a host: a
+  // background of stars that cannot be clicked is 9 000 things competing with the few
+  // thousand that can. See setMode.
+  if (state.mode !== 'exo' && !gaiaWanted()) {
     for (const [ra, dec, v] of sky.stars) {
       const p = skyXY(ra, dec, geo);
       const r = Math.max(0.4, 1.9 - 0.21 * v);
@@ -1554,12 +1817,16 @@ function drawSkyStatic() {
   }
 
   // -- first-magnitude IAU names ------------------------------------------------
-  g.font = '9.5px -apple-system, system-ui, sans-serif';
-  g.fillStyle = 'rgba(125,138,156,.85)';
-  g.textAlign = 'left'; g.textBaseline = 'middle';
-  for (const l of sky.labels) {
-    const p = skyXY(l.ra, l.dec, geo);
-    g.fillText(l.name, p.x + 5, p.y - 4);
+  // These label stars in the background layer, so they go with it in exoplanet mode:
+  // a name floating over an empty patch of chart labels nothing.
+  if (state.mode !== 'exo') {
+    g.font = '9.5px -apple-system, system-ui, sans-serif';
+    g.fillStyle = 'rgba(125,138,156,.85)';
+    g.textAlign = 'left'; g.textBaseline = 'middle';
+    for (const l of sky.labels) {
+      const p = skyXY(l.ra, l.dec, geo);
+      g.fillText(l.name, p.x + 5, p.y - 4);
+    }
   }
 }
 
@@ -1573,16 +1840,29 @@ function drawSkyOverlay() {
   const g = setupSkyCanvas(cv);
   const geo = skyGeom();
 
-  for (const hst of sky.hosts) {
-    const p = skyXY(hst.ra, hst.dec, geo);
-    hst._x = p.x; hst._y = p.y;      // cached for hit-testing
+  // HOSTS BELONG TO EXOPLANET MODE AND TO NOTHING ELSE. They are not drawn in astrophotography
+  // mode, not hovered, and not clickable: there, a host is just a star, and the chart already
+  // has 7.4 million of those to point at. Marking four thousand of them for a reason that has
+  // nothing to do with taking a picture is a claim that they are special to this instrument.
+  //
+  // THE CACHED POSITIONS ARE CLEARED RATHER THAN LEFT, which is the part that actually matters.
+  // skyHitTest walks these, so a host carrying last-mode coordinates would still answer a click
+  // after it stopped being drawn: an invisible target under the cursor. Deleting them means the
+  // hit test has nothing to find even if it is reached.
+  if (state.mode !== 'exo') {
+    for (const hst of sky.hosts) { delete hst._x; delete hst._y; }
+  } else {
+    for (const hst of sky.hosts) {
+      const p = skyXY(hst.ra, hst.dec, geo);
+      hst._x = p.x; hst._y = p.y;      // cached for hit-testing
 
-    const matches = state.filter === 'all' || (state.filter === 'rv' ? hst.rv : hst.tr);
-    g.globalAlpha = matches ? 0.8 : 0.14;
-    g.fillStyle = '#5ecfff';
-    g.beginPath(); g.arc(p.x, p.y, hst.n > 1 ? 2.1 : 1.5, 0, 6.2832); g.fill();
+      const matches = state.filter === 'all' || (state.filter === 'rv' ? hst.rv : hst.tr);
+      g.globalAlpha = matches ? 0.8 : 0.14;
+      g.fillStyle = '#5ecfff';
+      g.beginPath(); g.arc(p.x, p.y, hst.n > 1 ? 2.1 : 1.5, 0, 6.2832); g.fill();
+    }
+    g.globalAlpha = 1;
   }
-  g.globalAlpha = 1;
 
   const ring = (hst, color, r) => {
     g.strokeStyle = color; g.lineWidth = 1.4;
@@ -1669,12 +1949,17 @@ async function aimAt(pos) {
 }
 
 function skySelectHost(hostName) {
+  if (state.mode !== 'exo') return;     // no host ring on a chart with no hosts on it
   if (!state.sky || !hostName) return;
   const hst = state.sky.hosts.find((x) => x.name.toLowerCase() === hostName.toLowerCase());
   if (hst) { state.skySel = hst; drawSkyOverlay(); }
 }
 
 function skyHitTest(mx, my) {
+  // Hosts are exoplanet mode's alone. Refusing here rather than only declining to draw them is
+  // what keeps a click on bare sky in astrophotography mode reaching aimAt: a host that answered
+  // the hit test while invisible would swallow the pointing instead.
+  if (state.mode !== 'exo') return null;
   if (!state.sky) return null;
   let best = null, bestD = 81;   // 9 px pick radius, squared
   for (const hst of state.sky.hosts) {
@@ -1918,11 +2203,13 @@ for (const [id, field] of [['scAlt', 'altitudeKm'], ['scInc', 'inclinationDeg'],
 
 /** One revolution of yes/no for the current aim, with the reason for each no. */
 async function loadOrbitVisibility() {
+  const mine = modeReceipt();
   const scope = selectedScope();
   if (!scope || !scope.isSpaceBased) { $('orbitPanel').hidden = true; return; }
 
   const qs = new URLSearchParams({ ra: $('capRa').value, dec: $('capDec').value, samples: 120 });
   const d = await (await fetch(`/api/platforms/${encodeURIComponent(scope.platform)}/conditions?${qs}`)).json();
+  if (!ofThisMode(mine)) return;
   if (d.error) { $('orbitPanel').hidden = true; return; }
 
   $('orbitPanel').hidden = false;
@@ -1963,4 +2250,744 @@ function classForBlock(reason) {
   return 'limb';
 }
 
+/* ---------------------------------------------------------------- stretch */
+/* Why the picture on the page and the picture in the FITS viewer are not the same picture.
+
+   They are the same PIXELS. What differs is where black and white sit, and on a deep-sky frame
+   that decides essentially everything: the subject occupies a few tens of ADU on top of a sky
+   pedestal, out of a converter counting to tens of thousands. The page has always chosen those
+   levels from the frame; a viewer opened with defaults has not. Switching between the three here
+   costs one request and no recomputation of the frame — the stored ADU are rendered again. */
+
+state.stretch = 'asinh';
+
+async function applyStretch() {
+  if (!state.capture) return;
+  $('stretchNote').textContent = 're-rendering…';
+  try {
+    const r = await fetch(`/api/captures/${state.capture}/render?stretch=${state.stretch}`);
+    const d = await r.json();
+    if (!r.ok) {
+      // Say so rather than leaving the previous view up under the newly-selected chip, which
+      // reads as "this stretch looks identical" instead of "that did not happen".
+      $('stretchNote').textContent = d.error || 'That view could not be rendered.';
+      return;
+    }
+    $('captureImg').src = 'data:image/png;base64,' + d.png;
+    $('stretchNote').textContent =
+      `black ${fmt.num(d.blackAdu, 1)} ADU · white ${fmt.num(d.whiteAdu, 1)} ADU · ` +
+      `${((d.whiteAdu - d.blackAdu) / d.maxAdu * 100).toFixed(2)} % of the converter's ` +
+      `${fmt.num(d.maxAdu, 0)} ADU range — ${d.note}`;
+  } catch (e) {
+    $('stretchNote').textContent = String(e);
+  }
+}
+
+for (const chip of document.querySelectorAll('#stretchChips .chip')) {
+  chip.onclick = () => {
+    state.stretch = chip.dataset.stretch;
+    for (const c of document.querySelectorAll('#stretchChips .chip')) {
+      c.classList.toggle('on', c === chip);
+    }
+    applyStretch();
+  };
+}
+
+/* ------------------------------------------------------------- calibration */
+/* Bias, dark and flat, and the reduction that uses them.
+
+   The server has been able to do all of this since the calibration work landed and nothing on
+   the page called any of it, so the only way to take a bias was curl. Two things are offered
+   here and they are not equivalent:
+
+     * MASTERS THIS PIPELINE BUILDS, which remove exactly the patterns it put in. Useful, and
+       circular: a defect the forward model does not have cannot be found by a calibration frame
+       the forward model wrote.
+     * A MASTER THE OBSERVER UPLOADS, which is the one that breaks the circle. A real camera's
+       flat carries dust motes, accessory vignetting and tree rings, none of which this model
+       generates and two of which it explicitly declines to invent. */
+
+const CAL_KINDS = ['Bias', 'Dark', 'Flat'];
+
+function calBusy(on) {
+  for (const b of document.querySelectorAll('#calibrationPanel button')) b.disabled = on;
+  $('upFile').disabled = on;
+}
+
+function calFail(message) {
+  $('calError').hidden = false;
+  $('calError').textContent = message;
+}
+
+/** Every note the server returned, warnings first and marked, because they are the point. */
+function renderCalNotes(notes) {
+  const ul = $('calNotes');
+  ul.innerHTML = '';
+  for (const n of notes || []) {
+    const li = document.createElement('li');
+    const warning = /^WARNING/i.test(n);
+    li.className = warning ? 'warn' : '';
+    li.textContent = warning ? n.replace(/^WARNING:?\s*/i, '') : n;
+    ul.appendChild(li);
+  }
+}
+
+function renderMasters() {
+  const rows = $('masterRows');
+  const held = CAL_KINDS.filter((k) => state.masters[k]);
+  $('masterTable').hidden = held.length === 0;
+  rows.innerHTML = '';
+
+  for (const kind of held) {
+    const m = state.masters[kind];
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td class="mkind">${kind}</td>` +
+      `<td>${m.imported ? 'your file' : `${m.framesAveraged}× simulated`}</td>` +
+      `<td class="mono">${m.exposureSeconds ? fmt.num(m.exposureSeconds, 1) + ' s' : '—'}</td>` +
+      `<td class="mono">${fmt.num(m.meanAdu, 1)}</td>` +
+      `<td class="mono">${fmt.num(m.rmsAdu, 2)}</td>` +
+      `<td><label><input type="checkbox" data-use="${kind}" ${m.use === false ? '' : 'checked'}></label></td>` +
+      `<td><a href="${m.fitsUrl}" download>FITS</a></td>`;
+    rows.appendChild(tr);
+  }
+
+  for (const box of rows.querySelectorAll('input[data-use]')) {
+    box.onchange = () => { state.masters[box.dataset.use].use = box.checked; };
+  }
+}
+
+for (const btn of document.querySelectorAll('#calibrationPanel .calbtn')) {
+  btn.onclick = async () => {
+    if (!state.capture) return;
+    const mine = modeReceipt();
+    const kind = btn.dataset.cal;
+    $('calError').hidden = true;
+    calBusy(true);
+    const was = btn.textContent;
+    btn.textContent = 'Exposing…';
+    try {
+      const r = await fetch(`/api/captures/${state.capture}/calibration`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          kind,
+          count: Math.max(1, Math.min(256, $('calCount').valueAsNumber || 16)),
+        }),
+      });
+      const data = await r.json();
+      if (!ofThisMode(mine)) return;
+      if (!r.ok) { calFail(data.error || 'Could not build that frame.'); return; }
+      state.masters[kind] = data;
+      renderMasters();
+      renderCalNotes(data.notes);
+    } catch (e) {
+      calFail(String(e));
+    } finally {
+      btn.textContent = was;
+      calBusy(false);
+    }
+  };
+}
+
+/* The upload. The body is the file itself; the name rides in a header purely so the server can
+   quote it back in an error message, since the person who has to act on "this is 4144x2822 and
+   the frame is 2072x1411" is the one holding the file. */
+$('upFile').onchange = async () => {
+  const file = $('upFile').files[0];
+  if (!file || !state.capture) return;
+  const kind = $('upKind').value;
+  $('calError').hidden = true;
+  calBusy(true);
+  $('upHint').textContent = `reading ${file.name}…`;
+  try {
+    const r = await fetch(`/api/captures/${state.capture}/masters?kind=${encodeURIComponent(kind)}`, {
+      method: 'POST',
+      headers: { 'X-File-Name': file.name, 'content-type': 'application/octet-stream' },
+      body: file,
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      calFail(data.error || 'That file was refused.');
+      $('upHint').textContent = 'refused — nothing was loaded';
+      return;
+    }
+    state.masters[kind] = data;
+    renderMasters();
+    renderCalNotes(data.notes);
+    $('upHint').textContent =
+      `${file.name}: ${data.width}×${data.height}, BITPIX ${data.bitPix}` +
+      (data.headerInstrument ? `, ${data.headerInstrument}` : '');
+  } catch (e) {
+    calFail(String(e));
+  } finally {
+    $('upFile').value = '';
+    calBusy(false);
+  }
+};
+
+/* Reduce, which is the only thing on this page that runs the model BACKWARDS: it recovers each
+   injected star's magnitude out of the pixels and reports how far off it came back. */
+$('reduce').onclick = async () => {
+  if (!state.capture) return;
+  const mine = modeReceipt();
+  $('calError').hidden = true;
+  calBusy(true);
+  $('reduceOut').textContent = 'reducing…';
+  try {
+    const qs = new URLSearchParams();
+    for (const kind of CAL_KINDS) {
+      const m = state.masters[kind];
+      if (m && m.use !== false) qs.set(kind.toLowerCase(), m.id);
+    }
+    const r = await fetch(`/api/captures/${state.capture}/photometry?${qs}`);
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) { calFail(d.error || 'Reduction failed.'); $('reduceOut').textContent = ''; return; }
+
+    const num = (v, dp) => (v === null || v === undefined ? null : fmt.num(v, dp));
+    const bits = [
+      // Whether to believe any of the rest. A frame can be unreducible and still return numbers.
+      d.reliable === false ? '⚠ UNRELIABLE' : null,
+      `${fmt.int(d.detection.sourcesFound)} sources, ${fmt.int(d.detection.matched)} matched to injected stars`,
+      num(d.residuals.medianAbsMag, 4) ? `median |residual| ${num(d.residuals.medianAbsMag, 4)} mag` : null,
+      num(d.residuals.brightRmsMag, 4)
+        ? `bright RMS ${num(d.residuals.brightRmsMag, 4)} mag over ${fmt.int(d.residuals.brightCount)} stars` : null,
+      // The two zero points come by completely different routes, one through the pixels and one
+      // through the passband integral, so their difference is evidence rather than a formality.
+      num(d.zeroPoint.residualColourMatched, 4)
+        ? `zero point ${num(d.zeroPoint.residualColourMatched, 4)} mag from the analytic one` : null,
+      num(d.fluxRecovery.magnitudes, 4) ? `flux recovery ${num(d.fluxRecovery.magnitudes, 4)} mag` : null,
+    ].filter(Boolean);
+    $('reduceOut').textContent = bits.join(' · ');
+    renderCalNotes(d.notes);
+  } catch (e) {
+    calFail(String(e));
+    $('reduceOut').textContent = '';
+  } finally {
+    calBusy(false);
+  }
+};
+
 boot();
+
+
+// ============================ REAL EXOPLANET RESEARCH ============================
+//
+// The only part of Studio that consumes data it did not generate. A thin front end over
+// /api/research: the science is in Engine/Research, and the detector it reaches is
+// Core/TransitDetector, unchanged and blind.
+
+const rsFmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v) ? '—' : Number(v).toFixed(d));
+
+let rsLast = null;
+
+function rsRow(label, value, note) {
+  return `<div class="rsRow"><span class="rsLabel">${label}</span>` +
+         `<span class="rsValue">${value}</span>` +
+         (note ? `<span class="rsNote">${note}</span>` : '') + '</div>';
+}
+
+/**
+ * Scatter of the light curve, through the page's own setupCanvas so it matches every other chart
+ * here: logical height in data-h, backing store scaled by the device pixel ratio, and all drawing
+ * afterwards in CSS pixels. Sizing the canvas by hand instead drew everything at twice the
+ * intended scale on a retina display, which is the bug setupCanvas exists to prevent.
+ */
+function rsDrawCurve(cv, points, opts = {}) {
+  // WATCHED, NOT TIMED. setupCanvas sizes the backing store from clientWidth, and a canvas in a
+  // panel that was hidden a moment ago has not been laid out yet: measured here, one reported 262
+  // device pixels of backing against 833 CSS pixels of display and drew 3.2 times too large, and
+  // a second reported 300 against 131. Deferring by a frame fixed the first and not the second,
+  // because the number of frames layout takes is not something to guess at. A ResizeObserver
+  // fires when the box actually has its size, and again whenever it changes, which also covers
+  // the window being resized.
+  cv._rsDraw = () => rsPaintCurve(cv, points, opts);
+
+  // The observer catches later resizes; it does NOT reliably catch a panel going from hidden to
+  // visible, which is the case that matters most here. So the first paint retries itself while
+  // the box still has no width, bounded so a canvas that is legitimately never shown does not
+  // spin forever.
+  if (!cv._rsObserver) {
+    cv._rsObserver = new ResizeObserver(() => { if (cv._rsDraw) cv._rsDraw(); });
+    cv._rsObserver.observe(cv);
+  }
+  let tries = 0;
+  const attempt = () => {
+    if (cv.clientWidth > 0) { cv._rsDraw(); return; }
+    if (++tries < 60) requestAnimationFrame(attempt);
+  };
+  requestAnimationFrame(attempt);
+}
+
+function rsPaintCurve(cv, points, opts = {}) {
+  if (!cv.clientWidth) return;
+  const { g, w, h } = setupCanvas(cv);
+  if (!points.length) return;
+
+  const pad = { l: 46, r: 12, t: 14, b: 26 };
+  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  for (const p of points) {
+    if (p.x < xMin) xMin = p.x; if (p.x > xMax) xMax = p.x;
+    if (p.y < yMin) yMin = p.y; if (p.y > yMax) yMax = p.y;
+  }
+  const span = Math.max(yMax - yMin, 1e-6);
+  yMin -= span * 0.08; yMax += span * 0.08;
+
+  const sx = (x) => pad.l + (x - xMin) / Math.max(xMax - xMin, 1e-9) * (w - pad.l - pad.r);
+  const sy = (y) => h - pad.b - (y - yMin) / Math.max(yMax - yMin, 1e-9) * (h - pad.t - pad.b);
+
+  const css = getComputedStyle(document.body);
+  const dim = (css.getPropertyValue('--dim') || 'rgba(255,255,255,0.45)').trim();
+  const accent = (css.getPropertyValue('--accent') || '#e0a44c').trim();
+
+  g.strokeStyle = 'rgba(255,255,255,0.12)';
+  g.lineWidth = 1;
+  g.beginPath(); g.moveTo(pad.l, h - pad.b); g.lineTo(w - pad.r, h - pad.b); g.stroke();
+  g.beginPath(); g.moveTo(pad.l, pad.t); g.lineTo(pad.l, h - pad.b); g.stroke();
+
+  // The unbroken flux level, so a dip is read against something rather than in the abstract.
+  g.strokeStyle = 'rgba(255,255,255,0.18)';
+  g.setLineDash([4, 4]);
+  g.beginPath(); g.moveTo(pad.l, sy(1)); g.lineTo(w - pad.r, sy(1)); g.stroke();
+  g.setLineDash([]);
+
+  g.fillStyle = accent;
+  for (const p of points) g.fillRect(sx(p.x) - 0.6, sy(p.y) - 0.6, 1.2, 1.2);
+
+  g.fillStyle = dim;
+  g.font = '11px system-ui, sans-serif';
+  g.fillText(opts.xLabel || '', pad.l, h - 8);
+  g.textAlign = 'right';
+  g.fillText(((yMax - yMin) * 1e6).toFixed(0) + ' ppm', pad.l - 6, pad.t + 8);
+  g.fillText('1.000', pad.l - 6, sy(1) + 4);
+  g.textAlign = 'left';
+}
+
+async function loadResearchRuns() {
+  const box = $('rsRuns');
+  if (!box) return;
+  try {
+    const runs = await (await fetch('/api/research/runs')).json();
+    box.innerHTML = runs.length
+      ? runs.map((r) => `<a class="rsRun ${r.detected ? 'hit' : 'null'}" href="/api/research/runs/${r.id}" target="_blank">` +
+          `<b>${r.label || '(unnamed)'}</b><span>${r.detected ? 'candidate' : 'nothing above threshold'}</span>` +
+          `<time>${(r.recordedUtc || '').replace('T', ' ').slice(0, 16)}</time></a>`).join('')
+      : '<p class="hint dim">No runs yet.</p>';
+  } catch {
+    box.innerHTML = '<p class="hint dim">Could not read the run list.</p>';
+  }
+}
+
+function renderResearch(d) {
+  $('rsError').hidden = true;
+  if (!d.ok) {
+    $('rsError').hidden = false;
+    $('rsError').textContent = d.message;
+    return;
+  }
+
+  const lc = d.lightCurve;
+  $('rsCurvePanel').hidden = false;
+  $('rsCurveMeta').textContent =
+    `${lc.target || ''} · sector ${lc.sector} · ${fmt.int(lc.cadences)} cadences · ` +
+    `${rsFmt(lc.baselineDays, 1)} d · ${rsFmt(lc.cadenceMinutes, 1)} min`;
+  $('rsCurveNote').textContent =
+    `scatter ${rsFmt(lc.scatterPpmRaw, 0)} ppm before detrending, ${rsFmt(lc.scatterPpmDetrended, 0)} after. ` +
+    d.log[0];
+  if (d.series) {
+    const t0 = d.series[0][0];
+    rsDrawCurve($('rsCurve'), d.series.map((p) => ({ x: p[0] - t0, y: p[1] })),
+                { xLabel: 'days from the first cadence' });
+  }
+
+  if (!d.detected) {
+    $('rsFoldPanel').hidden = true;
+    $('rsResultPanel').hidden = false;
+    $('rsResult').innerHTML =
+      `<p class="hint"><b>${(d.singleTransits || []).length ? 'No repeating transit.' : 'Nothing above threshold.'}</b> ${d.message}</p>` +
+      `<p class="hint dim">Saved as <code>${d.id}</code>.</p>`;
+    rsLast = d;
+    rsShowInspection(d);
+    return;
+  }
+
+  const c = d.candidate, v = d.vetting;
+
+  if (d.series) {
+    // Folded on the recovered period: the check anyone can make with their own eyes.
+    const tf = d.series[0][0];
+    const folded = d.series.map((p) => {
+      let ph = ((p[0] - tf) / c.periodDays) % 1;
+      if (ph < 0) ph += 1;
+      if (ph > 0.5) ph -= 1;
+      return { x: ph, y: p[1] };
+    });
+    $('rsFoldPanel').hidden = false;
+    $('rsFoldMeta').textContent = `period ${rsFmt(c.periodDays, 5)} d · depth ${rsFmt(c.depthPpm, 0)} ppm`;
+    rsDrawCurve($('rsFold'), folded, { xLabel: 'phase, transit near 0' });
+  }
+
+  $('rsResultPanel').hidden = false;
+  let html = '<div class="rsBlock">' +
+    rsRow('Period', rsFmt(c.periodDays, 5) + ' d') +
+    rsRow('Depth', rsFmt(c.depthPpm, 0) + ' ppm', '± ' + rsFmt(c.depthUncertaintyPpm, 0)) +
+    rsRow('Duration', rsFmt(c.durationHours, 2) + ' h') +
+    rsRow('Signal to noise', rsFmt(c.snr, 1)) +
+    rsRow('Radius ratio', rsFmt(c.radiusRatio, 4), 'Rp/Rs, from the depth alone') +
+    '</div>';
+
+  html += `<div class="rsBlock"><h3>Vetting <span class="${v.passed ? 'rsPass' : 'rsWarn'}">` +
+    `${v.passed ? 'nothing disqualifying' : v.concerns.length + ' concern(s)'}</span></h3>` +
+    rsRow('Odd vs even depth', rsFmt(v.oddDepthPpm, 0) + ' / ' + rsFmt(v.evenDepthPpm, 0) + ' ppm',
+          rsFmt(v.oddEvenSigma, 1) + ' sigma apart') +
+    rsRow('Secondary eclipse', rsFmt(v.secondaryDepthPpm, 0) + ' ppm',
+          rsFmt(v.secondarySigma, 1) + ' sigma, ' + rsFmt(v.secondaryRatio * 100, 1) + '% of transit') +
+    rsRow('Duration vs period', rsFmt(v.durationRatio, 2) + '×', 'against a solar density star') +
+    (v.concerns.length ? '<ul class="rsConcerns">' + v.concerns.map((x) => `<li>${x}</li>`).join('') + '</ul>' : '') +
+    '</div>';
+
+  const k = d.known;
+  html += '<div class="rsBlock"><h3>Already known?</h3>' +
+    (k.matches.length
+      ? '<ul class="rsKnown">' + k.matches.map((m) =>
+          `<li><b>${m.name}</b> in ${m.register}, ${rsFmt(m.separationArcsec, 1)} arcsec away` +
+          (m.periodDays ? `, period ${rsFmt(m.periodDays, 5)} d (ratio ${rsFmt(m.periodRatio, 3)})` : '') +
+          `<br><span class="rsNote">${m.note}</span></li>`).join('') + '</ul>'
+      : '<p class="rsPass">Nothing registered within 30 arcsec of this position.</p>') +
+    (k.unavailable.length ? '<p class="rsNote">Could not check: ' + k.unavailable.join('; ') + '</p>' : '') +
+    '</div>';
+
+  html += `<div class="rsCaveat">${d.caveat}</div>`;
+  html += `<p class="hint dim">Saved as <code>${d.id}</code>.</p>`;
+  $('rsResult').innerHTML = html;
+  rsLast = d;
+  rsShowInspection(d);
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const run = $('rsRun');
+  if (!run) return;
+
+  for (const chip of document.querySelectorAll('#rsPresets .chip')) {
+    chip.onclick = () => {
+      if (chip.dataset.preset === 'known') {
+        $('rsLabel').value = 'WASP-18';
+        $('rsRa').value = '24.354'; $('rsDec').value = '-45.678';
+        $('rsMinP').value = '0.5'; $('rsMaxP').value = '10';
+        $('rsTargetHint').textContent =
+          'A hot Jupiter found in 2009. Useful for checking the pipeline works, not for discovery.';
+      } else {
+        $('rsMinP').value = '8'; $('rsMaxP').value = '25'; $('rsWindow').value = '1.5';
+        $('rsTargetHint').textContent =
+          'Long periods are where the mission pipeline is weakest: it wants three transits and a ' +
+          'sector is 27 days, so anything beyond about 9 days is under searched.';
+      }
+    };
+  }
+
+  run.onclick = async () => {
+    const mine = modeReceipt();
+    const ra = parseFloat($('rsRa').value), dec = parseFloat($('rsDec').value);
+    if (!Number.isFinite(ra) || !Number.isFinite(dec)) {
+      $('rsError').hidden = false;
+      $('rsError').textContent = 'A right ascension and declination in degrees are needed.';
+      return;
+    }
+    run.disabled = true;
+    const was = run.textContent;
+    run.textContent = 'Fetching and searching…';
+    $('rsError').hidden = true;
+    try {
+      const body = {
+        raDeg: ra, decDeg: dec, label: $('rsLabel').value || null,
+        minPeriodDays: parseFloat($('rsMinP').value) || 0.5,
+        maxPeriodDays: parseFloat($('rsMaxP').value) || 12,
+        detrendWindowDays: parseFloat($('rsWindow').value) || 0.75,
+        snrThreshold: parseFloat($('rsSnr').value) || 8,
+      };
+      const d = await (await fetch('/api/research/search', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      })).json();
+      if (!ofThisMode(mine)) return;
+      renderResearch(d);
+      loadResearchRuns();
+    } catch (e) {
+      if (!ofThisMode(mine)) return;
+      $('rsError').hidden = false;
+      $('rsError').textContent = 'The search failed: ' + e;
+    } finally {
+      run.disabled = false;
+      run.textContent = was;
+    }
+  };
+});
+
+
+// ------------------------------------------------------- visual inspection
+
+let rsEvents = [];      // what was found, marked on the curve
+let rsPicked = -1;      // which one the person is looking at
+let rsRunId = null;
+let rsVerdict = null;
+
+/** The curve around one event, wide enough to see whether the baseline either side is flat. */
+function rsDrawZoom(ev) {
+  const cv = $('rsZoom');
+  if (!rsLast || !rsLast.series || !ev) return;
+  const half = ev.durationHours / 24 * 4;      // four durations either side
+  const pts = rsLast.series
+    .filter((p) => Math.abs(p[0] - ev.centreTimeDays) <= half)
+    .map((p) => ({ x: (p[0] - ev.centreTimeDays) * 24, y: p[1] }));
+  rsDrawCurve(cv, pts, { xLabel: 'hours from the centre of the dip' });
+
+  $('rsZoomNote').textContent =
+    `${ev.depthPpm.toFixed(0)} ppm deep over ${ev.durationHours.toFixed(1)} h, signal to noise ` +
+    `${ev.snr.toFixed(1)}, ${ev.pointsInDip} cadences inside it` +
+    (Number.isFinite(ev.centroidShiftPixels)
+      ? `. The centre of light moved ${ev.centroidShiftPixels.toFixed(4)} px during the dip` +
+        (ev.centroidShiftPixels < 0.01 ? ', which is consistent with the light coming from this star.' : '.')
+      : '. This light curve carries no centroid, so a blended neighbour is not excluded.') +
+    (ev.concerns && ev.concerns.length ? ' Concerns: ' + ev.concerns.join(' ') : '');
+}
+
+function rsShowInspection(d) {
+  rsEvents = (d.singleTransits || []).slice();
+  rsRunId = d.id;
+  rsVerdict = null;
+  $('rsSaveReview').disabled = true;
+  $('rsReviewOut').textContent = '';
+  for (const c of document.querySelectorAll('#rsVerdictChips .chip')) c.classList.remove('on');
+
+  // A repeating detection is worth looking at too, as one event at its first transit.
+  if (d.detected && d.candidate) {
+    const t0 = d.series && d.series.length ? d.series[0][0] : 0;
+    rsEvents.unshift({
+      centreTimeDays: t0 + d.candidate.phase * d.candidate.periodDays
+                      + d.candidate.durationHours / 24 / 2,
+      durationHours: d.candidate.durationHours,
+      depthPpm: d.candidate.depthPpm,
+      snr: d.candidate.snr,
+      pointsInDip: d.candidate.inTransitPoints,
+      centroidShiftPixels: NaN,
+      concerns: d.vetting ? d.vetting.concerns : [],
+      repeating: true,
+    });
+  }
+
+  if (!rsEvents.length) {
+    $('rsInspectPanel').hidden = true;
+    $('rsSubmitPanel').hidden = true;
+    return;
+  }
+
+  $('rsInspectPanel').hidden = false;
+  $('rsInspectMeta').textContent =
+    rsEvents.length === 1 ? 'one event to judge' : `${rsEvents.length} events to judge`;
+  $('rsEventChips').innerHTML = rsEvents.map((e, i) =>
+    `<button class="chip${i === 0 ? ' on' : ''}" data-ev="${i}">` +
+    `${e.repeating ? 'repeating' : 'single'} · ${e.depthPpm.toFixed(0)} ppm · SNR ${e.snr.toFixed(0)}</button>`).join('');
+  for (const c of document.querySelectorAll('#rsEventChips .chip')) {
+    c.onclick = () => {
+      for (const o of document.querySelectorAll('#rsEventChips .chip')) o.classList.remove('on');
+      c.classList.add('on');
+      rsPicked = Number(c.dataset.ev);
+      rsDrawZoom(rsEvents[rsPicked]);
+    };
+  }
+  rsPicked = 0;
+  rsDrawZoom(rsEvents[0]);
+  rsLoadReadiness();
+}
+
+async function rsLoadReadiness() {
+  if (!rsRunId) return;
+  try {
+    const r = await (await fetch(`/api/research/runs/${rsRunId}/readiness`)).json();
+    $('rsSubmitPanel').hidden = false;
+    const url = `/api/research/runs/${rsRunId}/ctoi?submitter=` +
+                encodeURIComponent($('rsReviewer').value || '');
+    $('rsReadiness').innerHTML = r.ready
+      ? '<p class="rsPass">This run is fit to submit as a Community TOI.</p>' +
+        `<p><a class="ghost" href="${url}" download="ctoi.csv">Download the CTOI file</a></p>` +
+        '<div class="rsCaveat">The file is <b>not sent anywhere</b>. Read every number in it, then ' +
+        'upload it yourself at exofop.ipac.caltech.edu under your own account. A submission needs a ' +
+        'person who stands behind it, and that person is you.</div>' +
+        (r.warnings.length ? '<ul class="rsConcerns">' + r.warnings.map((w) => `<li>${w}</li>`).join('') + '</ul>' : '')
+      : '<p class="rsWarn">Not fit to submit yet:</p><ul class="rsConcerns">' +
+        r.blocking.map((b) => `<li>${b}</li>`).join('') + '</ul>';
+  } catch { /* the panel simply stays as it was */ }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  if (!$('rsSaveReview')) return;
+  for (const c of document.querySelectorAll('#rsVerdictChips .chip')) {
+    c.onclick = () => {
+      for (const o of document.querySelectorAll('#rsVerdictChips .chip')) o.classList.remove('on');
+      c.classList.add('on');
+      rsVerdict = c.dataset.verdict;
+      $('rsSaveReview').disabled = false;
+    };
+  }
+  $('rsSaveReview').onclick = async () => {
+    if (!rsRunId || !rsVerdict) return;
+    const r = await fetch(`/api/research/runs/${rsRunId}/review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        verdict: rsVerdict, note: $('rsReviewNote').value, reviewer: $('rsReviewer').value,
+      }),
+    });
+    $('rsReviewOut').textContent = r.ok
+      ? 'Recorded against this run, with your name and the time.'
+      : 'Could not record that.';
+    rsLoadReadiness();
+  };
+});
+
+
+// ------------------------------------------------------------------ field sweep
+
+const RS_FIELDS = {
+  'cvz-south': { ra: 90.0, dec: -66.5, note: 'The southern continuous viewing zone. TESS returns ' +
+    'here sector after sector, so it holds the longest baselines the mission produces.' },
+  'cvz-north': { ra: 270.0, dec: 66.5, note: 'The northern continuous viewing zone, the same idea ' +
+    'in the other hemisphere.' },
+};
+
+let rsSweepId = null;
+let rsSweepTimer = null;
+
+function rsRenderSweep(s) {
+  const p = $('rsSweepProgress');
+  p.hidden = false;
+  if (s.state === 'listing') {
+    p.textContent = 'Asking the archive what is in this field…';
+  } else if (s.state === 'empty') {
+    p.textContent = 'Nothing in this field has that many sectors. Lower the sector floor, or move.';
+  } else if (s.state === 'failed') {
+    p.textContent = 'The sweep failed: ' + (s.error || 'unknown');
+  } else {
+    p.textContent = `${s.done} of ${s.total} stars searched` +
+      (s.current ? ` · ${s.current}` : '') +
+      (s.state === 'done' ? ' · finished' : '');
+  }
+
+  const worth = (s.hits || []).filter((h) => h.score > 0);
+  $('rsSweepPanel').hidden = false;
+  $('rsSweepMeta').textContent =
+    `${s.field.radius}° around ${s.field.ra.toFixed(2)} ${s.field.dec >= 0 ? '+' : ''}` +
+    `${s.field.dec.toFixed(2)}, at least ${s.field.minSectors} sectors · ` +
+    `${worth.length} worth opening of ${s.done} searched`;
+
+  $('rsSweepList').innerHTML = worth.length
+    ? worth.map((h) => `<a class="rsRun hit" href="#" data-run="${h.runId}">` +
+        `<b>TIC ${h.target}</b><span>${h.why}</span>` +
+        `<time>${h.sectors} sectors</time></a>`).join('')
+    : (s.state === 'done'
+        ? '<p class="hint dim">Nothing in this field worth opening. That is the usual answer, and ' +
+          'every star is recorded, so the field is now searched rather than unknown.</p>'
+        : '<p class="hint dim">Nothing yet.</p>');
+
+  for (const a of document.querySelectorAll('#rsSweepList a')) {
+    a.onclick = async (e) => {
+      e.preventDefault();
+      const d = await (await fetch(`/api/research/runs/${a.dataset.run}`)).json();
+      // The stored record and the live response differ in shape; normalise enough to inspect it.
+      renderResearch({
+        ok: true,
+        detected: !!(d.result && d.result.detected),
+        id: d.id,
+        log: d.log || [],
+        lightCurve: d.lightCurve || {},
+        series: d.series || null,
+        singleTransits: (d.singleTransits || []).map((x) => ({
+          centreTimeDays: x.CentreTimeDays, durationHours: x.DurationHours,
+          depthPpm: x.DepthPpm, snr: x.Snr, pointsInDip: x.PointsInDip,
+          centroidShiftPixels: x.CentroidShiftPixels, concerns: x.Concerns || [],
+          passed: !(x.Concerns || []).length,
+        })),
+        candidate: d.result && d.result.detected ? {
+          periodDays: d.result.BestPeriodDays, depthPpm: d.result.BestDepthPpm,
+          depthUncertaintyPpm: 0, durationHours: d.result.BestDurationHours,
+          phase: d.result.BestPhase01, snr: d.result.Snr,
+          inTransitPoints: d.result.InTransitPointCount,
+          radiusRatio: Math.sqrt(Math.max(0, d.result.BestDepthPpm) / 1e6),
+        } : null,
+        vetting: d.vetting ? {
+          oddDepthPpm: d.vetting.OddDepthPpm, evenDepthPpm: d.vetting.EvenDepthPpm,
+          oddEvenSigma: d.vetting.OddEvenDifferenceSigma,
+          secondaryDepthPpm: d.vetting.SecondaryDepthPpm,
+          secondarySigma: d.vetting.SecondarySignificanceSigma,
+          secondaryRatio: d.vetting.SecondaryToPrimaryRatio,
+          durationRatio: d.vetting.DurationRatio,
+          concerns: d.vetting.Concerns || [], passed: !(d.vetting.Concerns || []).length,
+        } : { concerns: [], passed: true },
+        known: { anything: !!(d.known || []).length, matches: (d.known || []).map((m) => ({
+          register: m.Register, name: m.Name, periodDays: m.PeriodDays,
+          separationArcsec: m.SeparationArcsec, periodRatio: m.PeriodRatio, note: m.Note,
+        })), unavailable: [] },
+        caveat: 'A candidate, not a planet. Reopened from the recorded run.',
+      });
+      $('rsResultPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+  }
+
+  if (s.state === 'done' || s.state === 'failed' || s.state === 'empty') {
+    clearInterval(rsSweepTimer);
+    rsSweepTimer = null;
+    $('rsSweep').disabled = false;
+    $('rsSweep').textContent = 'Sweep this field';
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const sweep = $('rsSweep');
+  if (!sweep) return;
+
+  for (const chip of document.querySelectorAll('#rsFieldPresets .chip')) {
+    chip.onclick = () => {
+      const f = RS_FIELDS[chip.dataset.field];
+      $('rsRa').value = f.ra;
+      $('rsDec').value = f.dec;
+      $('rsSweepHint').textContent = f.note;
+    };
+  }
+
+  sweep.onclick = async () => {
+    const ra = parseFloat($('rsRa').value), dec = parseFloat($('rsDec').value);
+    if (!Number.isFinite(ra) || !Number.isFinite(dec)) {
+      $('rsError').hidden = false;
+      $('rsError').textContent = 'Pick a field first: a right ascension and declination, or a preset.';
+      return;
+    }
+    sweep.disabled = true;
+    sweep.textContent = 'Sweeping…';
+    $('rsError').hidden = true;
+    const body = {
+      raDeg: ra, decDeg: dec,
+      radiusDeg: parseFloat($('rsSwRadius').value) || 0.3,
+      minSectors: parseInt($('rsSwSectors').value, 10) || 10,
+      limit: parseInt($('rsSwLimit').value, 10) || 40,
+      minPeriodDays: parseFloat($('rsMinP').value) || 1,
+      maxPeriodDays: parseFloat($('rsMaxP').value) || 20,
+      detrendWindowDays: parseFloat($('rsWindow').value) || 1,
+      snrThreshold: parseFloat($('rsSnr').value) || 8,
+    };
+    const r = await (await fetch('/api/research/sweep', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })).json();
+    if (!r.id) {
+      $('rsError').hidden = false;
+      $('rsError').textContent = r.error || 'could not start the sweep';
+      sweep.disabled = false; sweep.textContent = 'Sweep this field';
+      return;
+    }
+    rsSweepId = r.id;
+    const poll = async () => {
+      try { rsRenderSweep(await (await fetch(`/api/research/sweep/${rsSweepId}`)).json()); }
+      catch { /* keep polling */ }
+    };
+    poll();
+    rsSweepTimer = setInterval(poll, 3000);
+  };
+});
