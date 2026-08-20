@@ -26,6 +26,30 @@ namespace ExoStudio.Research
     /// neighbour, needs the target pixel data and a centroid measurement, which this does not do.
     /// Roughly speaking that test is where most candidates die.
     /// </summary>
+
+    /// <summary>
+    /// Writes a double that is not a number as JSON null.
+    ///
+    /// These records are full of legitimately absent measurements: a centroid shift when the
+    /// provider supplied no centroid, an odd transit depth when no odd transit fell in the data.
+    /// The natural value for those in C# is NaN, and NaN has no JSON spelling. Serialising with
+    /// AllowNamedFloatingPointLiterals would emit a bare NaN token, which is not valid JSON and
+    /// which the reader on the other side then refuses, so the file would save and never load.
+    ///
+    /// null is what absent means, and every reader already understands it.
+    /// </summary>
+    internal sealed class NanAsNullConverter : System.Text.Json.Serialization.JsonConverter<double>
+    {
+        public override double Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions options)
+            => reader.TokenType == JsonTokenType.Null ? double.NaN : reader.GetDouble();
+
+        public override void Write(Utf8JsonWriter writer, double value, JsonSerializerOptions options)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value)) writer.WriteNullValue();
+            else writer.WriteNumberValue(value);
+        }
+    }
+
     public sealed class ResearchService
     {
         private readonly MastClient mast;
@@ -298,6 +322,13 @@ namespace ExoStudio.Research
                     detector = "Core/TransitDetector, box least squares, Kovacs et al. 2002",
                 },
                 lightCurve = Describe(raw, flat),
+
+                // THE CURVE ITSELF, not only what was measured from it. Without this a recorded
+                // run could be reopened and would show every number and no light curve, which is
+                // the one thing the page exists to let a person look at. Thinned the same way the
+                // live response is, so a record is about a hundred kilobytes rather than a
+                // megabyte, and a run stays something you can keep thousands of.
+                series = Series(flat),
                 result = found.Detected ? new
                 {
                     detected = true,
@@ -317,8 +348,9 @@ namespace ExoStudio.Research
             // record saved an empty vetting object and the exported dataset had blank columns
             // where the odd/even and secondary tests should be. A dataset silently missing its
             // most important columns is worse than one that fails to write.
-            File.WriteAllText(path, JsonSerializer.Serialize(record,
-                new JsonSerializerOptions { WriteIndented = true, IncludeFields = true }));
+            var options = new JsonSerializerOptions { WriteIndented = true, IncludeFields = true };
+            options.Converters.Add(new NanAsNullConverter());
+            File.WriteAllText(path, JsonSerializer.Serialize(record, options));
             return id;
         }
 
@@ -366,6 +398,121 @@ namespace ExoStudio.Research
             using JsonDocument d = JsonDocument.Parse(record);
             CtoiSubmission.Readiness readiness = CtoiSubmission.Assess(d.RootElement);
             return (readiness, readiness.Ready ? CtoiSubmission.Build(d.RootElement, submitter) : null);
+        }
+
+        /// <summary>
+        /// Searches a light curve ALREADY ON DISK, with no archive query at all.
+        ///
+        /// WHY THIS EXISTS. Every other path asks MAST what exists at a position before it can do
+        /// anything, and that query layer is a separate service from the one that serves files.
+        /// Measured during an outage: downloading a known file returned 200 and the catalogue of
+        /// stars answered fine, while the observation query returned "Cannot open database" and
+        /// the static manifests timed out. So the pipeline could still run and simply had no way
+        /// to be told what to run on.
+        ///
+        /// It is also the honest answer to wanting the data local: once a curve is on the disk it
+        /// belongs to you, and re-searching it with different periods or a different detrend
+        /// window costs nothing and needs nobody.
+        /// </summary>
+        public async Task<object> RunOnFileAsync(string path, Request request)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var log = new List<string>();
+            log.Add($"reading {Path.GetFileName(path)} from disk; no archive query");
+
+            TransitSearchPipeline.LightCurve raw = TransitSearchPipeline.Load(path);
+            log.Add($"{raw.Count:N0} usable cadences over {raw.BaselineDays:0.0} days at "
+                  + $"{raw.CadenceMinutes:0.#} minutes, scatter {raw.ScatterPpm:0} ppm");
+
+            TransitSearchPipeline.LightCurve flat =
+                TransitSearchPipeline.Detrend(raw, request.DetrendWindowDays);
+            List<FluxSample> samples = TransitSearchPipeline.ToSamples(flat);
+            DetectionResult found = TransitDetector.Detect(
+                samples, request.MinPeriodDays, request.MaxPeriodDays,
+                snrThreshold: request.SnrThreshold);
+            List<SingleTransitSearch.Event> singles = request.SingleTransits
+                ? SingleTransitSearch.Find(flat)
+                : new List<SingleTransitSearch.Event>();
+
+            TransitSearchPipeline.Vetting vetting =
+                found.Detected ? TransitSearchPipeline.Vet(flat, found) : null;
+
+            // The cross match lives on a different archive entirely, so it usually still answers
+            // when MAST does not. When it does not either, that is reported rather than hidden:
+            // a candidate nobody could check against the registers is not a candidate yet.
+            KnownObjects.Report registry = null;
+            if (request.RaDeg != 0 || request.DecDeg != 0)
+            {
+                registry = await known.LookUpAsync(request.RaDeg, request.DecDeg,
+                                                   found.Detected ? found.BestPeriodDays : 0);
+            }
+            else
+            {
+                log.Add("no position given, so nothing was cross matched: this run cannot tell you "
+                      + "whether what it found is already known.");
+            }
+
+            foreach (SingleTransitSearch.Event e in singles)
+                log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
+                      + $"{e.DepthPpm:0} ppm over {e.DurationHours:0.#} h, SNR {e.Snr:0.#}");
+            log.Add($"searched in {clock.Elapsed.TotalSeconds:0.0} s");
+
+            var product = new MastClient.LightCurveProduct
+            {
+                FileName = Path.GetFileName(path),
+                DataUri = "local:" + Path.GetFileName(path),
+                Sector = raw.Sector,
+                Provider = "local file",
+            };
+            string id = Save(request, product, raw, flat, found, vetting, registry, log, singles);
+
+            return new
+            {
+                ok = true,
+                detected = found.Detected,
+                id,
+                log,
+                lightCurve = Describe(raw, flat),
+                series = Series(flat),
+                singleTransits = singles.Select(Describe),
+                candidate = found.Detected ? new
+                {
+                    periodDays = found.BestPeriodDays, depthPpm = found.BestDepthPpm,
+                    depthUncertaintyPpm = found.DepthUncertaintyPpm,
+                    durationHours = found.BestDurationHours, phase = found.BestPhase01,
+                    snr = found.Snr, inTransitPoints = found.InTransitPointCount,
+                    radiusRatio = Math.Sqrt(Math.Max(0.0, found.BestDepthPpm) / 1e6),
+                } : null,
+                vetting = vetting == null ? null : new
+                {
+                    oddDepthPpm = vetting.OddDepthPpm, evenDepthPpm = vetting.EvenDepthPpm,
+                    oddEvenSigma = vetting.OddEvenDifferenceSigma,
+                    secondaryDepthPpm = vetting.SecondaryDepthPpm,
+                    secondarySigma = vetting.SecondarySignificanceSigma,
+                    secondaryRatio = vetting.SecondaryToPrimaryRatio,
+                    durationRatio = vetting.DurationRatio,
+                    concerns = vetting.Concerns, passed = !vetting.AnyConcern,
+                },
+                known = new
+                {
+                    anything = registry?.AnythingKnown ?? false,
+                    matches = (registry?.Matches ?? new List<KnownObjects.Match>()).Select(m => new
+                    {
+                        register = m.Register, name = m.Name, periodDays = m.PeriodDays,
+                        separationArcsec = m.SeparationArcsec, periodRatio = m.PeriodRatio, note = m.Note,
+                    }),
+                    unavailable = registry?.Unavailable ?? new List<string>(),
+                },
+                caveat = "A candidate, not a planet, and searched from a file already on disk.",
+            };
+        }
+
+        /// <summary>Light curves already downloaded, which can be searched with no archive at all.</summary>
+        public IEnumerable<object> CachedCurves(string cacheDir)
+        {
+            if (!Directory.Exists(cacheDir)) yield break;
+            foreach (string f in Directory.GetFiles(cacheDir, "*.fits").OrderBy(f => f))
+                yield return new { file = Path.GetFileName(f), path = f, bytes = new FileInfo(f).Length };
         }
 
         // ------------------------------------------------------------------ sweeps
@@ -468,8 +615,9 @@ namespace ExoStudio.Research
         /// </summary>
         private static Hit ScoreRun(object raw, MastClient.RegionTarget t)
         {
-            using JsonDocument d = JsonDocument.Parse(JsonSerializer.Serialize(raw,
-                new JsonSerializerOptions { IncludeFields = true }));
+            var scoreOptions = new JsonSerializerOptions { IncludeFields = true };
+            scoreOptions.Converters.Add(new NanAsNullConverter());
+            using JsonDocument d = JsonDocument.Parse(JsonSerializer.Serialize(raw, scoreOptions));
             JsonElement r = d.RootElement;
 
             if (!(r.TryGetProperty("ok", out JsonElement ok) && ok.ValueKind == JsonValueKind.True))

@@ -880,6 +880,36 @@ app.MapPost("/api/research/search", async (ExoStudio.Research.ResearchService.Re
     }
 });
 
+string lightCurveCache = Path.Combine(Path.GetTempPath(), "exostudio-lightcurves");
+
+// Curves already on the disk, and searching one without touching an archive. During a MAST
+// outage the file service and the star catalogue kept answering while the observation query did
+// not, so the pipeline could still run and simply had nothing to be pointed at.
+app.MapGet("/api/research/cached", () =>
+    Results.Json(research.Value.CachedCurves(lightCurveCache)));
+
+app.MapPost("/api/research/search-file", async (SearchFileRequest req) =>
+{
+    if (req == null || string.IsNullOrWhiteSpace(req.File))
+        return Results.BadRequest(new { error = "a file name from /api/research/cached is needed" });
+    // Confined to the cache directory: a path from the page must not be able to read the disk.
+    string path = Path.Combine(lightCurveCache, Path.GetFileName(req.File));
+    if (!System.IO.File.Exists(path)) return Results.NotFound(new { error = "not in the cache" });
+    try
+    {
+        return Results.Json(await research.Value.RunOnFileAsync(path,
+            new ExoStudio.Research.ResearchService.Request
+            {
+                RaDeg = req.RaDeg, DecDeg = req.DecDeg, Label = req.Label,
+                MinPeriodDays = req.MinPeriodDays > 0 ? req.MinPeriodDays : 1.0,
+                MaxPeriodDays = req.MaxPeriodDays > 0 ? req.MaxPeriodDays : 20.0,
+                DetrendWindowDays = req.DetrendWindowDays > 0 ? req.DetrendWindowDays : 1.0,
+                SnrThreshold = req.SnrThreshold > 0 ? req.SnrThreshold : 8.0,
+            }));
+    }
+    catch (Exception e) { return Results.Json(new { ok = false, stage = "read", message = e.Message }); }
+});
+
 app.MapGet("/api/research/runs", () => Results.Json(research.Value.List()));
 
 // A SWEEP runs the same search over every star in a field, which is the thing that actually finds
@@ -1252,6 +1282,10 @@ static string ResolveWebRoot(string contentRoot)
 
 
 record ReviewRequest(string Verdict, string Note, string Reviewer);
+
+record SearchFileRequest(string File, string Label, double RaDeg, double DecDeg,
+                         double MinPeriodDays, double MaxPeriodDays,
+                         double DetrendWindowDays, double SnrThreshold);
 
 record SweepRequest(double RaDeg, double DecDeg, double RadiusDeg, int MinSectors, int Limit,
                     double MinPeriodDays, double MaxPeriodDays, double DetrendWindowDays,

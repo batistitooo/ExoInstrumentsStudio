@@ -2512,12 +2512,17 @@ function rsDrawCurve(cv, points, opts = {}) {
     cv._rsObserver = new ResizeObserver(() => { if (cv._rsDraw) cv._rsDraw(); });
     cv._rsObserver.observe(cv);
   }
+  // setTimeout RATHER THAN requestAnimationFrame, and that is not a style choice.
+  // requestAnimationFrame does not fire at all while a tab is in the background, so a run opened
+  // in a tab the reader is not looking at would show every number and an empty chart, and would
+  // stay that way until they happened to focus it. A timer is throttled in the background but it
+  // still runs, so the chart is drawn and waiting when they arrive.
   let tries = 0;
   const attempt = () => {
     if (cv.clientWidth > 0) { cv._rsDraw(); return; }
-    if (++tries < 60) requestAnimationFrame(attempt);
+    if (++tries < 60) setTimeout(attempt, 50);
   };
-  requestAnimationFrame(attempt);
+  attempt();
 }
 
 function rsPaintCurve(cv, points, opts = {}) {
@@ -2564,16 +2569,75 @@ function rsPaintCurve(cv, points, opts = {}) {
   g.textAlign = 'left';
 }
 
+
+/**
+ * Opens a recorded run in the inspection panels.
+ *
+ * The stored record and the live response are NOT the same shape: the record is serialised from
+ * the C# objects with their field names, the response is the camel cased view the page reads. This
+ * translates one into the other in ONE place, because there are two lists that open runs and
+ * having each do its own translation is how one of them ends up showing a blank chart.
+ */
+async function rsOpenRun(id) {
+  const d = await (await fetch(`/api/research/runs/${id}`)).json();
+  const num = (v) => (typeof v === 'number' ? v : NaN);
+  renderResearch({
+    ok: true,
+    detected: !!(d.result && d.result.detected),
+    id: d.id,
+    log: d.log || [],
+    lightCurve: d.lightCurve || {},
+    series: d.series || null,
+    singleTransits: (d.singleTransits || []).map((x) => ({
+      centreTimeDays: x.CentreTimeDays, durationHours: x.DurationHours,
+      depthPpm: x.DepthPpm, snr: x.Snr, pointsInDip: x.PointsInDip,
+      centroidShiftPixels: num(x.CentroidShiftPixels), concerns: x.Concerns || [],
+      passed: !(x.Concerns || []).length,
+    })),
+    candidate: d.result && d.result.detected ? {
+      periodDays: d.result.BestPeriodDays, depthPpm: d.result.BestDepthPpm,
+      depthUncertaintyPpm: 0, durationHours: d.result.BestDurationHours,
+      phase: d.result.BestPhase01, snr: d.result.Snr,
+      inTransitPoints: d.result.InTransitPointCount,
+      radiusRatio: Math.sqrt(Math.max(0, d.result.BestDepthPpm) / 1e6),
+    } : null,
+    vetting: d.vetting ? {
+      oddDepthPpm: d.vetting.OddDepthPpm, evenDepthPpm: d.vetting.EvenDepthPpm,
+      oddEvenSigma: d.vetting.OddEvenDifferenceSigma,
+      secondaryDepthPpm: d.vetting.SecondaryDepthPpm,
+      secondarySigma: d.vetting.SecondarySignificanceSigma,
+      secondaryRatio: d.vetting.SecondaryToPrimaryRatio,
+      durationRatio: d.vetting.DurationRatio,
+      concerns: d.vetting.Concerns || [], passed: !(d.vetting.Concerns || []).length,
+    } : { concerns: [], passed: true },
+    known: {
+      anything: !!(d.known || []).length,
+      matches: (d.known || []).map((m) => ({
+        register: m.Register, name: m.Name, periodDays: m.PeriodDays,
+        separationArcsec: m.SeparationArcsec, periodRatio: m.PeriodRatio, note: m.Note,
+      })),
+      unavailable: [],
+    },
+    caveat: 'Reopened from the recorded run. A candidate, not a planet.',
+  });
+  $('rsCurvePanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 async function loadResearchRuns() {
   const box = $('rsRuns');
   if (!box) return;
   try {
     const runs = await (await fetch('/api/research/runs')).json();
     box.innerHTML = runs.length
-      ? runs.map((r) => `<a class="rsRun ${r.detected ? 'hit' : 'null'}" href="/api/research/runs/${r.id}" target="_blank">` +
+      ? runs.map((r) => `<a class="rsRun ${r.detected ? 'hit' : 'null'}" href="#" data-run="${r.id}">` +
           `<b>${r.label || '(unnamed)'}</b><span>${r.detected ? 'candidate' : 'nothing above threshold'}</span>` +
           `<time>${(r.recordedUtc || '').replace('T', ' ').slice(0, 16)}</time></a>`).join('')
       : '<p class="hint dim">No runs yet.</p>';
+    // Opens it in the panels. It used to link straight at the stored JSON, which showed a page of
+    // raw record instead of the light curve the whole tab exists to look at.
+    for (const a of box.querySelectorAll('a[data-run]')) {
+      a.onclick = (e) => { e.preventDefault(); rsOpenRun(a.dataset.run); };
+    }
   } catch {
     box.innerHTML = '<p class="hint dim">Could not read the run list.</p>';
   }
@@ -2888,48 +2952,8 @@ function rsRenderSweep(s) {
           'every star is recorded, so the field is now searched rather than unknown.</p>'
         : '<p class="hint dim">Nothing yet.</p>');
 
-  for (const a of document.querySelectorAll('#rsSweepList a')) {
-    a.onclick = async (e) => {
-      e.preventDefault();
-      const d = await (await fetch(`/api/research/runs/${a.dataset.run}`)).json();
-      // The stored record and the live response differ in shape; normalise enough to inspect it.
-      renderResearch({
-        ok: true,
-        detected: !!(d.result && d.result.detected),
-        id: d.id,
-        log: d.log || [],
-        lightCurve: d.lightCurve || {},
-        series: d.series || null,
-        singleTransits: (d.singleTransits || []).map((x) => ({
-          centreTimeDays: x.CentreTimeDays, durationHours: x.DurationHours,
-          depthPpm: x.DepthPpm, snr: x.Snr, pointsInDip: x.PointsInDip,
-          centroidShiftPixels: x.CentroidShiftPixels, concerns: x.Concerns || [],
-          passed: !(x.Concerns || []).length,
-        })),
-        candidate: d.result && d.result.detected ? {
-          periodDays: d.result.BestPeriodDays, depthPpm: d.result.BestDepthPpm,
-          depthUncertaintyPpm: 0, durationHours: d.result.BestDurationHours,
-          phase: d.result.BestPhase01, snr: d.result.Snr,
-          inTransitPoints: d.result.InTransitPointCount,
-          radiusRatio: Math.sqrt(Math.max(0, d.result.BestDepthPpm) / 1e6),
-        } : null,
-        vetting: d.vetting ? {
-          oddDepthPpm: d.vetting.OddDepthPpm, evenDepthPpm: d.vetting.EvenDepthPpm,
-          oddEvenSigma: d.vetting.OddEvenDifferenceSigma,
-          secondaryDepthPpm: d.vetting.SecondaryDepthPpm,
-          secondarySigma: d.vetting.SecondarySignificanceSigma,
-          secondaryRatio: d.vetting.SecondaryToPrimaryRatio,
-          durationRatio: d.vetting.DurationRatio,
-          concerns: d.vetting.Concerns || [], passed: !(d.vetting.Concerns || []).length,
-        } : { concerns: [], passed: true },
-        known: { anything: !!(d.known || []).length, matches: (d.known || []).map((m) => ({
-          register: m.Register, name: m.Name, periodDays: m.PeriodDays,
-          separationArcsec: m.SeparationArcsec, periodRatio: m.PeriodRatio, note: m.Note,
-        })), unavailable: [] },
-        caveat: 'A candidate, not a planet. Reopened from the recorded run.',
-      });
-      $('rsResultPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    };
+  for (const a of document.querySelectorAll('#rsSweepList a[data-run]')) {
+    a.onclick = (e) => { e.preventDefault(); rsOpenRun(a.dataset.run); };
   }
 
   if (s.state === 'done' || s.state === 'failed' || s.state === 'empty') {
