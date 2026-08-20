@@ -99,6 +99,7 @@ namespace ExoStudio.Research
                 {
                     ok = true, detected = false, id = emptyId, log,
                     lightCurve = Describe(raw, flat),
+                    series = Series(flat),
                     message = "Nothing above threshold. That is a real result about this star over this "
                             + "baseline, not a failure, and it is saved as one.",
                 };
@@ -125,6 +126,7 @@ namespace ExoStudio.Research
                 id,
                 log,
                 lightCurve = Describe(raw, flat),
+                series = Series(flat),
                 candidate = new
                 {
                     periodDays = found.BestPeriodDays,
@@ -162,6 +164,22 @@ namespace ExoStudio.Research
                        + "dip belongs to this star or to a blended neighbour, needs target pixel data "
                        + "and is not done here.",
             };
+        }
+
+
+        /// <summary>
+        /// The detrended curve, thinned for drawing. A sector is fifteen thousand cadences and a
+        /// chart is a thousand pixels wide, so sending all of them costs bandwidth to draw the
+        /// same picture. Thinned by STRIDE rather than by averaging, because averaging a transit
+        /// with its neighbours is exactly the shape being looked for and would flatten it.
+        /// </summary>
+        private static double[][] Series(TransitSearchPipeline.LightCurve flat, int maxPoints = 4000)
+        {
+            int stride = Math.Max(1, flat.Count / maxPoints);
+            var outp = new List<double[]>(flat.Count / stride + 1);
+            for (int i = 0; i < flat.Count; i += stride)
+                outp.Add(new[] { flat.TimeDays[i], flat.Flux[i] });
+            return outp.ToArray();
         }
 
         private static object Describe(TransitSearchPipeline.LightCurve raw,
