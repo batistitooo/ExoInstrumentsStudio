@@ -133,7 +133,8 @@ namespace ExoStudio.Simulation
 
         public string Describe() =>
             IsAllSky
-                ? $"all sky, {Count:N0} stars"
+                ? $"{Name}, all sky, {Count:N0} stars"
+                  + (double.IsNaN(GaiaGLimit) ? "" : $", cut at G < {GaiaGLimit:0.##}")
                 : $"{Name}, {Count:N0} stars over {RadiusDeg:0.###} deg at "
                   + $"{CentreRaDeg:0.####} {CentreDecDeg:+0.####;-0.####}"
                   + (double.IsNaN(GaiaGLimit) ? "" : $", cut at G < {GaiaGLimit:0.##}");
@@ -175,7 +176,7 @@ namespace ExoStudio.Simulation
             {
                 Catalog = catalog,
                 Path = path,
-                Name = "all sky",
+                Name = System.IO.Path.GetFileNameWithoutExtension(path) ?? "all sky",
                 IsAllSky = true,
                 GaiaGLimit = double.NaN,
             };
@@ -219,7 +220,30 @@ namespace ExoStudio.Simulation
                 string line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith("#")) continue;
 
-                string[] f = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+                string[] f = Tokenise(line);
+
+                // A DEEP CATALOGUE COVERING THE WHOLE SKY, which is what makes patches
+                // unnecessary rather than merely safe. Gaia DR3 entire is 25.3 GB in this format,
+                // which a disk holds and a memory mapped reader does not have to; see
+                // tools/build_allsky_catalog.py. Declared separately from the base rather than
+                // replacing it, for one practical reason: the sky chart streams its catalogue in
+                // full on every render, and 25 GB per chart is not a chart. The base stays the
+                // chart's, the deep file serves the frames, and no field has an edge.
+                if (string.Equals(f[0], "deep", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (f.Length < 2)
+                    {
+                        Report.Add($"WARNING, patch manifest line {lineNumber}: "
+                                 + "'deep' wants a file and optionally its Gaia G cut; ignored.");
+                        continue;
+                    }
+                    double deepLimit = f.Length >= 3 && TryDeg(f[2], out double dl) ? dl : double.NaN;
+                    string deepPath = System.IO.Path.IsPathRooted(f[1])
+                        ? f[1]
+                        : System.IO.Path.Combine(System.IO.Path.GetDirectoryName(manifest) ?? ".", f[1]);
+                    LoadDeepAllSky(deepPath, f[1], deepLimit);
+                    continue;
+                }
 
                 if (string.Equals(f[0], "allsky", StringComparison.OrdinalIgnoreCase))
                 {
@@ -387,6 +411,135 @@ namespace ExoStudio.Simulation
         }
 
         /// <summary>
+        /// Registers a deep catalogue covering the whole sky, so every pointing gets its depth
+        /// and no frame has a boundary to fall off.
+        ///
+        /// VALIDATED DIFFERENTLY FROM A PATCH, because the checks a patch gets do not scale. A
+        /// patch is megabytes, so it is read back entirely: every record's band verified against
+        /// its declination, every star of the base found inside it. This file is tens of
+        /// gigabytes. Reading it at startup would undo the whole point of mapping it, and would
+        /// put minutes in front of the first frame.
+        ///
+        /// So the exhaustive pass happens ONCE, where it belongs, in the builder: it verifies
+        /// every record is reachable before it will write the file at all. What is left here is
+        /// the cheap shape test on the index, and a sample of the base's stars rather than all of
+        /// them. A file that is systematically wrong fails the sample; one wrong in a single
+        /// record will not, and that is the honest limit of a check that has to be instant.
+        /// </summary>
+        private void LoadDeepAllSky(string path, string declared, double gaiaGLimit)
+        {
+            if (!File.Exists(path))
+            {
+                Report.Add($"WARNING, deep all sky catalogue {declared}: not found at {path}; ignored.");
+                return;
+            }
+
+            var catalog = new RenderedStarCatalog();
+            try
+            {
+                catalog.Load(path);
+            }
+            catch (Exception e)
+            {
+                Report.Add($"WARNING, deep all sky catalogue {declared}: failed to load ({e.Message}); ignored.");
+                return;
+            }
+            if (catalog.Count == 0)
+            {
+                Report.Add($"WARNING, deep all sky catalogue {declared}: holds no stars; ignored.");
+                catalog.Dispose();
+                return;
+            }
+
+            string shape = Data.GaiaCatalogReader.ValidateBandIndex(path);
+            if (shape != null)
+            {
+                Report.Add($"WARNING, deep all sky catalogue {declared}: {shape} Ignored.");
+                catalog.Dispose();
+                return;
+            }
+
+            var layer = new StarFieldLayer
+            {
+                Catalog = catalog,
+                Path = path,
+                Name = System.IO.Path.GetFileNameWithoutExtension(path),
+                IsAllSky = true,
+                GaiaGLimit = gaiaGLimit,
+            };
+
+            // A deeper catalogue over the same sky holds strictly more stars. If it does not, the
+            // manifest is describing something other than the file, and believing the label would
+            // quietly serve every field from the shallower of the two. Cheap, and it catches the
+            // one mistake a hand edited manifest can make that nothing else here would notice.
+            if (AllSky != null && AllSky.Count > 0 && layer.Count <= AllSky.Count)
+            {
+                Report.Add($"WARNING, deep all sky catalogue {declared}: it holds {layer.Count:N0} "
+                         + $"stars against the all sky catalogue's {AllSky.Count:N0}, so it cannot "
+                         + "be the deeper of the two whatever the manifest says; ignored.");
+                catalog.Dispose();
+                return;
+            }
+
+            string sampled = DeepSampleFault(layer);
+            if (sampled != null)
+            {
+                Report.Add($"WARNING, deep all sky catalogue {declared}: {sampled}");
+                catalog.Dispose();
+                return;
+            }
+
+            Patches.Add(layer);
+            Report.Add($"deep all sky catalogue: {layer.Name}, {layer.Count:N0} stars"
+                     + (double.IsNaN(gaiaGLimit) ? "" : $", cut at G < {gaiaGLimit:0.##}")
+                     + ". Every field is served at this depth; no patch has an edge to fall off.");
+        }
+
+        /// <summary>
+        /// Spot check: a bounded number of the base's own stars, spread over the sky, must be
+        /// present in the deep file. Enough to catch a file that is empty, truncated, badly
+        /// indexed or built from the wrong data, without reading it all.
+        /// </summary>
+        private string DeepSampleFault(StarFieldLayer deep)
+        {
+            if (AllSky?.Catalog == null || !AllSky.Catalog.IsLoaded) return null;
+
+            const int cones = 24, perCone = 40;
+            var reference = new List<RenderedStar>();
+            var found = new List<RenderedStar>();
+            int checkedStars = 0, missing = 0;
+
+            for (int i = 0; i < cones; i++)
+            {
+                // Spread over the sphere rather than over a latitude grid, so the sample is not
+                // concentrated at the poles.
+                double z = 1.0 - 2.0 * (i + 0.5) / cones;
+                double dec = Math.Asin(z) * 180.0 / Math.PI;
+                double ra = 360.0 * ((i * 0.61803398875) % 1.0);
+
+                reference.Clear();
+                AllSky.Catalog.Search(ra, dec, 0.5, double.MaxValue, reference);
+                for (int j = 0; j < reference.Count && j < perCone; j++)
+                {
+                    RenderedStar b = reference[j];
+                    found.Clear();
+                    deep.Catalog.Search(b.RaDeg, b.DecDeg, MatchRadiusDeg, double.MaxValue, found);
+                    checkedStars++;
+                    bool matched = false;
+                    foreach (RenderedStar p in found)
+                        if (Math.Abs(p.VMag - b.VMag) <= MatchMagTolerance) { matched = true; break; }
+                    if (!matched) missing++;
+                }
+            }
+
+            if (checkedStars == 0 || missing == 0) return null;
+            return $"a sample of {checkedStars:N0} stars taken from the all sky catalogue across "
+                 + $"{cones} fields found {missing:N0} of them absent from it. A deeper catalogue "
+                 + "should contain every star a shallower one has, so this file is not what it "
+                 + "claims; ignored.";
+        }
+
+        /// <summary>
         /// Checks that a patch does not LOSE stars the all-sky catalogue already had, and names
         /// the problem if it does. Null when the patch is a clean gain.
         ///
@@ -469,6 +622,34 @@ namespace ExoStudio.Simulation
 
         private static double Depth(StarFieldLayer l) =>
             l == null || double.IsNaN(l.GaiaGLimit) ? double.NegativeInfinity : l.GaiaGLimit;
+
+        /// <summary>
+        /// Splits a manifest line on whitespace, except inside double quotes.
+        ///
+        /// Quoting is here because the obvious place to keep these files is beside the rest of
+        /// the deep sky data, and on this platform that path is "Library/Application Support/...",
+        /// which has a space in it. A plain split turned that into a file called
+        /// "/Users/name/Library/Application" and reported it missing, which is a confusing way to
+        /// learn that your directory has a space in its name.
+        /// </summary>
+        private static string[] Tokenise(string line)
+        {
+            var tokens = new List<string>();
+            var current = new System.Text.StringBuilder();
+            bool quoted = false;
+            foreach (char c in line)
+            {
+                if (c == '"') { quoted = !quoted; continue; }
+                if (!quoted && char.IsWhiteSpace(c))
+                {
+                    if (current.Length > 0) { tokens.Add(current.ToString()); current.Clear(); }
+                    continue;
+                }
+                current.Append(c);
+            }
+            if (current.Length > 0) tokens.Add(current.ToString());
+            return tokens.ToArray();
+        }
 
         private static bool TryDeg(string s, out double v) =>
             double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v);

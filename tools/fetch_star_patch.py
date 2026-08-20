@@ -286,7 +286,10 @@ def main():
     os.replace(tmp, target)
     shutil.rmtree(cache, ignore_errors=True)
 
-    entries[filename] = (f"{filename}  {args.ra:.6f}  {args.dec:+.6f}  "
+    # Quoted when it has to be: the manifest splits on whitespace unless quoted, and the
+    # natural home for these files is a path with a space in it.
+    written = f'"{filename}"' if " " in filename else filename
+    entries[filename] = (f"{written}  {args.ra:.6f}  {args.dec:+.6f}  "
                          f"{args.radius:g}  {args.gmax:g}")
     write_manifest(manifest, entries, allsky)
 
