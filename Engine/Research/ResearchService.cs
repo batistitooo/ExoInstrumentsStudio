@@ -308,6 +308,52 @@ namespace ExoStudio.Research
             return id;
         }
 
+
+        /// <summary>
+        /// Records what a person concluded after looking at the light curve, against the run.
+        ///
+        /// THIS IS THE STEP THE WHOLE PAGE EXISTS FOR. An automated candidate is what the mission
+        /// pipeline already produces by the thousand; the reason community submissions are worth
+        /// anything is that somebody looked. So the verdict is stored as its own part of the
+        /// record, with who made it and when, and nothing can be submitted without one.
+        /// </summary>
+        public bool Review(string id, string verdict, string note, string reviewer)
+        {
+            string path = Path.Combine(resultsDir, Path.GetFileName(id) + ".json");
+            if (!File.Exists(path)) return false;
+
+            var allowed = new[] { "real", "unsure", "noise", "systematic", "eclipsing-binary" };
+            if (!allowed.Contains(verdict)) return false;
+
+            using JsonDocument d = JsonDocument.Parse(File.ReadAllText(path));
+            var root = new Dictionary<string, object>();
+            foreach (JsonProperty p in d.RootElement.EnumerateObject())
+            {
+                if (p.Name == "review") continue;
+                root[p.Name] = JsonSerializer.Deserialize<object>(p.Value.GetRawText());
+            }
+            root["review"] = new
+            {
+                Verdict = verdict,
+                Note = note ?? "",
+                Reviewer = string.IsNullOrWhiteSpace(reviewer) ? "unnamed" : reviewer,
+                WhenUtc = DateTime.UtcNow.ToString("o"),
+            };
+            File.WriteAllText(path, JsonSerializer.Serialize(root,
+                new JsonSerializerOptions { WriteIndented = true, IncludeFields = true }));
+            return true;
+        }
+
+        /// <summary>Whether a run is fit to submit, and the CTOI file if it is.</summary>
+        public (CtoiSubmission.Readiness readiness, string file) Ctoi(string id, string submitter)
+        {
+            string record = ReadRecord(id);
+            if (record == null) return (null, null);
+            using JsonDocument d = JsonDocument.Parse(record);
+            CtoiSubmission.Readiness readiness = CtoiSubmission.Assess(d.RootElement);
+            return (readiness, readiness.Ready ? CtoiSubmission.Build(d.RootElement, submitter) : null);
+        }
+
         public IEnumerable<object> List()
         {
             foreach (string path in Directory.GetFiles(resultsDir, "*.json")
