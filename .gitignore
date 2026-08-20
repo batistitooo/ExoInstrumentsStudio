@@ -37,3 +37,7 @@ validation/*.out
 validation/**/exo_*.csv
 validation/**/.skyfield-data/
 validation/**/*.png
+
+# Research records: your results, not source. Export them deliberately.
+# Anchored to the root: a bare 'research/' also matched Engine/Research, which is source.
+/research/

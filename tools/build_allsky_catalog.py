@@ -173,17 +173,33 @@ def process_one(args):
     path = os.path.join(work_dir, name)
 
     if not (os.path.exists(path) and os.path.getsize(path) == entry["size"]):
+        # RETRIED, because a run this long meets transient failures with certainty. Measured: a
+        # bare ConnectionResetError from the CDN killed the whole pool 182 files into a 3,386 file
+        # run, losing nothing on disk but stopping unattended progress dead. A reset is not a
+        # reason to abandon 6 hours of work, and a short file is caught by the size check anyway.
         partial = path + ".part"
-        with urllib.request.urlopen(f"{gaia_bulk.CDN_BASE}/{entry['key']}", timeout=600) as r, \
-                open(partial, "wb") as out:
-            while True:
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                out.write(chunk)
-        if os.path.getsize(partial) != entry["size"]:
-            os.remove(partial)
-            raise RuntimeError(f"{name}: short download")
+        last = None
+        for attempt in range(6):
+            try:
+                with urllib.request.urlopen(f"{gaia_bulk.CDN_BASE}/{entry['key']}", timeout=600) as r, \
+                        open(partial, "wb") as out:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                if os.path.getsize(partial) != entry["size"]:
+                    raise RuntimeError(f"{name}: got {os.path.getsize(partial)} of {entry['size']} bytes")
+                break
+            except Exception as e:
+                last = e
+                try:
+                    os.remove(partial)
+                except OSError:
+                    pass
+                if attempt == 5:
+                    raise RuntimeError(f"{name}: {last} after 6 attempts")
+                time.sleep(5 * (attempt + 1))
         os.replace(partial, path)
 
     pg = packer()
