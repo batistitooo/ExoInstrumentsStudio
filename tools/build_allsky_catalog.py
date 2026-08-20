@@ -24,9 +24,13 @@ WHAT IT COSTS
 Measured on a real file: 571,690 rows in 10 s of one core, 8 MB of packed records from a 246 MB
 source. Extrapolated over the release:
 
-    output                  25.3 GB
+    GaiaAllSky.starcat      25.3 GB   positions, V, B minus V, reddening
+    GaiaAllSky.starcat.pm    7.2 GB   proper motion, to carry J2016.0 forward to the real date
+    GaiaAllSky.starcat.id   14.5 GB   source_id, the join key to every other Gaia product
+    GaiaAllSky.starcat.ap   10.9 GB   parallax and temperature, which give a stellar radius
+    total                   58 GB
     conversion, 8 cores     about 1 hour
-    download at 6 MB/s      about 35 hours   <- the wall
+    download                753 GB    <- the wall, and it is transfer, not storage
 
 The download is the whole cost. Everything else overlaps with it. It resumes, so it does not have
 to happen in one sitting.
@@ -80,6 +84,50 @@ BAND_WIDTH = struct.unpack("<f", struct.pack("<f", 0.1))[0]
 BAND_COUNT = 1800
 RECORD = struct.Struct("<IiHhH")
 RECORD_BYTES = RECORD.size
+
+# The bucket record carries PROPER MOTION alongside the packed star, and the two are split apart
+# again at assembly. Gaia positions are at epoch J2016.0; Studio renders at real dates, already a
+# decade later, so a star that moves is in the wrong place unless it is carried forward. Measured
+# on real DR3 data, the drift to 2026 is 0.17 px for a median star on the RC20 and 4.1 px at the
+# 99.9th percentile, which is small; on SPHERE at 3.6 mas/px the MEDIAN star is 12.6 px out and
+# the tail runs past 300. The packer drops proper motions deliberately, but its reasoning is about
+# in-game years in KSP rather than real epochs at a milliarcsecond plate scale.
+#
+# Stored as two int16 in mas/yr. That spans +/- 32.8 arcsec/yr against a largest known proper
+# motion near 10.4 (Barnard's Star), and 1 mas/yr of granularity is 0.05 arcsec after fifty years,
+# a fifth of an RC20 pixel. Four bytes per star, 7.2 GB over the whole sky.
+# source_id rides along too, and it is the most valuable eight bytes here.
+#
+# It is Gaia's primary key, and every other product in the release is keyed on it: radius_gspphot
+# and mass_flame in astrophysical_parameters (which transits need and gaia_source does not carry),
+# nss_two_body_orbit's measured orbits, vari_eclipsing_binary. Those tables are small, 167 MB and
+# 350 MB, and joining them later costs nothing IF the key is here. Without it the only way back is
+# positional cross matching, or fetching all 753 GB of gaia_source a second time.
+#
+# 14.5 GB over the whole sky, in its own sidecar so it can be deleted once whatever join it was
+# kept for has been done.
+# PARALLAX AND TEMPERATURE, the pair that makes transits possible without another download.
+#
+# A transit depth is (Rp/Rs)^2, so it needs a STELLAR RADIUS, and gaia_source does not carry one:
+# radius_gspphot lives in astrophysical_parameters, a separate 256 GB. But radius follows from
+# luminosity and temperature by Stefan Boltzmann, and luminosity follows from apparent magnitude
+# and distance. Parallax gives the distance. So parallax plus teff plus the magnitude already
+# here is a complete route to a radius for every star that has them.
+#
+# Parallax matters more than the rest because it exists ONLY in gaia_source. Temperature can also
+# be joined later through source_id, and Studio can already invert B minus V for one, but Gaia's
+# own fit is better than a colour inversion that is degenerate with reddening, and it costs two
+# bytes.
+#
+# float32 for parallax, NaN where unmeasured; uint16 kelvin for temperature, zero where unfitted.
+BUCKET_RECORD = struct.Struct("<IiHhHhhQfH")
+BUCKET_RECORD_BYTES = BUCKET_RECORD.size
+PM_RECORD = struct.Struct("<hh")
+PM_RECORD_BYTES = PM_RECORD.size
+ID_RECORD_BYTES = 8
+AP_RECORD = struct.Struct("<fH")
+AP_RECORD_BYTES = AP_RECORD.size
+PM_MAX = 32767
 MAGIC = b"EXOSTAR1"
 VERSION = 3
 DEC_DEG_PER_UNIT = 180.0 / 4294967296.0
@@ -149,7 +197,10 @@ def process_one(args):
             if cols is None:
                 cols = line.rstrip("\n").split(",")
                 idx = [cols.index(c) for c in gaia_bulk.WANTED]
-                need = max(idx) + 1
+                pm_idx = [cols.index("pmra"), cols.index("pmdec")]
+                id_idx = cols.index("source_id")
+                ap_idx = [cols.index("parallax"), cols.index("teff_gspphot")]
+                need = max(idx + pm_idx + [id_idx] + ap_idx) + 1
                 continue
             f = line.split(",")
             if len(f) < need:
@@ -166,8 +217,34 @@ def process_one(args):
             # Banded on the DECODED declination, the value the reader itself bands by, so a star
             # on a boundary cannot be sorted one way and searched the other.
             b = band_of(star.dec_fixed * DEC_DEG_PER_UNIT)
+
+            # Missing proper motion is stored as zero, which is also what "not measured" renders
+            # as: the star simply stays where the catalogue put it. 11 percent of sources have no
+            # solution, and inventing a motion for them would be worse than leaving them still.
+            def pm(j):
+                v = f[pm_idx[j]]
+                if not v or v == "null":
+                    return 0
+                k = int(round(float(v)))
+                return PM_MAX if k > PM_MAX else (-PM_MAX if k < -PM_MAX else k)
+
+            try:
+                source_id = int(f[id_idx])
+            except ValueError:
+                source_id = 0
+
+            pv = f[ap_idx[0]]
+            parallax = float(pv) if pv and pv != "null" else float("nan")
+            tv = f[ap_idx[1]]
+            teff = 0
+            if tv and tv != "null":
+                k = int(round(float(tv)))
+                teff = 65535 if k > 65535 else (0 if k < 0 else k)
+
             buckets.setdefault(b, bytearray()).extend(
-                RECORD.pack(star.ra_fixed, star.dec_fixed, star.v_milli, star.bv_milli, star.ebv_milli))
+                BUCKET_RECORD.pack(star.ra_fixed, star.dec_fixed, star.v_milli,
+                                   star.bv_milli, star.ebv_milli, pm(0), pm(1),
+                                   source_id, parallax, teff))
 
     if not keep:
         os.remove(path)
@@ -251,7 +328,7 @@ def assemble(buckets, out_path, expected):
     counts = []
     for band in range(BAND_COUNT):
         p = buckets.path(band)
-        counts.append(os.path.getsize(p) // RECORD_BYTES if os.path.exists(p) else 0)
+        counts.append(os.path.getsize(p) // BUCKET_RECORD_BYTES if os.path.exists(p) else 0)
     total = sum(counts)
     if total != expected:
         raise SystemExit(f"the buckets hold {total:,} records but {expected:,} were packed")
@@ -262,24 +339,62 @@ def assemble(buckets, out_path, expected):
         running += counts[b]
     start[BAND_COUNT] = running
 
+    # The catalogue and its proper motions are written in ONE pass, from the same sorted order,
+    # because the sidecar is positional: record i of the .pm file belongs to star i of the
+    # catalogue. Writing them separately would be two chances to disagree.
     tmp = out_path + ".partial"
-    with open(tmp, "wb") as out:
+    pm_path = out_path + ".pm"
+    pm_tmp = pm_path + ".partial"
+    id_path = out_path + ".id"
+    id_tmp = id_path + ".partial"
+    ap_path = out_path + ".ap"
+    ap_tmp = ap_path + ".partial"
+    with open(tmp, "wb") as out, open(pm_tmp, "wb") as pm_out, \
+            open(id_tmp, "wb") as id_out, open(ap_tmp, "wb") as ap_out:
         out.write(MAGIC)
         out.write(struct.pack("<iii", VERSION, total, BAND_COUNT))
         out.write(struct.pack("<f", BAND_WIDTH))
         out.write(struct.pack(f"<{BAND_COUNT + 1}I", *start))
+
+        # The sidecar names the file it belongs to by star count and band width, so a mismatched
+        # pair is caught rather than silently shifting every star by one record.
+        pm_out.write(b"EXOSTPM1")
+        pm_out.write(struct.pack("<iii", 1, total, BAND_COUNT))
+        pm_out.write(struct.pack("<f", BAND_WIDTH))
+        id_out.write(b"EXOSTID1")
+        id_out.write(struct.pack("<iii", 1, total, BAND_COUNT))
+        id_out.write(struct.pack("<f", BAND_WIDTH))
+        ap_out.write(b"EXOSTAP1")
+        ap_out.write(struct.pack("<iii", 1, total, BAND_COUNT))
+        ap_out.write(struct.pack("<f", BAND_WIDTH))
+
         for band in range(BAND_COUNT):
             p = buckets.path(band)
             if not os.path.exists(p):
                 continue
             blob = open(p, "rb").read()
-            records = [blob[i:i + RECORD_BYTES] for i in range(0, len(blob), RECORD_BYTES)]
+            records = [blob[i:i + BUCKET_RECORD_BYTES]
+                       for i in range(0, len(blob), BUCKET_RECORD_BYTES)]
             # Right ascension ascending inside the band: the order the binary search needs.
-            records.sort(key=lambda r: r[:4])
-            out.write(b"".join(records))
+            #
+            # Sorted on the DECODED integer, not on the raw bytes. Right ascension is a little
+            # endian uint32, so comparing its bytes lexicographically compares the low byte first
+            # and produces an order that is not numeric at all. The verification pass below caught
+            # exactly that: 521,154 of 1,045,237 records out of order on the first assembly.
+            records.sort(key=lambda r: struct.unpack_from("<I", r)[0])
+            out.write(b"".join(r[:RECORD_BYTES] for r in records))
+            pm0 = RECORD_BYTES
+            id0 = pm0 + PM_RECORD_BYTES
+            ap0 = id0 + ID_RECORD_BYTES
+            pm_out.write(b"".join(r[pm0:id0] for r in records))
+            id_out.write(b"".join(r[id0:ap0] for r in records))
+            ap_out.write(b"".join(r[ap0:] for r in records))
             os.remove(p)
             if band % 200 == 0:
                 print(f"    assembling, band {band}/{BAND_COUNT}", flush=True)
+    os.replace(ap_tmp, ap_path)
+    os.replace(id_tmp, id_path)
+    os.replace(pm_tmp, pm_path)
     os.replace(tmp, out_path)
     return total
 
@@ -319,7 +434,7 @@ def main():
     # scratch and left 16 MB of packed records behind.
     #
     # Checked here because running out of room 30 hours in is a bad way to find out.
-    expected_out = 1.81e9 * RECORD_BYTES
+    expected_out = 1.81e9 * BUCKET_RECORD_BYTES
     in_flight = args.jobs * 250e6 * (1 if not args.keep_downloads else 0)
     hoard = sum(e["size"] for e in index) if args.keep_downloads else 0
     need = expected_out * 1.15 + in_flight + hoard
@@ -347,7 +462,7 @@ def main():
     print(f"  {len(todo):,} source files to read, {sum(e['size'] for e in todo)/1e9:.0f} GB to fetch")
 
     packed = sum(os.path.getsize(buckets.path(b)) for b in range(BAND_COUNT)
-                 if os.path.exists(buckets.path(b))) // RECORD_BYTES
+                 if os.path.exists(buckets.path(b))) // BUCKET_RECORD_BYTES
     started = time.time()
     read_bytes = 0
 
@@ -357,7 +472,7 @@ def main():
             for i, (key, rows, grouped) in enumerate(
                     pool.imap_unordered(process_one, work_args, chunksize=1), 1):
                 buckets.write(grouped)
-                packed += sum(len(v) for v in grouped.values()) // RECORD_BYTES
+                packed += sum(len(v) for v in grouped.values()) // BUCKET_RECORD_BYTES
                 done.add(key)
                 read_bytes += next(e["size"] for e in index if e["key"] == key)
                 buckets.save_state(done)

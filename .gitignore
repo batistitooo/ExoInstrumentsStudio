@@ -20,6 +20,9 @@ data/*.cache/
 data/GaiaPatches.manifest
 # Bulk Gaia files, downloaded on demand and reused; gigabytes, and rebuildable.
 tools/gaia_bulk_cache/
+# The all sky build's scratch: per band buckets and in flight source files, tens of GB,
+# and it deletes itself as it assembles.
+data/*.building/
 
 # Frames and their reductions, which are output, not source.
 captures/
