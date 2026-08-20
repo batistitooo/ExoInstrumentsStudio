@@ -48,6 +48,12 @@ namespace ExoStudio.Research
             public string FileName { get; init; }
             public string DataUri { get; init; }
             public long SizeBytes { get; init; }
+
+            /// <summary>Who produced it: the mission's own SPOC, or one of the full frame extractions.</summary>
+            public string Provider { get; init; }
+
+            /// <summary>True for the mission's two minute products, false for a full frame extraction.</summary>
+            public bool IsMissionProduct { get; init; }
         }
 
         private async Task<JsonElement> InvokeAsync(string service, object parameters)
@@ -83,36 +89,58 @@ namespace ExoStudio.Research
         public async Task<List<LightCurveProduct>> FindLightCurvesAsync(
             double raDeg, double decDeg, double radiusDeg = 0.02, int maxObservations = 8)
         {
+            // NOT RESTRICTED TO THE MISSION'S OWN COLLECTION, and that is the whole point of this
+            // query. The two minute targets are half a million stars that the mission's pipeline
+            // has already searched exhaustively; the light curves extracted from the FULL FRAME
+            // IMAGES by other groups cover vastly more sky and have not been examined star by
+            // star. Measured at one arbitrary position: zero two minute products, and thirty full
+            // frame light curves from three providers. Asking only for the mission collection is
+            // asking only about the part of the sky where there is nothing left to find.
             JsonElement found = await InvokeAsync("Mast.Caom.Filtered.Position", new
             {
-                columns = "obsid,target_name,sequence_number,t_exptime",
+                columns = "obsid,target_name,sequence_number,t_exptime,obs_collection,provenance_name",
                 filters = new object[]
                 {
-                    new { paramName = "obs_collection", values = new[] { "TESS" } },
                     new { paramName = "dataproduct_type", values = new[] { "timeseries" } },
                 },
                 position = FormattableString.Invariant($"{raDeg},{decDeg},{radiusDeg}"),
             });
 
-            var observations = new List<(string obsid, string target, int sector, double exp)>();
+            var observations = new List<(string obsid, string target, int sector, double exp,
+                                         string collection, string provider)>();
             if (found.TryGetProperty("data", out JsonElement rows))
             {
                 foreach (JsonElement row in rows.EnumerateArray())
                 {
+                    string collection = Text(row, "obs_collection") ?? "";
+                    // TESS and its high level products only; other missions' time series are not
+                    // what this pipeline knows how to read.
+                    string provider = Text(row, "provenance_name") ?? "";
+                    if (!collection.Equals("TESS", StringComparison.OrdinalIgnoreCase)
+                        && !collection.Equals("HLSP", StringComparison.OrdinalIgnoreCase)) continue;
+
                     observations.Add((
                         Text(row, "obsid"),
                         Text(row, "target_name"),
                         (int)Number(row, "sequence_number"),
-                        Number(row, "t_exptime")));
+                        Number(row, "t_exptime"),
+                        collection, provider));
                 }
             }
 
-            // Newest sector first: when several exist, the most recent is the one most likely to
-            // still be worth looking at, and it keeps repeat runs deterministic.
-            observations.Sort((a, b) => b.sector.CompareTo(a.sector));
+            // Mission products first when they exist, because they are the best calibrated, then
+            // the full frame extractions; newest sector first inside each group.
+            observations.Sort((a, b) =>
+            {
+                bool am = a.collection.Equals("TESS", StringComparison.OrdinalIgnoreCase);
+                bool bm = b.collection.Equals("TESS", StringComparison.OrdinalIgnoreCase);
+                if (am != bm) return am ? -1 : 1;
+                return b.sector.CompareTo(a.sector);
+            });
 
             var products = new List<LightCurveProduct>();
-            foreach ((string obsid, string target, int sector, double exp) in observations.Take(maxObservations))
+            foreach ((string obsid, string target, int sector, double exp,
+                      string collection, string provider) in observations.Take(maxObservations))
             {
                 JsonElement list;
                 try { list = await InvokeAsync("Mast.Caom.Products", new { obsid }); }
@@ -132,6 +160,8 @@ namespace ExoStudio.Research
                         FileName = file,
                         DataUri = Text(item, "dataURI"),
                         SizeBytes = (long)Number(item, "size"),
+                        Provider = string.IsNullOrEmpty(provider) ? collection : provider,
+                        IsMissionProduct = collection.Equals("TESS", StringComparison.OrdinalIgnoreCase),
                     });
                 }
             }

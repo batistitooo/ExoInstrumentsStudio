@@ -50,6 +50,13 @@ namespace ExoStudio.Research
             public double DetrendWindowDays { get; set; } = 0.75;
             public double SnrThreshold { get; set; } = TransitDetector.DefaultSnrThreshold;
             public int Sector { get; set; }              // 0 means whichever is newest
+
+            /// <summary>
+            /// Search for ONE dip as well as repeating ones. On by default, because it is the
+            /// regime the mission pipelines leave behind and therefore the only one where a
+            /// discovery is realistically still waiting.
+            /// </summary>
+            public bool SingleTransits { get; set; } = true;
         }
 
         public async Task<object> RunAsync(Request request)
@@ -72,8 +79,14 @@ namespace ExoStudio.Research
             MastClient.LightCurveProduct chosen = request.Sector > 0
                 ? products.FirstOrDefault(p => p.Sector == request.Sector) ?? products[0]
                 : products[0];
-            log.Add($"MAST holds {products.Count} light curve(s); using sector {chosen.Sector}, "
-                  + $"{chosen.ExposureSeconds:0} s cadence, {chosen.FileName}");
+            int fromFfi = products.Count(p => !p.IsMissionProduct);
+            log.Add($"MAST holds {products.Count} light curve(s) here, {products.Count - fromFfi} from the "
+                  + $"mission's two minute targets and {fromFfi} extracted from the full frame images");
+            log.Add($"using {(chosen.IsMissionProduct ? "the mission product" : chosen.Provider)}, "
+                  + $"sector {chosen.Sector}, {chosen.ExposureSeconds:0} s cadence, {chosen.FileName}");
+            if (!chosen.IsMissionProduct)
+                log.Add("this is a full frame extraction, which is the under searched half of the sky: "
+                      + "the mission's own pipeline never examined this star individually");
 
             string path = await mast.FetchAsync(chosen);
             TransitSearchPipeline.LightCurve raw = TransitSearchPipeline.Load(path);
@@ -93,17 +106,42 @@ namespace ExoStudio.Research
 
             if (!found.Detected)
             {
-                log.Add("no box cleared the threshold");
-                string emptyId = Save(request, chosen, raw, flat, found, null, null, log);
+                log.Add("no repeating box cleared the threshold");
+                List<SingleTransitSearch.Event> alone = request.SingleTransits
+                    ? SingleTransitSearch.Find(flat)
+                    : new List<SingleTransitSearch.Event>();
+                foreach (SingleTransitSearch.Event e in alone)
+                    log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
+                          + $"{e.DepthPpm:0} ppm over {e.DurationHours:0.#} h, SNR {e.Snr:0.#}");
+
+                string emptyId = Save(request, chosen, raw, flat, found, null, null, log, alone);
                 return new
                 {
                     ok = true, detected = false, id = emptyId, log,
                     lightCurve = Describe(raw, flat),
                     series = Series(flat),
-                    message = "Nothing above threshold. That is a real result about this star over this "
-                            + "baseline, not a failure, and it is saved as one.",
+                    singleTransits = alone.Select(Describe),
+                    message = alone.Count > 0
+                        ? "No repeating transit, but an isolated dip is present. That is the interesting "
+                        + "case rather than the disappointing one: a single event is what a long period "
+                        + "planet looks like in one sector, and it is the regime the mission's own "
+                        + "pipelines cannot trigger on."
+                        : "Nothing above threshold, repeating or isolated. That is a real result about "
+                        + "this star over this baseline, not a failure, and it is saved as one.",
                 };
             }
+
+            // ONE DIP AS WELL AS REPEATING ONES, and the two answer different questions. A box
+            // least squares needs two or three transits, so a sector of 27 days cannot see a
+            // period beyond about nine days at all. That gap is where TOI-2180 b was found, by a
+            // person looking at a single event the pipelines had no way to trigger on.
+            List<SingleTransitSearch.Event> singles = request.SingleTransits
+                ? SingleTransitSearch.Find(flat)
+                : new List<SingleTransitSearch.Event>();
+            foreach (SingleTransitSearch.Event e in singles)
+                log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
+                      + $"{e.DepthPpm:0} ppm over {e.DurationHours:0.#} h, SNR {e.Snr:0.#}"
+                      + (e.Concerns.Count > 0 ? $" ({e.Concerns.Count} concern(s))" : ""));
 
             TransitSearchPipeline.Vetting vetting = TransitSearchPipeline.Vet(flat, found);
             KnownObjects.Report registry = await known.LookUpAsync(
@@ -117,7 +155,7 @@ namespace ExoStudio.Research
                       + (m.PeriodDays > 0 ? $", period {m.PeriodDays:0.#####} d (ratio {m.PeriodRatio:0.###})" : ""));
             foreach (string u in registry.Unavailable) log.Add("could not check " + u);
 
-            string id = Save(request, chosen, raw, flat, found, vetting, registry, log);
+            string id = Save(request, chosen, raw, flat, found, vetting, registry, log, singles);
 
             return new
             {
@@ -127,6 +165,7 @@ namespace ExoStudio.Research
                 log,
                 lightCurve = Describe(raw, flat),
                 series = Series(flat),
+                singleTransits = singles.Select(Describe),
                 candidate = new
                 {
                     periodDays = found.BestPeriodDays,
@@ -182,6 +221,21 @@ namespace ExoStudio.Research
             return outp.ToArray();
         }
 
+
+        private static object Describe(SingleTransitSearch.Event e) => new
+        {
+            centreTimeDays = e.CentreTimeDays,
+            durationHours = e.DurationHours,
+            depthPpm = e.DepthPpm,
+            depthUncertaintyPpm = e.DepthUncertaintyPpm,
+            snr = e.Snr,
+            pointsInDip = e.PointsInDip,
+            nextBestFraction = e.NextBestFraction,
+            centroidShiftPixels = e.CentroidShiftPixels,
+            concerns = e.Concerns,
+            passed = e.Concerns.Count == 0,
+        };
+
         private static object Describe(TransitSearchPipeline.LightCurve raw,
                                        TransitSearchPipeline.LightCurve flat) => new
         {
@@ -202,7 +256,8 @@ namespace ExoStudio.Research
         private string Save(Request request, MastClient.LightCurveProduct product,
                             TransitSearchPipeline.LightCurve raw, TransitSearchPipeline.LightCurve flat,
                             DetectionResult found, TransitSearchPipeline.Vetting vetting,
-                            KnownObjects.Report registry, List<string> log)
+                            KnownObjects.Report registry, List<string> log,
+                            List<SingleTransitSearch.Event> singles = null)
         {
             string id = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)
                       + "-" + Math.Abs(HashCode.Combine(request.RaDeg, request.DecDeg)).ToString("x8");
@@ -236,6 +291,7 @@ namespace ExoStudio.Research
                     found.BestPhase01, found.Snr, found.InTransitPointCount,
                 } : (object)new { detected = false },
                 vetting,
+                singleTransits = singles,
                 known = registry?.Matches,
                 log,
             };

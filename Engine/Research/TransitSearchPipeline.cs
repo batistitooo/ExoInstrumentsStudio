@@ -43,6 +43,16 @@ namespace ExoStudio.Research
             public string Target;
             public int Sector;
             public double CadenceMinutes;
+
+            /// <summary>
+            /// Column centroid per cadence, when the provider supplies one. The mission's two
+            /// minute products do not carry it in the light curve; several of the full frame
+            /// extractions do, and it is the single most valuable extra column here, because a
+            /// centroid that MOVES during the dip means the light is not coming from this star.
+            /// Null when unavailable.
+            /// </summary>
+            public double[] CentroidX;
+            public double[] CentroidY;
             public double BaselineDays => TimeDays.Length > 1 ? TimeDays[^1] - TimeDays[0] : 0.0;
             public int Count => TimeDays.Length;
             public double ScatterPpm;
@@ -59,17 +69,36 @@ namespace ExoStudio.Research
         public static LightCurve Load(string fitsPath)
         {
             FitsBinaryTable table = FitsBinaryTable.Read(fitsPath);
-            string fluxColumn = table.Has("PDCSAP_FLUX") ? "PDCSAP_FLUX" : "SAP_FLUX";
-            string errorColumn = fluxColumn + "_ERR";
+
+            // THE FLUX COLUMN DEPENDS ON WHO MADE THE FILE. The mission's own two minute products
+            // carry PDCSAP_FLUX; the light curves extracted from the full frame images by other
+            // groups do not, and each names its corrected flux differently. eleanor gives
+            // CORR_FLUX and PCA_FLUX, others give a plain FLUX. Preferring in this order takes
+            // the most processed version each provider offers, and falls back rather than
+            // failing, because the full frame products are the ones covering the sky nobody has
+            // searched star by star.
+            string fluxColumn = new[] { "PDCSAP_FLUX", "CORR_FLUX", "PCA_FLUX", "FLUX", "SAP_FLUX" }
+                .FirstOrDefault(table.Has)
+                ?? throw new InvalidOperationException(
+                    "no recognised flux column; the file has: " + string.Join(", ", table.ColumnNames));
+            string errorColumn = table.Has(fluxColumn + "_ERR") ? fluxColumn + "_ERR"
+                               : table.Has("FLUX_ERR") ? "FLUX_ERR" : null;
 
             double[] time = table.Column1("TIME");
             double[] flux = table.Column1(fluxColumn);
-            double[] error = table.Has(errorColumn) ? table.Column1(errorColumn) : null;
+            double[] error = errorColumn != null ? table.Column1(errorColumn) : null;
             double[] quality = table.Has("QUALITY") ? table.Column1("QUALITY") : null;
+
+            double[] cx = table.Has("X_CENTROID") ? table.Column1("X_CENTROID")
+                        : table.Has("MOM_CENTR1") ? table.Column1("MOM_CENTR1") : null;
+            double[] cy = table.Has("Y_CENTROID") ? table.Column1("Y_CENTROID")
+                        : table.Has("MOM_CENTR2") ? table.Column1("MOM_CENTR2") : null;
 
             var t = new List<double>(time.Length);
             var f = new List<double>(time.Length);
             var e = new List<double>(time.Length);
+            var gx = new List<double>(time.Length);
+            var gy = new List<double>(time.Length);
             for (int i = 0; i < time.Length; i++)
             {
                 if (double.IsNaN(time[i]) || double.IsNaN(flux[i]) || flux[i] <= 0) continue;
@@ -77,6 +106,8 @@ namespace ExoStudio.Research
                 t.Add(time[i]);
                 f.Add(flux[i]);
                 e.Add(error != null && !double.IsNaN(error[i]) ? error[i] : 0.0);
+                if (cx != null) gx.Add(cx[i]);
+                if (cy != null) gy.Add(cy[i]);
             }
             if (t.Count == 0) throw new InvalidOperationException("the light curve has no usable cadences");
 
@@ -86,8 +117,10 @@ namespace ExoStudio.Research
                 TimeDays = t.ToArray(),
                 Flux = f.Select(v => v / median).ToArray(),
                 Error = e.Select(v => v / median).ToArray(),
-                Target = table.Card("OBJECT") ?? table.Card("TICID"),
+                Target = table.Card("OBJECT") ?? table.Card("TICID") ?? table.Card("TICVER"),
                 Sector = int.TryParse(table.Card("SECTOR"), out int s) ? s : 0,
+                CentroidX = cx != null && gx.Count == t.Count ? gx.ToArray() : null,
+                CentroidY = cy != null && gy.Count == t.Count ? gy.ToArray() : null,
             };
             curve.CadenceMinutes = curve.Count > 1
                 ? Median(Diffs(curve.TimeDays)) * 24.0 * 60.0 : 0.0;
@@ -135,6 +168,8 @@ namespace ExoStudio.Research
                 Sector = curve.Sector,
                 CadenceMinutes = curve.CadenceMinutes,
                 ScatterPpm = PointToPointScatter(flat) * 1e6,
+                CentroidX = curve.CentroidX,
+                CentroidY = curve.CentroidY,
             };
         }
 
