@@ -88,6 +88,13 @@ namespace ExoStudio.Research
             public long Tic { get; set; }
 
             /// <summary>
+            /// How many sectors to join, newest first. Zero means every sector the star has, which
+            /// is the point of the fast route: a star in a continuous viewing zone holds seventeen
+            /// or more, and an isolated transit sits in exactly one of them.
+            /// </summary>
+            public int MaxSectors { get; set; }
+
+            /// <summary>
             /// Search for ONE dip as well as repeating ones. On by default, because it is the
             /// regime the mission pipelines leave behind and therefore the only one where a
             /// discovery is realistically still waiting.
@@ -125,27 +132,68 @@ namespace ExoStudio.Research
                 };
             }
 
-            MastClient.LightCurveProduct chosen = request.Sector > 0
-                ? products.FirstOrDefault(p => p.Sector == request.Sector) ?? products[0]
-                : products[0];
             int fromFfi = products.Count(p => !p.IsMissionProduct);
             log.Add(constructed
                 ? $"probed the full frame products for TIC {request.Tic} by constructing their "
                 + $"addresses: {products.Count} sector(s) present [{listing}]"
                 : $"the archive lists {mast.LastObservationCount} observation(s) at this position; "
                 + $"opened the first that carried a light curve [{listing}]");
+
+            // ONE SECTOR, OR ALL OF THEM. Asking for a named sector, or coming in by position
+            // rather than by catalogue number, still opens a single file. The fast route opens
+            // every sector the star has and joins them, because that is the difference between
+            // one chance in seventeen of an isolated transit being in the data and seventeen.
+            List<MastClient.LightCurveProduct> opening;
+            if (request.Sector > 0)
+                opening = new List<MastClient.LightCurveProduct>
+                    { products.FirstOrDefault(p => p.Sector == request.Sector) ?? products[0] };
+            else if (!constructed)
+                opening = new List<MastClient.LightCurveProduct> { products[0] };
+            else
+                opening = (request.MaxSectors > 0 ? products.Take(request.MaxSectors) : products).ToList();
+
+            MastClient.LightCurveProduct chosen = opening[0];
             log.Add($"using {(chosen.IsMissionProduct ? "the mission product" : chosen.Provider)}, "
-                  + $"sector {chosen.Sector}, {chosen.ExposureSeconds:0} s cadence, {chosen.FileName}");
+                  + (opening.Count > 1
+                     ? $"sectors {string.Join(", ", opening.OrderBy(p => p.Sector).Select(p => p.Sector))}"
+                     : $"sector {chosen.Sector}, {chosen.FileName}"));
             if (!chosen.IsMissionProduct)
                 log.Add("this is a full frame extraction, which is the under searched half of the sky: "
                       + "the mission's own pipeline never examined this star individually");
 
-            string path = constructed ? await hlsp.FetchAsync(chosen) : await mast.FetchAsync(chosen);
+            // Fetched together rather than one after another; each is under a megabyte and the
+            // gate inside HlspDirect keeps the archive seeing a steady trickle.
+            var loaded = new List<TransitSearchPipeline.LightCurve>();
+            var refused = new List<string>();
+            string[] paths = await Task.WhenAll(opening.Select(async p =>
+            {
+                try { return constructed ? await hlsp.FetchAsync(p) : await mast.FetchAsync(p); }
+                catch { lock (refused) refused.Add($"sector {p.Sector}"); return null; }
+            }));
             string fetched = Took();
-            TransitSearchPipeline.LightCurve raw = TransitSearchPipeline.Load(path);
-            log.Add($"{raw.Count:N0} cadences the mission did not flag, spanning {raw.BaselineDays:0.0} days "
-                  + $"at {raw.CadenceMinutes:0.#} minutes, scatter {raw.ScatterPpm:0} ppm "
-                  + $"[fetch {fetched}, read {Took()}]");
+            foreach (string one in paths.Where(x => x != null))
+            {
+                // A sector that will not parse is a sector missing from the baseline, not a
+                // failed search: the rest of them still say something about this star.
+                try { loaded.Add(TransitSearchPipeline.Load(one)); }
+                catch { refused.Add(Path.GetFileName(one)); }
+            }
+            if (loaded.Count == 0)
+                return new
+                {
+                    ok = false,
+                    stage = "archive",
+                    message = "every sector for this star failed to open: "
+                            + string.Join(", ", refused),
+                };
+
+            TransitSearchPipeline.LightCurve raw = TransitSearchPipeline.Stitch(loaded);
+            if (refused.Count > 0)
+                log.Add($"could not open {refused.Count} of {opening.Count} sectors ("
+                      + string.Join(", ", refused.Take(4)) + "), searching the rest");
+            log.Add($"{raw.Count:N0} cadences the mission did not flag across {loaded.Count} sector(s), "
+                  + $"spanning {raw.BaselineDays:0.0} days at {raw.CadenceMinutes:0.#} minutes, "
+                  + $"scatter {raw.ScatterPpm:0} ppm [fetch {fetched}, read {Took()}]");
 
             TransitSearchPipeline.LightCurve flat =
                 TransitSearchPipeline.Detrend(raw, request.DetrendWindowDays);
@@ -153,11 +201,30 @@ namespace ExoStudio.Research
                   + $"scatter {flat.ScatterPpm:0} ppm afterwards [{Took()}]");
 
             // The search never sees anything but times, fluxes and errors.
-            List<FluxSample> samples = TransitSearchPipeline.ToSamples(flat);
+            // Binned for the fold only; the isolated event search below still reads every cadence.
+            double binMinutes = TransitSearchPipeline.BinMinutesFor(request.MinPeriodDays);
+            TransitSearchPipeline.LightCurve folded = TransitSearchPipeline.Bin(flat, binMinutes);
+            if (folded.Count < flat.Count)
+                log.Add($"binned to {binMinutes:0.#} minutes for the period search, "
+                      + $"{flat.Count:N0} cadences to {folded.Count:N0}; the isolated event search "
+                      + "still reads every cadence");
+
+            List<FluxSample> samples = TransitSearchPipeline.ToSamples(folded);
+
+            // THE PERIOD GRID HAS TO FOLLOW THE BASELINE. Trial periods are spaced so that two
+            // neighbouring trials drift apart by less than a transit duration over the whole
+            // observation; the longer the baseline, the finer that spacing has to be. The
+            // detector's own automatic grid does exactly this but stops at 3000 steps, which is
+            // right for the 27 days it was written against and far too coarse for the two years a
+            // joined curve can cover. Leaving it there would silently step over real periods, so
+            // the count is worked out here from the actual baseline and passed in.
+            double baseline = raw.BaselineDays;
+            int steps = PeriodSteps(baseline, request.MinPeriodDays, request.MaxPeriodDays);
             DetectionResult found = TransitDetector.Detect(
                 samples, request.MinPeriodDays, request.MaxPeriodDays,
-                snrThreshold: request.SnrThreshold);
-            log.Add($"box least squares over {request.MinPeriodDays:0.#} to {request.MaxPeriodDays:0.#} days [{Took()}]");
+                periodSteps: steps, snrThreshold: request.SnrThreshold);
+            log.Add($"box least squares over {request.MinPeriodDays:0.#} to {request.MaxPeriodDays:0.#} days, "
+                  + $"{steps:N0} trial periods for a {baseline:0.#} day baseline [{Took()}]");
 
             if (!found.Detected)
             {
@@ -292,6 +359,8 @@ namespace ExoStudio.Research
             snr = e.Snr,
             pointsInDip = e.PointsInDip,
             nextBestFraction = e.NextBestFraction,
+            coverageRatio = e.CoverageRatio,
+            redNoiseFactor = e.RedNoiseFactor,
             centroidShiftPixels = e.CentroidShiftPixels,
             concerns = e.Concerns,
             passed = e.Concerns.Count == 0,
@@ -449,7 +518,15 @@ namespace ExoStudio.Research
 
             TransitSearchPipeline.LightCurve flat =
                 TransitSearchPipeline.Detrend(raw, request.DetrendWindowDays);
-            List<FluxSample> samples = TransitSearchPipeline.ToSamples(flat);
+            // Binned for the fold only; the isolated event search below still reads every cadence.
+            double binMinutes = TransitSearchPipeline.BinMinutesFor(request.MinPeriodDays);
+            TransitSearchPipeline.LightCurve folded = TransitSearchPipeline.Bin(flat, binMinutes);
+            if (folded.Count < flat.Count)
+                log.Add($"binned to {binMinutes:0.#} minutes for the period search, "
+                      + $"{flat.Count:N0} cadences to {folded.Count:N0}; the isolated event search "
+                      + "still reads every cadence");
+
+            List<FluxSample> samples = TransitSearchPipeline.ToSamples(folded);
             DetectionResult found = TransitDetector.Detect(
                 samples, request.MinPeriodDays, request.MaxPeriodDays,
                 snrThreshold: request.SnrThreshold);
@@ -779,6 +856,26 @@ namespace ExoStudio.Research
             };
         }
 
+        /// <summary>
+        /// How many trial periods a baseline of this length actually needs.
+        ///
+        /// Two trial periods are distinguishable when, across the whole observation, they put a
+        /// transit out of step by about its own duration. That gives a spacing uniform in
+        /// FREQUENCY rather than period, of roughly duty cycle over baseline, oversampled a few
+        /// times so a real period cannot fall between two trials. Capped, because a very long
+        /// baseline with a wide period range would otherwise ask for millions of folds and the
+        /// answer would arrive tomorrow.
+        /// </summary>
+        private static int PeriodSteps(double baselineDays, double minPeriodDays, double maxPeriodDays)
+        {
+            if (baselineDays <= 0 || minPeriodDays <= 0 || maxPeriodDays <= minPeriodDays) return 0;
+            const double duty = 0.02;          // a transit is a couple of percent of an orbit
+            const double oversampling = 3.0;
+            double step = duty / (oversampling * Math.Max(baselineDays, maxPeriodDays));
+            double span = 1.0 / minPeriodDays - 1.0 / maxPeriodDays;
+            return (int)Math.Clamp(Math.Ceiling(span / step), 200, 60000);
+        }
+
         private static double Dbl(JsonElement e, string name)
             => e.TryGetProperty(name, out JsonElement v) && v.ValueKind == JsonValueKind.Number
                ? v.GetDouble() : 0.0;
@@ -824,14 +921,28 @@ namespace ExoStudio.Research
                 try { text = File.ReadAllText(path); } catch { continue; }
                 using JsonDocument d = JsonDocument.Parse(text);
                 JsonElement r = d.RootElement;
+                JsonElement review = Get(r, "review");
                 yield return new
                 {
                     id = Str(r, "id"),
                     recordedUtc = Str(r, "recordedUtc"),
                     label = r.TryGetProperty("target", out JsonElement t) ? Str(t, "Label") : null,
-                    detected = r.TryGetProperty("result", out JsonElement res)
-                               && res.TryGetProperty("detected", out JsonElement det)
-                               && det.ValueKind == JsonValueKind.True,
+                    detected = Detected(r),
+
+                    // WHAT A RUN IS WORTH KEEPING, AND WHAT KEEPING IT COSTS. A field sweep adds
+                    // one record per star, so the list is hundreds long and mostly null, and the
+                    // page cannot sort out which of those are still worth something without
+                    // opening every one of them. These four say it in the listing instead.
+                    events = r.TryGetProperty("singleTransits", out JsonElement st)
+                             && st.ValueKind == JsonValueKind.Array ? st.GetArrayLength() : 0,
+                    verdict = review.ValueKind == JsonValueKind.Object ? Str(review, "Verdict") : null,
+                    curve = HasCurve(r),
+                    // Trimmed and never-stored look the same from outside - no curve - and are not
+                    // the same thing. The oldest records predate storing one at all, and telling a
+                    // reader those were trimmed would be a small lie about their own dataset.
+                    trimmed = r.TryGetProperty("curveTrimmed", out JsonElement ct)
+                              && ct.ValueKind == JsonValueKind.True,
+                    bytes = new FileInfo(path).Length,
                 };
             }
         }
@@ -841,6 +952,125 @@ namespace ExoStudio.Research
             string path = Path.Combine(resultsDir, Path.GetFileName(id) + ".json");
             return File.Exists(path) ? File.ReadAllText(path) : null;
         }
+
+        /// <summary>Removes one recorded run.</summary>
+        /// <remarks>
+        /// Path.GetFileName confines the id to the results directory, the same way every other
+        /// call that takes an id from the page does. This is the one where getting it wrong
+        /// deletes something that was never ours to touch.
+        /// </remarks>
+        public bool Delete(string id)
+        {
+            string path = Path.Combine(resultsDir, Path.GetFileName(id ?? string.Empty) + ".json");
+            if (!File.Exists(path)) return false;
+            File.Delete(path);
+            return true;
+        }
+
+        /// <summary>
+        /// Bulk removal. With <paramref name="everything"/> false it takes only the runs nothing
+        /// came of and nobody has looked at, which is what a field sweep leaves behind by the
+        /// hundred; with it true, the whole directory.
+        ///
+        /// THIS SPENDS SOMETHING REAL. A null run is written precisely because completeness cannot
+        /// be measured from detections alone, and each one deleted is a star the dataset can no
+        /// longer say was searched. Exporting the CSV first keeps that row; <see cref="TrimCurves"/>
+        /// keeps it and frees most of the same bytes.
+        /// </summary>
+        public (int deleted, int kept) Clear(bool everything)
+        {
+            int deleted = 0, kept = 0;
+            foreach (string path in Directory.GetFiles(resultsDir, "*.json"))
+            {
+                if (!everything && !NothingCameOfIt(path)) { kept++; continue; }
+                try { File.Delete(path); deleted++; } catch { kept++; }
+            }
+            return (deleted, kept);
+        }
+
+        /// <summary>
+        /// Drops the stored light curve from the runs nothing came of, and KEEPS the runs.
+        ///
+        /// The curve is about two thirds of a record's bytes, and it is stored so a run can be
+        /// reopened and looked at with the eye rather than read as numbers. On a run that found
+        /// nothing and that nobody reviewed there is nothing there to look at, while the line it
+        /// contributes to the exported dataset - this star, these parameters, nothing found - is
+        /// the entire reason null runs are written at all. So this frees what the sweeps cost
+        /// without spending what they buy, and is the control to reach for before Clear.
+        /// </summary>
+        public (int trimmed, long freedBytes) TrimCurves()
+        {
+            int trimmed = 0;
+            long freed = 0;
+            foreach (string path in Directory.GetFiles(resultsDir, "*.json"))
+            {
+                string text;
+                try { text = File.ReadAllText(path); } catch { continue; }
+
+                var root = new Dictionary<string, object>();
+                bool hadCurve = false;
+                using (JsonDocument d = JsonDocument.Parse(text))
+                {
+                    if (!NothingCameOfIt(d.RootElement)) continue;
+                    foreach (JsonProperty p in d.RootElement.EnumerateObject())
+                    {
+                        if (p.Name == "series")
+                        {
+                            hadCurve = p.Value.ValueKind == JsonValueKind.Array
+                                       && p.Value.GetArrayLength() > 0;
+                            continue;
+                        }
+                        root[p.Name] = JsonSerializer.Deserialize<object>(p.Value.GetRawText());
+                    }
+                }
+                if (!hadCurve) continue;
+
+                // SAID IN THE RECORD rather than left to be inferred from a field that is not
+                // there. A run reopened a year from now should be able to say the curve was
+                // dropped deliberately, not leave somebody wondering whether it failed to write.
+                root["curveTrimmed"] = true;
+
+                string rewritten = JsonSerializer.Serialize(root,
+                    new JsonSerializerOptions { WriteIndented = true, IncludeFields = true });
+                try { File.WriteAllText(path, rewritten); } catch { continue; }
+                freed += Math.Max(0, text.Length - rewritten.Length);
+                trimmed++;
+            }
+            return (trimmed, freed);
+        }
+
+        /// <summary>
+        /// A run with a detection, a single transit event, or a verdict somebody recorded is one
+        /// there is still something to open. Anything else is a null result: a row of the dataset,
+        /// and nothing to look at.
+        /// </summary>
+        private static bool NothingCameOfIt(JsonElement r)
+            => !Detected(r)
+               && !(r.TryGetProperty("singleTransits", out JsonElement st)
+                    && st.ValueKind == JsonValueKind.Array && st.GetArrayLength() > 0)
+               && !(r.TryGetProperty("review", out JsonElement review)
+                    && review.ValueKind == JsonValueKind.Object);
+
+        private static bool NothingCameOfIt(string path)
+        {
+            try
+            {
+                using JsonDocument d = JsonDocument.Parse(File.ReadAllText(path));
+                return NothingCameOfIt(d.RootElement);
+            }
+            // A record that cannot be read is not one to decide about. It stays.
+            catch { return false; }
+        }
+
+        private static bool Detected(JsonElement r)
+            => r.TryGetProperty("result", out JsonElement res)
+               && res.ValueKind == JsonValueKind.Object
+               && res.TryGetProperty("detected", out JsonElement det)
+               && det.ValueKind == JsonValueKind.True;
+
+        private static bool HasCurve(JsonElement r)
+            => r.TryGetProperty("series", out JsonElement s)
+               && s.ValueKind == JsonValueKind.Array && s.GetArrayLength() > 0;
 
         /// <summary>
         /// Every run as one table, which is the form the dataset is actually useful in: one row

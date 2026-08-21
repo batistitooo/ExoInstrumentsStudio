@@ -59,6 +59,194 @@ namespace ExoStudio.Research
         }
 
         /// <summary>
+        /// The same light curve on a coarser time grid, for the period search only.
+        ///
+        /// A box least squares fold visits every sample once per trial period, so its cost is the
+        /// number of samples times the number of trials. Joining seventeen sectors at three minute
+        /// cadence gives 169,000 samples, and a properly sampled grid over a 969 day baseline
+        /// wants twelve thousand trials: that combination took 42 s for one star, and a WASP-18
+        /// curve spanning 2878 days took 128 s.
+        ///
+        /// Almost all of that resolution is wasted on this particular question. A transit lasts
+        /// hours; three minute sampling puts a hundred points inside one, where twenty is more
+        /// than enough to find it. Averaging into bins a tenth of a transit duration wide keeps
+        /// the shape that matters, cuts the samples by roughly ten, and cuts the fold with them.
+        ///
+        /// THE FINE CURVE IS NOT DISCARDED. This is used for the period search alone. The isolated
+        /// event search, the vetting and everything reported to the reader still read every
+        /// cadence, because there the shape of a single event is exactly what is being judged.
+        /// </summary>
+        public static LightCurve Bin(LightCurve curve, double binMinutes)
+        {
+            double width = binMinutes / (24.0 * 60.0);
+            if (curve.Count < 2 || width <= curve.CadenceMinutes / (24.0 * 60.0)) return curve;
+
+            var time = new List<double>(curve.Count);
+            var flux = new List<double>(curve.Count);
+            var error = new List<double>(curve.Count);
+
+            int i = 0;
+            while (i < curve.Count)
+            {
+                // Bins are laid on the data rather than on a fixed grid, so a gap between sectors
+                // simply starts the next bin rather than producing thousands of empty ones.
+                double edge = curve.TimeDays[i] + width;
+                int j = i;
+                double sumT = 0, sumF = 0, sumE = 0;
+                while (j < curve.Count && curve.TimeDays[j] < edge)
+                {
+                    sumT += curve.TimeDays[j];
+                    sumF += curve.Flux[j];
+                    if (curve.Error != null && j < curve.Error.Length) sumE += curve.Error[j];
+                    j++;
+                }
+                int n = j - i;
+                if (n > 0)
+                {
+                    time.Add(sumT / n);
+                    flux.Add(sumF / n);
+                    // Averaging n independent points divides their uncertainty by the root of n.
+                    error.Add(sumE / n / Math.Sqrt(n));
+                }
+                i = j > i ? j : i + 1;
+            }
+
+            var binned = new LightCurve
+            {
+                TimeDays = time.ToArray(),
+                Flux = flux.ToArray(),
+                Error = error.ToArray(),
+                Target = curve.Target,
+            };
+            binned.CadenceMinutes = binned.Count > 1
+                ? Median(Diffs(binned.TimeDays)) * 24.0 * 60.0 : curve.CadenceMinutes;
+            binned.ScatterPpm = PointToPointScatter(binned.Flux) * 1e6;
+            return binned;
+        }
+
+        /// <summary>
+        /// A sensible bin width for searching periods from this one upward, in minutes.
+        ///
+        /// Transit duration follows from the star's mean density through Kepler's third law, so a
+        /// solar density star gives about 13 hours at one year and scales as the cube root of the
+        /// period. A tenth of the shortest transit being searched for is fine enough to keep its
+        /// depth and its edges; never finer than the data and never coarser than half an hour.
+        /// </summary>
+        public static double BinMinutesFor(double minPeriodDays)
+        {
+            if (minPeriodDays <= 0) return 0;
+            double durationHours = 13.0 * Math.Pow(minPeriodDays / 365.25, 1.0 / 3.0);
+            return Math.Clamp(durationHours * 60.0 / 10.0, 1.0, 30.0);
+        }
+
+        /// <summary>Whether the telescope was recording within a window of this time.</summary>
+        private static bool AnyDataNear(double[] times, double when, double window)
+        {
+            int lo = 0, hi = times.Length;
+            while (lo < hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (times[mid] < when - window) lo = mid + 1; else hi = mid;
+            }
+            return lo < times.Length && times[lo] <= when + window;
+        }
+
+        /// <summary>
+        /// Joins the sectors of one star into a single light curve.
+        ///
+        /// WHY THIS IS WORTH THE TROUBLE. A sector is 27 days. A star in a continuous viewing zone
+        /// has seventeen of them and sometimes far more, and searching only the newest throws away
+        /// everything else. For a transit that repeats every few days that mostly costs precision,
+        /// but for a transit that happens once it costs the discovery outright: an isolated event
+        /// falls in whichever sector it falls in, so looking at one of seventeen is one chance in
+        /// seventeen of it being in the data at all. It also opens periods no single sector can
+        /// show, since nothing longer than about nine days repeats inside 27 days.
+        ///
+        /// EACH SECTOR IS ITS OWN MEASUREMENT AND IS NORMALISED AS ONE. Load already divides each
+        /// file by its own median, which is what makes them comparable: the aperture, the
+        /// contaminating neighbours and the detector all differ between sectors, so the raw levels
+        /// do not mean the same thing and joining them unnormalised would build a staircase and
+        /// call the steps transits.
+        ///
+        /// The months between sectors are left as gaps rather than closed up. Everything
+        /// downstream works in time and reads a gap as absence of data, which is what it is;
+        /// closing them would invent a baseline that was never observed.
+        /// </summary>
+        public static LightCurve Stitch(IReadOnlyList<LightCurve> parts)
+        {
+            if (parts == null || parts.Count == 0)
+                throw new ArgumentException("nothing to stitch", nameof(parts));
+            if (parts.Count == 1) return parts[0];
+
+            int total = parts.Sum(p => p.Count);
+            var order = Enumerable.Range(0, parts.Count)
+                                  .Where(i => parts[i].Count > 0)
+                                  .OrderBy(i => parts[i].TimeDays[0])
+                                  .ToList();
+
+            var time = new double[total];
+            var flux = new double[total];
+            var error = new double[total];
+            // Centroids only survive if every sector carried them, because a search that reads
+            // them must not silently compare a real position against a fabricated zero.
+            bool centroids = order.All(i => parts[i].CentroidX != null && parts[i].CentroidY != null);
+            var cx = centroids ? new double[total] : null;
+            var cy = centroids ? new double[total] : null;
+
+            int k = 0;
+            foreach (int i in order)
+            {
+                LightCurve part = parts[i];
+                for (int j = 0; j < part.Count; j++, k++)
+                {
+                    time[k] = part.TimeDays[j];
+                    flux[k] = part.Flux[j];
+                    error[k] = part.Error != null && j < part.Error.Length ? part.Error[j] : 0.0;
+                    if (centroids)
+                    {
+                        // Pixel coordinates are per sector: the star lands on a different camera
+                        // and a different place on it each time. Only the SHIFT during an event
+                        // is ever used, so each sector is referred to its own median and the
+                        // numbers become comparable displacements rather than absolute positions.
+                        cx[k] = part.CentroidX[j];
+                        cy[k] = part.CentroidY[j];
+                    }
+                }
+                if (centroids)
+                {
+                    int from = k - part.Count;
+                    Recentre(cx, from, k);
+                    Recentre(cy, from, k);
+                }
+            }
+
+            var joined = new LightCurve
+            {
+                TimeDays = time.Take(k).ToArray(),
+                Flux = flux.Take(k).ToArray(),
+                Error = error.Take(k).ToArray(),
+                CentroidX = centroids ? cx.Take(k).ToArray() : null,
+                CentroidY = centroids ? cy.Take(k).ToArray() : null,
+                Target = parts[order[0]].Target,
+            };
+            // The median spacing over the whole joined curve, which the handful of month long gaps
+            // between sectors cannot move.
+            joined.CadenceMinutes = joined.Count > 1
+                ? Median(Diffs(joined.TimeDays)) * 24.0 * 60.0 : 0.0;
+            joined.ScatterPpm = PointToPointScatter(joined.Flux) * 1e6;
+            return joined;
+        }
+
+        private static void Recentre(double[] v, int from, int to)
+        {
+            var real = new List<double>();
+            for (int i = from; i < to; i++) if (!double.IsNaN(v[i])) real.Add(v[i]);
+            if (real.Count == 0) return;
+            double m = Median(real.ToArray());
+            for (int i = from; i < to; i++) v[i] -= m;
+        }
+
+        /// <summary>
         /// Reads a light curve, keeping only cadences the mission itself did not flag.
         ///
         /// PDCSAP is preferred over SAP because the mission pipeline has already removed the
@@ -197,7 +385,11 @@ namespace ExoStudio.Research
             /// <summary>How many separate epochs actually carry enough data to show the transit.</summary>
             public int TransitsObserved;
 
-            /// <summary>How many the period and the baseline would allow, had nothing been missing.</summary>
+            /// <summary>
+            /// How many transits could have been seen at all: epochs whose predicted time falls
+            /// inside a stretch the telescope was actually recording. Not every epoch the span
+            /// allows, because most of them fall in the months between sectors.
+            /// </summary>
             public int TransitsPossible;
 
             /// <summary>
@@ -301,7 +493,23 @@ namespace ExoStudio.Research
             // transit should contain, so a couple of stray points at the edge of a gap do not
             // amount to a transit.
             v.TransitsObserved = epochsSeen.Count(kv => kv.Value >= Math.Max(3.0, perTransit * 0.5));
-            v.TransitsPossible = (int)Math.Floor(span / period) + 1;
+
+            // COUNTING EVERY EPOCH THE SPAN ALLOWS IS WRONG ONCE SECTORS ARE JOINED. A star seen
+            // in nine sectors spread over 2878 days was recorded for about 240 of those days; the
+            // rest is the months between visits, when the telescope was pointed elsewhere. Judging
+            // coverage against all 3058 epochs the span permits reported WASP-18 b, a planet with
+            // 110 transits plainly in the data, as holding 4 percent of its cadences, and the
+            // vetting refused it. An epoch counts as possible only if the telescope was recording
+            // near the time it would have happened.
+            v.TransitsPossible = 0;
+            long lastEpoch = (long)Math.Floor(span / period);
+            double window = Math.Max(durationDays, 2.0 * curve.CadenceMinutes / (24.0 * 60.0));
+            for (long e = 0; e <= lastEpoch; e++)
+            {
+                double when = t0 + (e + centre) * period;
+                if (AnyDataNear(curve.TimeDays, when, window)) v.TransitsPossible++;
+            }
+
             v.TransitCoverage = epochsSeen.Values.Sum()
                               / Math.Max(1.0, perTransit * Math.Max(1, v.TransitsPossible));
 

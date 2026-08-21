@@ -55,11 +55,22 @@ namespace ExoStudio.Research
         private static readonly SemaphoreSlim Gate = new(24, 24);
 
         /// <summary>
-        /// The highest sector anyone has been seen in, so later stars do not keep probing past the
-        /// end of the mission. Starts deliberately beyond where the mission has reached and is
-        /// pulled down to the truth by the first star that answers.
+        /// How far up the sector numbering to look.
+        ///
+        /// A CEILING THAT ADAPTS DOWNWARD IS A BUG, and this held one. It began at 130 and was
+        /// pulled down to just past whatever the first star answered with, on the reasoning that
+        /// later stars need not be probed past the end of the mission. But stars do not all share
+        /// a highest sector: one poorly covered star anywhere in a field dragged the ceiling down
+        /// and every star probed afterwards was truncated to that same range. A field in the
+        /// southern continuous viewing zone whose stars each hold 17 sectors returned two stars
+        /// above a floor of ten, because the rest were cut off before their coverage was reached.
+        ///
+        /// So the range is fixed and generous. Each probe transfers one byte, 130 of them run at
+        /// once in about a second and a half, and that is a small price beside the query this
+        /// whole class exists to avoid. Raise it as the mission goes on; probing past the end
+        /// costs a handful of refusals and nothing else.
         /// </summary>
-        private static int highestKnownSector = 130;
+        private const int SectorCeiling = 130;
 
         public HlspDirect(HttpClient http, string cacheDir)
         {
@@ -111,7 +122,7 @@ namespace ExoStudio.Research
         /// </summary>
         public async Task<List<int>> SectorsAsync(long tic, Provider provider, int maxSector = 0)
         {
-            int top = maxSector > 0 ? maxSector : Volatile.Read(ref highestKnownSector);
+            int top = maxSector > 0 ? maxSector : SectorCeiling;
             var found = new List<int>();
             var work = new List<Task>();
 
@@ -126,16 +137,6 @@ namespace ExoStudio.Research
             }
             await Task.WhenAll(work);
             found.Sort();
-
-            // Pull the ceiling down to the truth once something answers, so the next star probes a
-            // realistic range instead of the optimistic one this started with.
-            if (found.Count > 0)
-            {
-                int seen = found[found.Count - 1] + 4;
-                int current;
-                while (seen < (current = Volatile.Read(ref highestKnownSector)))
-                    if (Interlocked.CompareExchange(ref highestKnownSector, seen, current) == current) break;
-            }
             return found;
         }
 
