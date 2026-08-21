@@ -1208,7 +1208,7 @@ namespace ExoStudio.Research
                 // more attention than a deeper one that barely clears it.
                 double bump = Dbl(best, "brighteningSnr");
                 double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
-                score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0);
+                score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0) * Plausibility(best);
                 clean = true;
                 depth = Dbl(best, "depthPpm");
                 double rpc = Dbl(best, "companionRadiusEarth");
@@ -1225,7 +1225,8 @@ namespace ExoStudio.Research
                 JsonElement best = singles.OrderByDescending(e => Dbl(e, "snr")).First();
                 double bump = Dbl(best, "brighteningSnr");
                 double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
-                score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0) * 0.25;
+                score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0) * 0.25
+                      * Plausibility(best);
                 depth = Dbl(best, "depthPpm");
                 double rp = Dbl(best, "companionRadiusEarth");
                 why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
@@ -1291,6 +1292,42 @@ namespace ExoStudio.Research
             double step = duty / (oversampling * Math.Max(baselineDays, maxPeriodDays));
             double span = 1.0 / minPeriodDays - 1.0 / maxPeriodDays;
             return (int)Math.Clamp(Math.Ceiling(span / step), 200, 60000);
+        }
+
+        /// <summary>
+        /// How much of a score an isolated event keeps once physics is applied, from zero to one.
+        ///
+        /// SIGNAL TO NOISE IS NOT PLAUSIBILITY, and ranking on it put a 28 percent eclipse at the
+        /// head of a field: 280,351 ppm on a star whose radius makes the companion 5.4 Jupiter
+        /// radii, at a signal to noise of 278, scoring 139 while everything a planet could have
+        /// made sat below it. The measurement was excellent. The object is a star.
+        ///
+        /// A flat penalty for "vetting objected" cannot fix that, because a large enough signal to
+        /// noise walks through any constant. The things that make an event impossible have to zero
+        /// it instead:
+        ///
+        ///   * a companion past two and a half Jupiter radii is a star or a brown dwarf, and no
+        ///     amount of significance changes what it is
+        ///   * a depth past ten percent is the same statement made without a stellar radius
+        ///   * a duration pinned at the widest box searched means the event was never resolved
+        ///
+        /// Everything else is graded rather than judged, so a marginal event still ranks below a
+        /// convincing one without being thrown away.
+        /// </summary>
+        private static double Plausibility(JsonElement e)
+        {
+            double jupiter = Dbl(e, "companionRadiusEarth") / 11.21;
+            if (jupiter > 2.5) return 0.0;
+            if (Dbl(e, "depthPpm") > 100000) return 0.0;
+            if (Bool(e, "durationAtCeiling")) return 0.0;
+
+            double keep = 1.0;
+            // A dip that barely clears what the curve does upward, sits on a slope, or is matched
+            // by another window elsewhere is weakened rather than dismissed.
+            if (Dbl(e, "baselineTilt") > 0.25) keep *= 0.3;
+            if (Dbl(e, "nextBestFraction") > 0.7) keep *= 0.3;
+            if (Dbl(e, "coverageRatio") is double c && c > 0 && c < 0.85) keep *= 0.5;
+            return keep;
         }
 
         private static double Dbl(JsonElement e, string name)
