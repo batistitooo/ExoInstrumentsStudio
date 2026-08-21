@@ -895,19 +895,21 @@ namespace ExoStudio.Research
 
         public sealed class Sweep
         {
-            public string Id { get; init; }
-            public double RaDeg { get; init; }
-            public double DecDeg { get; init; }
-            public double RadiusDeg { get; init; }
-            public int MinSectors { get; init; }
-            public int Limit { get; init; }
+            // Settable rather than init only, because a sweep is now read back from disk as well
+            // as built in memory, and a deserialiser cannot fill an init only property here.
+            public string Id { get; set; }
+            public double RaDeg { get; set; }
+            public double DecDeg { get; set; }
+            public double RadiusDeg { get; set; }
+            public int MinSectors { get; set; }
+            public int Limit { get; set; }
             public string State { get; set; } = "listing";
             public int Total { get; set; }
             public int Done { get; set; }
             public string Current { get; set; } = "";
             public string Error { get; set; }
-            public DateTime StartedUtc { get; } = DateTime.UtcNow;
-            public List<Hit> Hits { get; } = new();
+            public DateTime StartedUtc { get; set; } = DateTime.UtcNow;
+            public List<Hit> Hits { get; set; } = new();
 
             /// <summary>How many stars the region held before anything was ruled out.</summary>
             public int Listed { get; set; }
@@ -926,7 +928,7 @@ namespace ExoStudio.Research
             public int CoverageUnknown { get; set; }
 
             /// <summary>Named examples of what was ruled out, so the filtering is visible rather than silent.</summary>
-            public List<string> TakenExamples { get; } = new();
+            public List<string> TakenExamples { get; set; } = new();
 
             /// <summary>Set when a register did not answer, because then the filtering is incomplete.</summary>
             public string FilterWarning { get; set; }
@@ -934,26 +936,80 @@ namespace ExoStudio.Research
 
         public sealed class Hit
         {
-            public string RunId { get; init; }
-            public string Target { get; init; }
-            public double RaDeg { get; init; }
-            public double DecDeg { get; init; }
-            public int Sectors { get; init; }
-            public double Score { get; init; }
-            public string Why { get; init; }
-            public bool Known { get; init; }
+            public string RunId { get; set; }
+            public string Target { get; set; }
+            public double RaDeg { get; set; }
+            public double DecDeg { get; set; }
+            public int Sectors { get; set; }
+            public double Score { get; set; }
+            public string Why { get; set; }
+            public bool Known { get; set; }
 
             /// <summary>
             /// Nothing was raised against it. A row without this is still worth having in the
             /// list, ranked and with its numbers, but it is not a row anybody should open first.
             /// </summary>
-            public bool Clean { get; init; }
+            public bool Clean { get; set; }
 
             /// <summary>Depth in ppm, so an implausible one can be seen without opening the run.</summary>
-            public double DepthPpm { get; init; }
+            public double DepthPpm { get; set; }
         }
 
         private readonly Dictionary<string, Sweep> sweeps = new();
+
+        /// <summary>
+        /// Sweeps kept on disk as well as in memory.
+        ///
+        /// A SWEEP THAT ONLY EXISTS IN MEMORY DIES SILENTLY. The process holding it can be
+        /// restarted for any number of ordinary reasons, and when it is, the identifier the page
+        /// is polling stops existing. The page swallowed the resulting 404 and went on polling,
+        /// showing the last state it had seen, so a sweep that had been killed looked exactly like
+        /// a sweep that had stalled: stuck at 34 of 100, for as long as anybody cared to watch.
+        ///
+        /// Written on every completed star, which is a small file a few times a minute, and read
+        /// back at startup. A sweep found still claiming to be running when the process starts is
+        /// one that was interrupted, and it says so rather than pretending to continue.
+        /// </summary>
+        private string SweepPath(string id) => Path.Combine(resultsDir, "sweeps", id + ".json");
+
+        private void PersistSweep(Sweep sweep)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.Combine(resultsDir, "sweeps"));
+                var options = new JsonSerializerOptions { IncludeFields = true, WriteIndented = false };
+                options.Converters.Add(new NanAsNullConverter());
+                string tmp = SweepPath(sweep.Id) + ".partial";
+                lock (sweep.Hits) File.WriteAllText(tmp, JsonSerializer.Serialize(sweep, options));
+                File.Move(tmp, SweepPath(sweep.Id), overwrite: true);
+            }
+            catch { /* a sweep that cannot be written is still a sweep worth finishing */ }
+        }
+
+        /// <summary>
+        /// Reads a sweep the current process did not run, and marks it interrupted if it was still
+        /// claiming to be searching when its process ended.
+        /// </summary>
+        private Sweep LoadSweep(string id)
+        {
+            try
+            {
+                string path = SweepPath(id);
+                if (!File.Exists(path)) return null;
+                var options = new JsonSerializerOptions { IncludeFields = true };
+                options.Converters.Add(new NanAsNullConverter());
+                Sweep sweep = JsonSerializer.Deserialize<Sweep>(File.ReadAllText(path), options);
+                if (sweep != null && (sweep.State == "searching" || sweep.State == "listing"))
+                {
+                    sweep.State = "interrupted";
+                    sweep.Error = $"this sweep stopped when the server it was running in restarted, "
+                                + $"after {sweep.Done} star(s). Its results are kept; start another "
+                                + "to carry on.";
+                }
+                return sweep;
+            }
+            catch { return null; }
+        }
 
         /// <summary>
         /// Searches a field, having first thrown away every star that is already spoken for.
@@ -979,6 +1035,7 @@ namespace ExoStudio.Research
                 MinSectors = minSectors, Limit = limit,
             };
             lock (sweeps) sweeps[sweep.Id] = sweep;
+            PersistSweep(sweep);
 
             _ = Task.Run(async () =>
             {
@@ -1072,6 +1129,7 @@ namespace ExoStudio.Research
                         catch { /* one bad star does not end a field */ }
 
                         sweep.Done = Interlocked.Increment(ref searched);
+                        PersistSweep(sweep);
                     }
                     }
 
@@ -1083,11 +1141,13 @@ namespace ExoStudio.Research
                     sweep.Total = sweep.Done;
                     sweep.State = "done";
                     sweep.Current = "";
+                    PersistSweep(sweep);
                 }
                 catch (Exception e)
                 {
                     sweep.State = "failed";
                     sweep.Error = e.Message;
+                    PersistSweep(sweep);
                 }
             });
             return sweep;
@@ -1243,7 +1303,9 @@ namespace ExoStudio.Research
         public object SweepStatus(string id)
         {
             Sweep s;
-            lock (sweeps) if (!sweeps.TryGetValue(id, out s)) return null;
+            lock (sweeps) sweeps.TryGetValue(id, out s);
+            s ??= LoadSweep(id);
+            if (s == null) return null;
             List<Hit> ranked;
             lock (s.Hits) ranked = s.Hits.OrderByDescending(h => h.Score).ToList();
             return new

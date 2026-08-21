@@ -3296,6 +3296,8 @@ function rsRenderSweep(s) {
       'stars in this field…';
   } else if (s.state === 'empty') {
     p.textContent = 'Nothing in this field has that many sectors. Lower the sector floor, or move.';
+  } else if (s.state === 'interrupted') {
+    p.textContent = s.error || 'This sweep was interrupted.';
   } else if (s.state === 'failed') {
     p.textContent = 'The sweep failed: ' + (s.error || 'unknown');
   } else {
@@ -3352,7 +3354,8 @@ function rsRenderSweep(s) {
     a.onclick = (e) => { e.preventDefault(); rsOpenRun(a.dataset.run); };
   }
 
-  if (s.state === 'done' || s.state === 'failed' || s.state === 'empty') {
+  if (s.state === 'done' || s.state === 'failed' || s.state === 'empty'
+      || s.state === 'interrupted') {
     clearInterval(rsSweepTimer);
     rsSweepTimer = null;
     $('rsSweep').disabled = false;
@@ -3403,9 +3406,34 @@ window.addEventListener('DOMContentLoaded', () => {
       return;
     }
     rsSweepId = r.id;
+    // A FAILED POLL WAS BEING SWALLOWED, and that is how a dead sweep passes for a slow one. If
+    // the server holding it restarts, the identifier stops existing and every poll 404s; catching
+    // that and carrying on left the last state frozen on screen, so a sweep killed at 34 of 100
+    // looked exactly like a sweep still working on the 35th, for as long as anybody watched.
+    let missed = 0;
     const poll = async () => {
-      try { rsRenderSweep(await (await fetch(`/api/research/sweep/${rsSweepId}`)).json()); }
-      catch { /* keep polling */ }
+      try {
+        const response = await fetch(`/api/research/sweep/${rsSweepId}`);
+        if (response.status === 404) {
+          clearInterval(rsSweepTimer); rsSweepTimer = null;
+          $('rsSweepProgress').textContent =
+            'This sweep is gone: the server restarted while it was running, so what it had ' +
+            'searched is saved under Runs recorded but the sweep itself cannot continue. ' +
+            'Start another to carry on.';
+          $('rsSweep').disabled = false; $('rsSweep').textContent = 'Sweep this field';
+          return;
+        }
+        if (!response.ok) throw new Error(String(response.status));
+        missed = 0;
+        rsRenderSweep(await response.json());
+      } catch (e) {
+        // A network hiccup is not a dead sweep; several in a row is worth saying.
+        if (++missed >= 5) {
+          $('rsSweepProgress').textContent =
+            `Cannot reach the server (${missed} attempts). The sweep may still be running; this ` +
+            'page will keep trying.';
+        }
+      }
     };
     poll();
     rsSweepTimer = setInterval(poll, 3000);
