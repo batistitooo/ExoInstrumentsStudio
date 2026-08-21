@@ -235,20 +235,30 @@ namespace ExoStudio.Research
             if (!found.Detected)
             {
                 log.Add("no repeating box cleared the threshold");
+                TransitSearchPipeline.LightCurve isolatedCurveForEmpty =
+                    IsolatedSearchCurve(loadedUnprocessed, flat, log, Took);
                 List<SingleTransitSearch.Event> alone = request.SingleTransits
-                    ? SingleTransitSearch.Find(IsolatedSearchCurve(loadedUnprocessed, flat, log, Took))
+                    ? SingleTransitSearch.Find(isolatedCurveForEmpty)
                     : new List<SingleTransitSearch.Event>();
                 log.Add($"single transit search [{Took()}]");
                 foreach (SingleTransitSearch.Event e in alone)
                     log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
                           + $"{e.DepthPpm:0} ppm over {e.DurationHours:0.#} h, SNR {e.Snr:0.#}");
 
-                string emptyId = Save(request, chosen, raw, flat, found, null, null, log, alone);
+                string emptyId = Save(request, chosen, raw, flat, found, null, null, log, alone,
+                                      isolatedCurveForEmpty);
                 return new
                 {
                     ok = true, detected = false, id = emptyId, log,
                     lightCurve = Describe(raw, flat),
                     series = Series(flat),
+                // THE CURVE THE ISOLATED EVENTS ACTUALLY LIVE IN, which is not the one above.
+                // The fold reads the provider's detrended flux; the isolated search reads the raw
+                // flux flattened on a five day median, because the detrended column has day long
+                // events removed from it. Showing only the first meant every star looked alike,
+                // since that column is flat by construction, and zooming on a reported dip showed
+                // a stretch of curve that could not contain it.
+                    isolatedSeries = Series(isolatedCurveForEmpty ?? flat),
                     singleTransits = alone.Select(Describe),
                     message = alone.Count > 0
                         ? "No repeating transit, but an isolated dip is present. That is the interesting "
@@ -288,7 +298,8 @@ namespace ExoStudio.Research
                       + (m.PeriodDays > 0 ? $", period {m.PeriodDays:0.#####} d (ratio {m.PeriodRatio:0.###})" : ""));
             foreach (string u in registry.Unavailable) log.Add("could not check " + u);
 
-            string id = Save(request, chosen, raw, flat, found, vetting, registry, log, singles);
+            string id = Save(request, chosen, raw, flat, found, vetting, registry, log, singles,
+                             isolatedCurve);
 
             return new
             {
@@ -298,6 +309,13 @@ namespace ExoStudio.Research
                 log,
                 lightCurve = Describe(raw, flat),
                 series = Series(flat),
+                // THE CURVE THE ISOLATED EVENTS ACTUALLY LIVE IN, which is not the one above.
+                // The fold reads the provider's detrended flux; the isolated search reads the raw
+                // flux flattened on a five day median, because the detrended column has day long
+                // events removed from it. Showing only the first meant every star looked alike,
+                // since that column is flat by construction, and zooming on a reported dip showed
+                // a stretch of curve that could not contain it.
+                isolatedSeries = Series(isolatedCurve ?? flat),
                 singleTransits = singles.Select(Describe),
                 candidate = new
                 {
@@ -560,7 +578,8 @@ namespace ExoStudio.Research
                             TransitSearchPipeline.LightCurve raw, TransitSearchPipeline.LightCurve flat,
                             DetectionResult found, TransitSearchPipeline.Vetting vetting,
                             KnownObjects.Report registry, List<string> log,
-                            List<SingleTransitSearch.Event> singles = null)
+                            List<SingleTransitSearch.Event> singles = null,
+                            TransitSearchPipeline.LightCurve isolated = null)
         {
             string id = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)
                       + "-" + Math.Abs(HashCode.Combine(request.RaDeg, request.DecDeg)).ToString("x8");
@@ -594,6 +613,13 @@ namespace ExoStudio.Research
                 // live response is, so a record is about a hundred kilobytes rather than a
                 // megabyte, and a run stays something you can keep thousands of.
                 series = Series(flat),
+                // THE CURVE THE ISOLATED EVENTS ACTUALLY LIVE IN, which is not the one above.
+                // The fold reads the provider's detrended flux; the isolated search reads the raw
+                // flux flattened on a five day median, because the detrended column has day long
+                // events removed from it. Showing only the first meant every star looked alike,
+                // since that column is flat by construction, and zooming on a reported dip showed
+                // a stretch of curve that could not contain it.
+                isolatedSeries = Series(isolated ?? flat),
                 result = found.Detected ? new
                 {
                     detected = true,
@@ -747,6 +773,9 @@ namespace ExoStudio.Research
                 log,
                 lightCurve = Describe(raw, flat),
                 series = Series(flat),
+                // One file, so the isolated search reads the same curve as the fold and there is
+                // no second version to offer.
+                isolatedSeries = Series(flat),
                 singleTransits = singles.Select(Describe),
                 candidate = found.Detected ? new
                 {
@@ -1043,22 +1072,29 @@ namespace ExoStudio.Research
                 double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
                 score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0);
                 why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
-                    + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}";
+                    + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}, "
+                    + $"{margin:0.##}x the best brightening";
             }
             else if (singles.Count > 0)
             {
+                // THE NUMBERS BELONG ON THE ROW. Saying only that vetting objected leaves a reader
+                // unable to rank one row against another, or to tell a 300 ppm quibble from a
+                // 5000 ppm one, and they are the numbers the ordering is computed from anyway.
                 JsonElement best = singles.OrderByDescending(e => Dbl(e, "snr")).First();
-                score = Dbl(best, "snr") * 0.5;
-                why = "isolated dip, but vetting raised something";
+                double bump = Dbl(best, "brighteningSnr");
+                double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
+                score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0) * 0.25;
+                why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
+                    + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}, "
+                    + $"{margin:0.##}x the best brightening; vetting raised something";
             }
             else if (r.TryGetProperty("detected", out JsonElement det) && det.ValueKind == JsonValueKind.True)
             {
                 JsonElement c = r.GetProperty("candidate");
                 bool passed = r.TryGetProperty("vetting", out JsonElement v) && Bool(v, "passed");
                 score = passed ? Dbl(c, "snr") : 0.1;
-                why = passed
-                    ? $"repeating, P {Dbl(c, "periodDays"):0.####} d, {Dbl(c, "depthPpm"):0} ppm"
-                    : "repeating, but vetting raised something";
+                why = $"repeating, P {Dbl(c, "periodDays"):0.####} d, {Dbl(c, "depthPpm"):0} ppm, "
+                    + $"SNR {Dbl(c, "snr"):0.#}" + (passed ? "" : "; vetting raised something");
             }
             else { score = 0; why = "nothing above threshold"; }
 

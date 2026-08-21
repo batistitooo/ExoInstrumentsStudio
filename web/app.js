@@ -1189,24 +1189,16 @@ $('capture').onclick = async () => {
     // GROUPED, NOT CONCATENATED. This used to be every entry joined with a middle dot, which on
     // a full install is a paragraph of absolute paths with the interesting part buried in it. The
     // label is what matters; the directory is the same for all of them and is available on hover.
-    // Deep sky patches collapse to a count, because six lines saying the same thing is not six
-    // pieces of information.
     const esc = (t) => String(t).replace(/[&<>"]/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-    const patches = [];
     const rows = [];
     for (const line of paths) {
       const at = line.indexOf(': ');
       const label = at > 0 ? line.slice(0, at) : line;
       const value = at > 0 ? line.slice(at + 2) : '';
-      if (/^star field patch$/i.test(label)) { patches.push(value.split(',')[0].trim()); continue; }
       const leaf = value.includes('/') ? value.slice(value.lastIndexOf('/') + 1) : value;
       rows.push(`<span class="dataItem" title="${esc(value)}"><b>${esc(label)}</b>${
         value ? ' ' + esc(leaf) : ''}</span>`);
-    }
-    if (patches.length) {
-      rows.push(`<span class="dataItem" title="${esc(patches.join(', '))}">` +
-        `<b>deep star field patches</b> ${patches.length} installed</span>`);
     }
     $('captureData').innerHTML = rows.join('');
     const box = $('captureDataWarnings');
@@ -2589,10 +2581,17 @@ async function rsOpenRun(id) {
     log: d.log || [],
     lightCurve: d.lightCurve || {},
     series: d.series || null,
+    // Forwarded explicitly, like everything else here. A field left out of this mapping is a field
+    // that exists in the record, exists in the live response, and silently disappears the moment a
+    // run is reopened: isolatedSeries went missing that way, and with it the only curve that
+    // actually contained the dip being reported.
+    isolatedSeries: d.isolatedSeries || null,
     curveTrimmed: !!d.curveTrimmed,
     singleTransits: (d.singleTransits || []).map((x) => ({
       centreTimeDays: x.CentreTimeDays, durationHours: x.DurationHours,
       depthPpm: x.DepthPpm, snr: x.Snr, pointsInDip: x.PointsInDip,
+      brighteningSnr: num(x.BrighteningSnr), coverageRatio: num(x.CoverageRatio),
+      redNoiseFactor: num(x.RedNoiseFactor),
       centroidShiftPixels: num(x.CentroidShiftPixels), concerns: x.Concerns || [],
       passed: !(x.Concerns || []).length,
     })),
@@ -2829,10 +2828,22 @@ function renderResearch(d) {
   $('rsCurveNote').textContent =
     `scatter ${rsFmt(lc.scatterPpmRaw, 0)} ppm before detrending, ${rsFmt(lc.scatterPpmDetrended, 0)} after. ` +
     d.log[0];
-  if (d.series && d.series.length) {
-    const t0 = d.series[0][0];
-    rsDrawCurve($('rsCurve'), d.series.map((p) => ({ x: p[0] - t0, y: p[1] })),
+  // THE CURVE SHOWN MUST BE THE ONE THE RESULT CAME FROM. The fold reads the provider's
+  // detrended flux and the isolated search reads the raw flux flattened on a five day median.
+  // Showing the first for every result made every star in a field look identical, because that
+  // column is flat by design, and it could not contain a dip the second one had found.
+  const shown = ((d.singleTransits || []).length && d.isolatedSeries && d.isolatedSeries.length)
+    ? d.isolatedSeries : d.series;
+  if (shown && shown.length) {
+    const t0 = shown[0][0];
+    rsDrawCurve($('rsCurve'), shown.map((p) => ({ x: p[0] - t0, y: p[1] })),
                 { xLabel: 'days from the first cadence' });
+    if (shown === d.isolatedSeries) {
+      $('rsCurveNote').textContent +=
+        ' Shown here is the unprocessed flux, flattened on a five day median, which is where the ' +
+        'isolated dip was found. The detrended column the fold uses has events of a day or more ' +
+        'removed from it.';
+    }
   } else {
     // A trimmed record: everything measured from the curve is still here, the curve itself is not.
     // Drawn as nothing and SAID, rather than left showing whichever run was open before it.
@@ -2975,9 +2986,15 @@ let rsVerdict = null;
 /** The curve around one event, wide enough to see whether the baseline either side is flat. */
 function rsDrawZoom(ev) {
   const cv = $('rsZoom');
-  if (!rsLast || !rsLast.series || !ev) return;
+  if (!rsLast || !ev) return;
+  // The curve the event was found in, not the one the fold used; see the note where the full
+  // light curve is drawn. Zooming a reported dip on the detrended column showed a flat stretch
+  // that could not contain it, because that column has events of a day or more removed.
+  const source = (rsLast.isolatedSeries && rsLast.isolatedSeries.length)
+    ? rsLast.isolatedSeries : rsLast.series;
+  if (!source) return;
   const half = ev.durationHours / 24 * 4;      // four durations either side
-  const pts = rsLast.series
+  const pts = source
     .filter((p) => Math.abs(p[0] - ev.centreTimeDays) <= half)
     .map((p) => ({ x: (p[0] - ev.centreTimeDays) * 24, y: p[1] }));
   rsDrawCurve(cv, pts, { xLabel: 'hours from the centre of the dip' });
@@ -2985,6 +3002,15 @@ function rsDrawZoom(ev) {
   $('rsZoomNote').textContent =
     `${ev.depthPpm.toFixed(0)} ppm deep over ${ev.durationHours.toFixed(1)} h, signal to noise ` +
     `${ev.snr.toFixed(1)}, ${ev.pointsInDip} cadences inside it` +
+    // THE MARGIN IS THE NUMBER THAT DECIDES, so it belongs beside the depth rather than buried in
+    // a concern. Nothing makes a star brighter in the shape of a box, so the best brightening in
+    // the same curve is what its noise manages for no reason at all, and how far the dip clears
+    // that is the whole question.
+    (Number.isFinite(ev.brighteningSnr) && ev.brighteningSnr > 0
+      ? `. The strongest brightening of the same duration in this curve reaches ` +
+        `${ev.brighteningSnr.toFixed(1)}, so this dip clears it ` +
+        `${(ev.snr / ev.brighteningSnr).toFixed(2)} times over`
+      : '') +
     (Number.isFinite(ev.centroidShiftPixels)
       ? `. The centre of light moved ${ev.centroidShiftPixels.toFixed(4)} px during the dip` +
         (ev.centroidShiftPixels < 0.01 ? ', which is consistent with the light coming from this star.' : '.')
@@ -3199,7 +3225,7 @@ function rsRenderSweep(s) {
   $('rsSweepMeta').textContent =
     `${s.field.radius}° around ${s.field.ra.toFixed(2)} ${s.field.dec >= 0 ? '+' : ''}` +
     `${s.field.dec.toFixed(2)}, at least ${s.field.minSectors} sectors · ` +
-    `${worth.length} worth opening of ${s.done} searched`;
+    `${worth.length} worth opening of ${s.done} searched, ranked by how far each dip stands above what the same curve manages upward`;
 
   // WHAT WAS RULED OUT, AND WHY, rather than a list that silently omits things. A star already
   // carrying a published planet or a mission candidate is dropped before anything is downloaded,
@@ -3227,7 +3253,7 @@ function rsRenderSweep(s) {
   $('rsSweepList').innerHTML = worth.length
     ? worth.map((h) => `<a class="rsRun hit" href="#" data-run="${h.runId}">` +
         `<b>TIC ${h.target}</b><span>${h.why}</span>` +
-        `<time>${h.sectors} sectors</time></a>`).join('')
+        `<time>${h.score.toFixed(1)} · ${h.sectors} sectors</time></a>`).join('')
     : (s.state === 'done'
         ? '<p class="hint dim">Nothing in this field worth opening. That is the usual answer, and ' +
           'every star is recorded, so the field is now searched rather than unknown.</p>'
