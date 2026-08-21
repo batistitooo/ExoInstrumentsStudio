@@ -36,6 +36,9 @@ namespace ExoStudio.Research
     /// </summary>
     public static class SingleTransitSearch
     {
+        /// <summary>The Sun's radius in Earth radii, for turning a ratio of radii into a size.</summary>
+        private const double SolarRadiiInEarthRadii = 109.076;
+
         /// <summary>
         /// How far a dip must clear the strongest brightening of the same duration before it is
         /// worth reporting at all.
@@ -66,6 +69,20 @@ namespace ExoStudio.Research
 
             /// <summary>Depth of the next best window elsewhere, as a fraction of this one. Near 1 means nothing special happened here.</summary>
             public double NextBestFraction;
+
+            /// <summary>
+            /// True when the best fitting duration is the longest one searched, which means the
+            /// event was never resolved: whatever is happening lasts longer than the widest box
+            /// and the box simply took as much of it as it could.
+            /// </summary>
+            public bool DurationAtCeiling;
+
+            /// <summary>
+            /// The companion's radius in Earth radii, when the caller supplied a stellar radius.
+            /// Depth gives the ratio of radii and nothing else, so this is the only place the
+            /// question "could a planet do this" can actually be answered.
+            /// </summary>
+            public double CompanionRadiusEarth = double.NaN;
 
             /// <summary>
             /// How far apart the two baseline flanks sit, as a fraction of the depth.
@@ -126,7 +143,8 @@ namespace ExoStudio.Research
                                        double minDurationHours = 1.0,
                                        double maxDurationHours = 24.0,
                                        double snrThreshold = 7.0,
-                                       int maxEvents = 5)
+                                       int maxEvents = 5,
+                                       double stellarRadiusSolar = 0.0)
         {
             var found = new List<Event>();
             int n = curve.Count;
@@ -333,7 +351,21 @@ namespace ExoStudio.Research
                 }
             }
 
-            foreach (Event e in found) Assess(curve, e, noise);
+            foreach (Event e in found)
+            {
+                // AT THE CEILING MEANS UNRESOLVED. The trial durations stop at maxDurationHours,
+                // so an event longer than that cannot be fitted, only clipped: the box takes the
+                // widest bite it can and reports that width. Seven of thirteen rows in one field
+                // came back at exactly 24.0 hours, which is not seven day long transits but seven
+                // slow variations truncated at the same place.
+                e.DurationAtCeiling = e.DurationHours >= maxDurationHours * 0.99;
+
+                if (stellarRadiusSolar > 0 && e.DepthPpm > 0)
+                    e.CompanionRadiusEarth =
+                        Math.Sqrt(e.DepthPpm / 1e6) * stellarRadiusSolar * SolarRadiiInEarthRadii;
+
+                Assess(curve, e, noise);
+            }
             return found;
         }
 
@@ -346,6 +378,24 @@ namespace ExoStudio.Research
             // Between a few percent and thirty, the photometry may be sound but the companion is
             // not a planet: a Jupiter in front of a sun sized star is one percent, and three
             // percent already needs a body larger than any planet.
+            if (e.DurationAtCeiling)
+                e.Concerns.Add("the best fitting duration is the longest one searched, so the event "
+                             + "was never resolved: it lasts longer than the widest box and the box "
+                             + "took what it could reach. Something on a slower timescale, not a "
+                             + "crossing with a beginning and an end.");
+
+            // THE ONLY PLACE THE QUESTION CAN BE ANSWERED. A depth is a ratio of radii, so 4.3
+            // percent is a credible Jupiter in front of a half sized dwarf and a small star in
+            // front of a sun sized one. Nothing in the light curve settles it; the stellar radius
+            // does. Two and a half Jupiter radii is where planets stop: degeneracy holds a giant
+            // near one Jupiter radius over a wide range of masses, and everything larger is a star
+            // or a brown dwarf caught young.
+            if (!double.IsNaN(e.CompanionRadiusEarth) && e.CompanionRadiusEarth > 28.0)
+                e.Concerns.Add($"that depth on this star means a companion of "
+                             + $"{e.CompanionRadiusEarth / 11.21:0.#} Jupiter radii. No planet is that "
+                             + "large: past about two and a half, the object is a star or a brown "
+                             + "dwarf rather than a planet.");
+
             if (e.DepthPpm > 50000)
                 e.Concerns.Add($"a dip of {e.DepthPpm / 10000.0:0.#} percent is far too deep for a "
                              + "planet. Around a star of ordinary size that needs a companion larger "

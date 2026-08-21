@@ -95,6 +95,12 @@ namespace ExoStudio.Research
             public int MaxSectors { get; set; }
 
             /// <summary>
+            /// The star's radius in solar radii, when the caller knows it. Without it a depth is
+            /// only a ratio and the search cannot say whether a planet could have produced it.
+            /// </summary>
+            public double StellarRadiusSolar { get; set; }
+
+            /// <summary>
             /// Search for ONE dip as well as repeating ones. On by default, because it is the
             /// regime the mission pipelines leave behind and therefore the only one where a
             /// discovery is realistically still waiting.
@@ -256,7 +262,7 @@ namespace ExoStudio.Research
                 TransitSearchPipeline.LightCurve isolatedCurveForEmpty =
                     IsolatedSearchCurve(loadedUnprocessed, flat, log, Took);
                 List<SingleTransitSearch.Event> alone = request.SingleTransits
-                    ? SingleTransitSearch.Find(isolatedCurveForEmpty)
+                    ? SingleTransitSearch.Find(isolatedCurveForEmpty, stellarRadiusSolar: request.StellarRadiusSolar)
                     : new List<SingleTransitSearch.Event>();
                 log.Add($"single transit search [{Took()}]");
                 foreach (SingleTransitSearch.Event e in alone)
@@ -295,7 +301,7 @@ namespace ExoStudio.Research
             TransitSearchPipeline.LightCurve isolatedCurve =
                 IsolatedSearchCurve(loadedUnprocessed, flat, log, Took);
             List<SingleTransitSearch.Event> singles = request.SingleTransits
-                ? SingleTransitSearch.Find(isolatedCurve)
+                ? SingleTransitSearch.Find(isolatedCurve, stellarRadiusSolar: request.StellarRadiusSolar)
                 : new List<SingleTransitSearch.Event>();
             foreach (SingleTransitSearch.Event e in singles)
                 log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
@@ -598,6 +604,8 @@ namespace ExoStudio.Research
             nextBestFraction = e.NextBestFraction,
             coverageRatio = e.CoverageRatio,
             baselineTilt = e.BaselineTilt,
+            durationAtCeiling = e.DurationAtCeiling,
+            companionRadiusEarth = e.CompanionRadiusEarth,
             redNoiseFactor = e.RedNoiseFactor,
             brighteningSnr = e.BrighteningSnr,
             centroidShiftPixels = e.CentroidShiftPixels,
@@ -1052,6 +1060,7 @@ namespace ExoStudio.Research
                             {
                                 RaDeg = t.RaDeg, DecDeg = t.DecDeg, Tic = tic,
                                 Label = $"TIC {t.Name} ({sectors.Count} sectors)",
+                                StellarRadiusSolar = t.RadiusSolar,
                                 MinPeriodDays = template.MinPeriodDays,
                                 MaxPeriodDays = template.MaxPeriodDays,
                                 DetrendWindowDays = template.DetrendWindowDays,
@@ -1142,9 +1151,11 @@ namespace ExoStudio.Research
                 score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0);
                 clean = true;
                 depth = Dbl(best, "depthPpm");
+                double rpc = Dbl(best, "companionRadiusEarth");
                 why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
-                    + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}, "
-                    + $"{margin:0.##}x the best brightening";
+                    + $"{Dbl(best, "durationHours"):0.#} h"
+                    + (rpc > 0 ? $" ({rpc:0.#} Earth radii)" : "")
+                    + $", SNR {Dbl(best, "snr"):0.#}, {margin:0.##}x the best brightening";
             }
             else if (singles.Count > 0)
             {
@@ -1156,8 +1167,11 @@ namespace ExoStudio.Research
                 double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
                 score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0) * 0.25;
                 depth = Dbl(best, "depthPpm");
+                double rp = Dbl(best, "companionRadiusEarth");
                 why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
-                    + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}, "
+                    + $"{Dbl(best, "durationHours"):0.#} h"
+                    + (rp > 0 ? $" ({rp / 11.21:0.#} R Jupiter)" : "")
+                    + $", SNR {Dbl(best, "snr"):0.#}, "
                     + $"{margin:0.##}x the best brightening; vetting raised something";
             }
             else if (r.TryGetProperty("detected", out JsonElement det) && det.ValueKind == JsonValueKind.True)
