@@ -254,7 +254,7 @@ namespace ExoStudio.Research
         /// also means a search here inherits whatever that pipeline did, including its known
         /// habit of suppressing signals longer than a few days.
         /// </summary>
-        public static LightCurve Load(string fitsPath)
+        public static LightCurve Load(string fitsPath, bool preferUnprocessed = false)
         {
             FitsBinaryTable table = FitsBinaryTable.Read(fitsPath);
 
@@ -265,8 +265,28 @@ namespace ExoStudio.Research
             // others give a plain FLUX. Preferring in this order takes the most processed version
             // each provider offers, and falls back rather than failing, because the full frame
             // products are the ones covering the sky nobody has searched star by star.
-            string fluxColumn = new[] { "PDCSAP_FLUX", "DET_FLUX", "KSPSAP_FLUX",
-                                        "CORR_FLUX", "PCA_FLUX", "FLUX", "SAP_FLUX" }
+            // A PROVIDER'S DETRENDED FLUX IS NOT ALWAYS THE BETTER ONE, and for the events this
+            // software exists to find it is the wrong column outright.
+            //
+            // QLP's DET_FLUX has had its systematics removed by a filter tuned for the short
+            // period transits the mission's own pipelines chase. A transit lasting a day does not
+            // look like a systematic to a person, but it does to that filter, and it goes with
+            // them. Measured on TOI-2180, whose planet was found by a citizen scientist looking at
+            // one 24 hour transit: across all 36 sectors QLP holds, the deepest 24 hour dip
+            // anywhere in DET_FLUX is 129 ppm. In SAP_FLUX from the same files the transit sits at
+            // BTJD 2871.52, against 2871.62 predicted by the published ephemeris, 4599 ppm deep
+            // against 4748 ppm published. The signal is not faint in the detrended column, it is
+            // absent.
+            //
+            // So the caller says which it wants. The period search keeps the processed flux, where
+            // the provider's work removes real systematics from the short transits it was built
+            // for. The isolated event search asks for the unprocessed flux and does its own
+            // detrending on a window far wider than the events it is looking for.
+            string[] preference = preferUnprocessed
+                ? new[] { "SAP_FLUX", "FLUX", "PDCSAP_FLUX", "CORR_FLUX", "PCA_FLUX", "DET_FLUX", "KSPSAP_FLUX" }
+                : new[] { "PDCSAP_FLUX", "DET_FLUX", "KSPSAP_FLUX",
+                          "CORR_FLUX", "PCA_FLUX", "FLUX", "SAP_FLUX" };
+            string fluxColumn = preference
                 .FirstOrDefault(table.Has)
                 ?? throw new InvalidOperationException(
                     "no recognised flux column; the file has: " + string.Join(", ", table.ColumnNames));

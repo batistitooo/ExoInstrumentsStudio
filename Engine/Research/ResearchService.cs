@@ -171,12 +171,18 @@ namespace ExoStudio.Research
                 catch { lock (refused) refused.Add($"sector {p.Sector}"); return null; }
             }));
             string fetched = Took();
+            var loadedUnprocessed = new List<TransitSearchPipeline.LightCurve>();
             foreach (string one in paths.Where(x => x != null))
             {
                 // A sector that will not parse is a sector missing from the baseline, not a
                 // failed search: the rest of them still say something about this star.
                 try { loaded.Add(TransitSearchPipeline.Load(one)); }
-                catch { refused.Add(Path.GetFileName(one)); }
+                catch { refused.Add(Path.GetFileName(one)); continue; }
+                // The same file read again from its least processed column, for the isolated
+                // event search. See the note in Load: a provider's detrending erases day long
+                // transits, which are exactly the ones still waiting to be found.
+                try { loadedUnprocessed.Add(TransitSearchPipeline.Load(one, preferUnprocessed: true)); }
+                catch { /* the processed copy is still searchable */ }
             }
             if (loaded.Count == 0)
                 return new
@@ -230,7 +236,7 @@ namespace ExoStudio.Research
             {
                 log.Add("no repeating box cleared the threshold");
                 List<SingleTransitSearch.Event> alone = request.SingleTransits
-                    ? SingleTransitSearch.Find(flat)
+                    ? SingleTransitSearch.Find(IsolatedSearchCurve(loadedUnprocessed, flat, log, Took))
                     : new List<SingleTransitSearch.Event>();
                 log.Add($"single transit search [{Took()}]");
                 foreach (SingleTransitSearch.Event e in alone)
@@ -258,8 +264,10 @@ namespace ExoStudio.Research
             // least squares needs two or three transits, so a sector of 27 days cannot see a
             // period beyond about nine days at all. That gap is where TOI-2180 b was found, by a
             // person looking at a single event the pipelines had no way to trigger on.
+            TransitSearchPipeline.LightCurve isolatedCurve =
+                IsolatedSearchCurve(loadedUnprocessed, flat, log, Took);
             List<SingleTransitSearch.Event> singles = request.SingleTransits
-                ? SingleTransitSearch.Find(flat)
+                ? SingleTransitSearch.Find(isolatedCurve)
                 : new List<SingleTransitSearch.Event>();
             foreach (SingleTransitSearch.Event e in singles)
                 log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
@@ -350,6 +358,47 @@ namespace ExoStudio.Research
         }
 
 
+        /// <summary>
+        /// The curve the isolated event search should read, which is not the one the period search
+        /// reads.
+        ///
+        /// Two differences, both of which decide whether a day long transit survives to be seen.
+        /// The flux is the provider's least processed, because their detrending removes events of
+        /// this length along with the systematics. And the running median that flattens it is five
+        /// days wide, because a window only a few times the event's own duration eats into it: the
+        /// median inside a 24 hour transit is computed largely from in transit points, so the
+        /// transit becomes its own baseline and vanishes.
+        ///
+        /// Leaving the systematics in is the cost, and it is paid for by the brightening control
+        /// inside the search, which measures what this particular curve can do upward and demands
+        /// that a dip beat it.
+        /// </summary>
+        private static TransitSearchPipeline.LightCurve IsolatedSearchCurve(
+            List<TransitSearchPipeline.LightCurve> unprocessed,
+            TransitSearchPipeline.LightCurve fallback,
+            List<string> log, Func<string> took)
+        {
+            if (unprocessed == null || unprocessed.Count == 0) return fallback;
+            try
+            {
+                TransitSearchPipeline.LightCurve joined = TransitSearchPipeline.Stitch(unprocessed);
+                TransitSearchPipeline.LightCurve flattened =
+                    TransitSearchPipeline.Detrend(joined, IsolatedDetrendDays);
+                log.Add($"isolated event search reads the unprocessed flux instead, flattened on a "
+                      + $"{IsolatedDetrendDays:0.#} day median: a provider's own detrending removes "
+                      + $"day long transits along with the systematics [{took()}]");
+                return flattened;
+            }
+            catch { return fallback; }
+        }
+
+        /// <summary>
+        /// Five days, against a longest searched event of one. Wide enough that a 24 hour transit
+        /// contributes little to its own baseline, narrow enough to still follow the slow drifts
+        /// an unprocessed light curve carries.
+        /// </summary>
+        private const double IsolatedDetrendDays = 5.0;
+
         private static object Describe(SingleTransitSearch.Event e) => new
         {
             centreTimeDays = e.CentreTimeDays,
@@ -361,6 +410,7 @@ namespace ExoStudio.Research
             nextBestFraction = e.NextBestFraction,
             coverageRatio = e.CoverageRatio,
             redNoiseFactor = e.RedNoiseFactor,
+            brighteningSnr = e.BrighteningSnr,
             centroidShiftPixels = e.CentroidShiftPixels,
             concerns = e.Concerns,
             passed = e.Concerns.Count == 0,

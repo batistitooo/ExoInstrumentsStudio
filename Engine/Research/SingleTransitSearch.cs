@@ -36,6 +36,14 @@ namespace ExoStudio.Research
     /// </summary>
     public static class SingleTransitSearch
     {
+        /// <summary>
+        /// How far a dip must clear the strongest brightening of the same duration before it
+        /// counts. Symmetric noise gives the two the same distribution, so anything at or near
+        /// parity is simply the downward half of it; a real transit leaves it far behind. WASP 18
+        /// b clears its own curve's best brightening several times over.
+        /// </summary>
+        private const double BrighteningMargin = 1.5;
+
         public sealed class Event
         {
             public double CentreTimeDays;
@@ -48,6 +56,14 @@ namespace ExoStudio.Research
 
             /// <summary>Depth of the next best window elsewhere, as a fraction of this one. Near 1 means nothing special happened here.</summary>
             public double NextBestFraction;
+
+            /// <summary>
+            /// The strongest BRIGHTENING of the same duration anywhere in this light curve, in the
+            /// same units as Snr. A transit removes light; noise and systematics move both ways.
+            /// So whatever this curve manages upward is what it can also manage downward for no
+            /// reason, and a dip only means something if it clears that by a margin.
+            /// </summary>
+            public double BrighteningSnr;
 
             /// <summary>
             /// Cadences inside the dip against the number the light curve's own cadence would
@@ -100,8 +116,15 @@ namespace ExoStudio.Research
             // the box rather than a fine grid: a box half the right width still finds the event.
             var durations = new List<double>();
             for (double h = minDurationHours; h <= maxDurationHours; h *= 1.4) durations.Add(h / 24.0);
+            // The geometric ladder stops short of the ceiling, and the ceiling is where the day
+            // long transits live: TOI-2180 b lasts 24.1 hours and the last rung reaches 20.7.
+            if (durations.Count == 0 || durations[durations.Count - 1] < maxDurationHours / 24.0 * 0.98)
+                durations.Add(maxDurationHours / 24.0);
 
             var candidates = new List<Event>();
+            // The strongest upward excursion found at each duration, which is what calibrates the
+            // downward ones. See BrighteningSnr.
+            var brightestByDuration = new Dictionary<double, double>();
             foreach (double dur in durations)
             {
                 // THE NOISE IS MEASURED AT THE DURATION OF THE EVENT, NOT EXTRAPOLATED FROM ONE
@@ -195,7 +218,25 @@ namespace ExoStudio.Research
                     double b = MedianOf(curve.Flux, leftOuter, leftInner, rightInner, rightOuter);
                     double d = MedianOf(curve.Flux, dipLo, dipHi, 0, 0);
                     double depth = b - d;
-                    if (depth <= 0) continue;
+
+                    // THE SAME SEARCH, RUN UPWARDS, IS THE CONTROL. Every window that comes out
+                    // BRIGHTER than its surroundings is measured with the identical statistic and
+                    // the strongest is kept. No star brightens by a percent for an hour in the
+                    // shape of a box, so whatever this reaches is what this particular light
+                    // curve's noise, systematics and variability can produce for no reason at all.
+                    // It calibrates the threshold against the data instead of against an assumed
+                    // distribution, which matters because the assumption was wrong: a robust
+                    // scatter underestimates the tails of a real curve, and sliding boxes over 969
+                    // joined days takes some 200,000 trial positions, so the extremes get many
+                    // chances to appear. Judged against a nominal threshold, 38 stars out of 40 in
+                    // one field looked worth opening.
+                    if (depth <= 0)
+                    {
+                        double bump = -depth / depthSigma;
+                        if (bump > brightestByDuration.GetValueOrDefault(dur))
+                            brightestByDuration[dur] = bump;
+                        continue;
+                    }
 
                     double sigma = depthSigma;
                     double snr = depth / sigma;
@@ -215,6 +256,19 @@ namespace ExoStudio.Research
                     });
                 }
             }
+            // Attach each candidate the strongest brightening at its own duration, since what the
+            // noise can do depends on the timescale being asked about.
+            foreach (Event e in candidates)
+                e.BrighteningSnr = brightestByDuration.GetValueOrDefault(e.DurationHours / 24.0);
+
+            // A dip that does not clear the best brightening of the same duration is not a
+            // detection, it is the deeper half of this curve's own scatter. Dropped outright
+            // rather than reported with a caveat, because a list where most entries are noise is
+            // not a list anybody can use.
+            candidates = candidates
+                .Where(e => e.BrighteningSnr <= 0 || e.Snr >= e.BrighteningSnr * BrighteningMargin)
+                .ToList();
+
             if (candidates.Count == 0) return found;
 
             // One event, not the hundred overlapping boxes that found it. Strongest first, then
@@ -253,6 +307,12 @@ namespace ExoStudio.Research
                 e.Concerns.Add($"the dip holds only {e.CoverageRatio:P0} of the cadences this light "
                              + "curve's cadence would give over that span, so the mission flagged "
                              + "part of this stretch and the depth rests on what survived the mask.");
+
+            if (e.BrighteningSnr > 0 && e.Snr < e.BrighteningSnr * 2.0)
+                e.Concerns.Add($"the strongest brightening of the same duration in this light curve "
+                             + $"reaches {e.BrighteningSnr:0.#} against this dip's {e.Snr:0.#}. Nothing "
+                             + "makes a star brighter in that shape, so the curve reaches nearly this "
+                             + "far on its own and the margin here is slim.");
 
             if (e.RedNoiseFactor > 3.0)
                 e.Concerns.Add($"this light curve is {e.RedNoiseFactor:0.#} times noisier on the "
