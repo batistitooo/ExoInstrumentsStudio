@@ -723,13 +723,55 @@ table.signals tr.miss td { color: var(--ink-faint); }
   margin: 1rem 0; padding: 0.75rem 0.9rem;
   border-left: 3px solid #d8a657; opacity: 0.85; font-size: 0.88em; line-height: 1.5;
 }
+/* The run list folds away. The default triangle is replaced because it sits on the baseline of
+   a heading it is twice too small for, and because it has to point the same way in both states
+   without the browser deciding. */
+.rsRunsFold > summary {
+  display: flex; align-items: baseline; gap: 9px;
+  cursor: pointer; list-style: none; user-select: none;
+}
+.rsRunsFold > summary::-webkit-details-marker { display: none; }
+.rsRunsFold > summary h2 { margin: 0; }
+.rsRunsFold > summary:hover .rsCaret { border-left-color: var(--ink); }
+.rsCaret {
+  flex: none; width: 0; height: 0; align-self: center;
+  border-left: 5px solid var(--ink-faint);
+  border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  transition: transform .12s ease;
+}
+.rsRunsFold[open] > summary .rsCaret { transform: rotate(90deg); }
+.rsRunsFold[open] > summary { margin-bottom: 10px; }
+
+.rsRunsBar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.rsRunsBar .chips { margin-top: 0; }
+.rsRunsActions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rsRunsActions .ghost { padding: 5px 11px; font-size: 11px; }
+/* The two controls that destroy something are marked as such, and only once they are hovered do
+   they go fully red: a row of red buttons reads as an error state, not as a set of choices. */
+.rsDanger { color: var(--ink-faint); }
+.rsDanger:not(:disabled):hover {
+  background: rgba(226,110,110,.12); color: #e26e6e; border-color: rgba(226,110,110,.4);
+}
+#rsRunsOut { margin: 0 0 10px; }
+
 .researchRuns { display: flex; flex-direction: column; gap: 0.35rem; }
+/* Two shapes, one row. The sweep list IS the anchor, because a swept star has nothing to do but
+   open; a recorded run wraps one, because it also carries a control that removes it, and a button
+   inside an anchor is not a thing. Both get the same rule, and the wrapper hands the layout down
+   to the anchor inside it. */
 .rsRun {
   display: flex; gap: 1rem; align-items: baseline; text-decoration: none;
   padding: 0.45rem 0.7rem; border-left: 3px solid transparent; font-size: 0.87em;
   /* Without an explicit colour these anchors fall back to the browser's blue,
      which is close to unreadable against the panel. */
   color: var(--ink);
+}
+.rsRun > a {
+  display: flex; gap: 1rem; align-items: baseline; flex: 1; min-width: 0;
+  text-decoration: none; color: inherit;
 }
 .rsRun:hover { background: var(--bg-hover); }
 .rsRun.hit { border-left-color: #6bbf8a; }
@@ -738,6 +780,19 @@ table.signals tr.miss td { color: var(--ink-faint); }
 .rsRun.null span { color: var(--ink-dim); }
 .rsRun b { min-width: 10rem; color: var(--ink); }
 .rsRun time { margin-left: auto; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+/* The element is in these two selectors only to outweigh the .rsRun.hit span rule above, which
+   would otherwise paint every span in a candidate row green, these included. */
+.rsRun span.rsVerdictTag { color: var(--amber); }
+.rsRun span.rsTrimmed { color: var(--ink-faint); font-style: italic; }
+/* Revealed on hover of its own row, so a list of three hundred is not also a list of three
+   hundred delete buttons. Kept in the layout at all times so nothing shifts when it appears. */
+.rsDrop {
+  flex: none; padding: 0 6px; line-height: 1.4; font-size: 13px;
+  background: transparent; border: 1px solid transparent; color: var(--ink-faint);
+  visibility: hidden;
+}
+.rsRun:hover .rsDrop, .rsDrop:focus-visible { visibility: visible; }
+.rsDrop:hover { color: #e26e6e; border-color: rgba(226,110,110,.4); }
 
 /* Visual inspection: the step where a person, not the pipeline, decides. */
 .rsVerdict { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
@@ -746,3 +801,11 @@ table.signals tr.miss td { color: var(--ink-faint); }
 
 /* Sweep progress, in the setup column under its button. */
 .rsProgress { margin-top: 10px; font-size: 0.85em; opacity: 0.8; line-height: 1.4; }
+
+/* The sector list under the quick look chart. Each is a link because clicking one is how you
+   check whether a dip repeats: a real signal shows in more than one sector, an artefact does not. */
+#rsLookSectors a { display: inline; margin-right: .45rem; text-decoration: none; opacity: .65;
+                   color: inherit; background: none; border: 0; padding: 0; }
+#rsLookSectors a:hover { opacity: 1; }
+#rsLookSectors a.on { opacity: 1; font-weight: 600; text-decoration: underline; }
+#rsLookForm input { min-width: 0; flex: 1 1 8rem; }

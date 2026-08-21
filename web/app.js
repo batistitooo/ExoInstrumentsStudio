@@ -159,7 +159,8 @@ function setMode(mode, opts = {}) {
   // happened and belongs to somebody else, so those blocks are the ones that go rather than the
   // whole layout. The page is not a different application in this mode, only a different question.
   const research = mode === 'research';
-  for (const id of ['rsSetup', 'rsSearchBlock', 'rsSweepBlock', 'rsRun', 'rsAboutPanel', 'rsRunsPanel']) {
+  for (const id of ['rsSetup', 'rsSearchBlock', 'rsSweepBlock', 'rsRun', 'rsAboutPanel',
+                    'rsLookPanel', 'rsRunsPanel']) {
     $(id).hidden = !research;
   }
   $('rsSweepPanel').hidden = true;
@@ -2588,6 +2589,7 @@ async function rsOpenRun(id) {
     log: d.log || [],
     lightCurve: d.lightCurve || {},
     series: d.series || null,
+    curveTrimmed: !!d.curveTrimmed,
     singleTransits: (d.singleTransits || []).map((x) => ({
       centreTimeDays: x.CentreTimeDays, durationHours: x.DurationHours,
       depthPpm: x.DepthPpm, snr: x.Snr, pointsInDip: x.PointsInDip,
@@ -2623,25 +2625,193 @@ async function rsOpenRun(id) {
   $('rsCurvePanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
+// THE RECORDED RUNS, AND NOT KEEPING ALL OF THEM. One record per star searched means a single
+// field sweep adds hundreds, at a few hundred kilobytes each, and the list stops being something
+// anyone reads. The listing is held here so the filter chips can re-render without asking the
+// server again, and so the counts in the header are the same numbers the buttons act on.
+let rsRunList = [];
+let rsRunFilter = 'all';
+// Whether the person has folded this open or shut themselves. Until they do, the first state is
+// chosen from how long the list is; after they do, it is theirs and re-rendering leaves it alone.
+let rsRunsFoldTouched = false;
+
+const RS_RUN_FILTERS = {
+  all: () => true,
+  candidates: (r) => r.detected,
+  events: (r) => r.events > 0,
+  reviewed: (r) => !!r.verdict,
+};
+
+function rsBytes(n) {
+  if (!(n > 0)) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} kB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const rsEsc = (t) => String(t).replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
 async function loadResearchRuns() {
   const box = $('rsRuns');
   if (!box) return;
   try {
-    const runs = await (await fetch('/api/research/runs')).json();
-    box.innerHTML = runs.length
-      ? runs.map((r) => `<a class="rsRun ${r.detected ? 'hit' : 'null'}" href="#" data-run="${r.id}">` +
-          `<b>${r.label || '(unnamed)'}</b><span>${r.detected ? 'candidate' : 'nothing above threshold'}</span>` +
-          `<time>${(r.recordedUtc || '').replace('T', ' ').slice(0, 16)}</time></a>`).join('')
-      : '<p class="hint dim">No runs yet.</p>';
-    // Opens it in the panels. It used to link straight at the stored JSON, which showed a page of
-    // raw record instead of the light curve the whole tab exists to look at.
-    for (const a of box.querySelectorAll('a[data-run]')) {
-      a.onclick = (e) => { e.preventDefault(); rsOpenRun(a.dataset.run); };
-    }
+    rsRunList = await (await fetch('/api/research/runs')).json();
   } catch {
+    rsRunList = [];
+    $('rsRunsCount').textContent = '';
     box.innerHTML = '<p class="hint dim">Could not read the run list.</p>';
+    return;
+  }
+  if (!rsRunsFoldTouched) {
+    // A handful of runs is a useful thing to see on arrival. Three hundred is a wall, and the
+    // panel sits between the reader and the light curve above it.
+    $('rsRunsPanel').open = rsRunList.length <= 20;
+  }
+  rsRenderRuns();
+}
+
+function rsRenderRuns() {
+  const box = $('rsRuns');
+  if (!box) return;
+
+  const runs = rsRunList;
+  const candidates = runs.filter((r) => r.detected).length;
+  const reviewed = runs.filter((r) => r.verdict).length;
+  const bytes = runs.reduce((t, r) => t + (r.bytes || 0), 0);
+  const empty = runs.filter((r) => !r.detected && !r.events && !r.verdict).length;
+
+  // WHAT IS STORED, SAID IN THE HEADER. The question that leads anyone to these controls is
+  // whether keeping all this is worth it, and that is not answerable from a list of names.
+  $('rsRunsCount').textContent = runs.length
+    ? `${runs.length} run${runs.length > 1 ? 's' : ''} · ${rsBytes(bytes)} · ` +
+      `${candidates} candidate${candidates === 1 ? '' : 's'}` +
+      (reviewed ? ` · ${reviewed} reviewed` : '')
+    : 'nothing recorded yet';
+
+  // Trim counts the empty runs STILL CARRYING A CURVE, not the empty ones: once they are trimmed
+  // there is nothing left for the button to do, and leaving it lit to answer "nothing to trim" is
+  // a control that lies about having work.
+  const trimmable = runs.filter((r) => !r.detected && !r.events && !r.verdict && r.curve).length;
+  $('rsTrim').disabled = !trimmable;
+  $('rsTrim').textContent = trimmable ? `Trim ${trimmable} curve${trimmable > 1 ? 's' : ''}`
+                                      : 'Trim curves';
+  $('rsClearNull').disabled = !empty;
+  $('rsClearNull').textContent = empty ? `Clear ${empty} empty run${empty > 1 ? 's' : ''}`
+                                       : 'Clear empty runs';
+  $('rsClearAll').disabled = !runs.length;
+
+  const keep = RS_RUN_FILTERS[rsRunFilter] || RS_RUN_FILTERS.all;
+  const shown = runs.filter(keep);
+
+  if (!runs.length) {
+    box.innerHTML = '<p class="hint dim">No runs yet.</p>';
+    return;
+  }
+  if (!shown.length) {
+    box.innerHTML = '<p class="hint dim">No run matches that filter.</p>';
+    return;
+  }
+
+  box.innerHTML = shown.map((r) => {
+    const what = r.detected ? 'candidate'
+      : r.events ? `${r.events} single event${r.events > 1 ? 's' : ''}`
+      : 'nothing above threshold';
+    return `<div class="rsRun ${r.detected ? 'hit' : 'null'}">` +
+      `<a href="#" data-run="${rsEsc(r.id)}">` +
+        `<b>${rsEsc(r.label || '(unnamed)')}</b><span>${what}</span>` +
+        (r.verdict ? `<span class="rsVerdictTag">${rsEsc(r.verdict)}</span>` : '') +
+        (r.curve ? '' : `<span class="rsTrimmed">${r.trimmed ? 'curve trimmed' : 'no curve stored'}</span>`) +
+      '</a>' +
+      `<time>${rsEsc((r.recordedUtc || '').replace('T', ' ').slice(0, 16))}</time>` +
+      `<button class="rsDrop" data-drop="${rsEsc(r.id)}" title="Remove this run" ` +
+        'aria-label="Remove this run">&times;</button>' +
+      '</div>';
+  }).join('');
+
+  // Opens it in the panels. It used to link straight at the stored JSON, which showed a page of
+  // raw record instead of the light curve the whole tab exists to look at.
+  for (const a of box.querySelectorAll('a[data-run]')) {
+    a.onclick = (e) => { e.preventDefault(); rsOpenRun(a.dataset.run); };
+  }
+  for (const b of box.querySelectorAll('button[data-drop]')) {
+    b.onclick = async () => {
+      const run = rsRunList.find((r) => r.id === b.dataset.drop);
+      if (!confirm(`Remove the run on ${run && run.label ? run.label : b.dataset.drop}?\n\n` +
+                   'The record goes with it, including the row it contributes to the exported ' +
+                   'dataset. This cannot be undone.')) return;
+      await fetch(`/api/research/runs/${encodeURIComponent(b.dataset.drop)}`, { method: 'DELETE' });
+      loadResearchRuns();
+    };
   }
 }
+
+function rsRunsSay(text) {
+  const out = $('rsRunsOut');
+  out.hidden = false;
+  out.textContent = text;
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  if (!$('rsRuns')) return;
+
+  $('rsRunsPanel').addEventListener('toggle', () => { rsRunsFoldTouched = true; });
+
+  for (const c of document.querySelectorAll('#rsRunsFilter .chip')) {
+    c.onclick = () => {
+      for (const o of document.querySelectorAll('#rsRunsFilter .chip')) o.classList.remove('on');
+      c.classList.add('on');
+      rsRunFilter = c.dataset.filter;
+      rsRenderRuns();
+    };
+  }
+
+  // TRIM IS THE ONE THAT SHOULD BE REACHED FOR. It answers the actual complaint - the megabytes -
+  // without touching the argument for writing null runs in the first place, so it asks nothing
+  // and simply reports what it freed.
+  $('rsTrim').onclick = async () => {
+    $('rsTrim').disabled = true;
+    try {
+      const r = await (await fetch('/api/research/runs/trim', { method: 'POST' })).json();
+      rsRunsSay(r.trimmed
+        ? `Dropped the stored light curve from ${r.trimmed} run${r.trimmed > 1 ? 's' : ''} ` +
+          `nothing came of, freeing ${rsBytes(r.freedBytes)}. Every run is still in the dataset.`
+        : 'Nothing to trim: no run that found nothing is still carrying a curve.');
+    } catch { rsRunsSay('Could not trim the records.'); }
+    loadResearchRuns();
+  };
+
+  $('rsClearNull').onclick = async () => {
+    if (!confirm('Delete every run that found nothing and that nobody has reviewed?\n\n' +
+                 'Those rows are how the dataset knows which stars were searched at all, and ' +
+                 'they cannot be recovered. Export the CSV first if you want to keep them, or ' +
+                 'use Trim curves, which frees most of the same space and keeps the runs.')) return;
+    try {
+      const r = await (await fetch('/api/research/runs/clear', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ everything: false }),
+      })).json();
+      rsRunsSay(`Deleted ${r.deleted} empty run${r.deleted === 1 ? '' : 's'}. ${r.kept} kept.`);
+    } catch { rsRunsSay('Could not clear the records.'); }
+    loadResearchRuns();
+  };
+
+  // Twice, because it takes the reviewed runs and the candidates with it, and a single misplaced
+  // click on the same row as a filter chip should not be able to empty the directory.
+  $('rsClearAll').onclick = async () => {
+    if (!confirm('Delete ALL recorded runs, including candidates and anything reviewed?')) return;
+    if (!confirm('Last check. Every record in the research directory will be deleted, and the ' +
+                 'exported dataset with it. There is no undo.')) return;
+    try {
+      const r = await (await fetch('/api/research/runs/clear', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ everything: true }),
+      })).json();
+      rsRunsSay(`Deleted ${r.deleted} run${r.deleted === 1 ? '' : 's'}.`);
+    } catch { rsRunsSay('Could not clear the records.'); }
+    loadResearchRuns();
+  };
+});
 
 function renderResearch(d) {
   $('rsError').hidden = true;
@@ -2659,10 +2829,17 @@ function renderResearch(d) {
   $('rsCurveNote').textContent =
     `scatter ${rsFmt(lc.scatterPpmRaw, 0)} ppm before detrending, ${rsFmt(lc.scatterPpmDetrended, 0)} after. ` +
     d.log[0];
-  if (d.series) {
+  if (d.series && d.series.length) {
     const t0 = d.series[0][0];
     rsDrawCurve($('rsCurve'), d.series.map((p) => ({ x: p[0] - t0, y: p[1] })),
                 { xLabel: 'days from the first cadence' });
+  } else {
+    // A trimmed record: everything measured from the curve is still here, the curve itself is not.
+    // Drawn as nothing and SAID, rather than left showing whichever run was open before it.
+    rsDrawCurve($('rsCurve'), []);
+    if (d.curveTrimmed) {
+      $('rsCurveNote').textContent += ' — the stored light curve was trimmed off this run.';
+    }
   }
 
   if (!d.detected) {
@@ -2908,6 +3085,85 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 });
 
+
+// ------------------------------------------------------------------ look at one star
+//
+// The cheap question, kept separate from the expensive one. Fetching one sector and drawing it
+// takes a couple of seconds; searching a star properly takes a minute and a half, because it joins
+// every sector it has and folds them against tens of thousands of trial periods. Anyone judging
+// light curves by eye needs to be able to ask the cheap question constantly.
+
+let rsLookData = null;
+let rsLookFlux = 'unprocessed';
+
+function rsPaintLook() {
+  if (!rsLookData) return;
+  const raw = rsLookData[rsLookFlux] || [];
+  // The chart wants {x, y}; the API sends pairs. Time is shown from the start of the sector
+  // rather than as a barycentric day, because the number that matters when reading a dip by eye
+  // is how far into the observation it happened.
+  const t0 = raw.length ? raw[0][0] : 0;
+  rsDrawCurve($('rsLookCurve'), raw.map((p) => ({ x: p[0] - t0, y: p[1] })),
+              { xLabel: `days from BTJD ${t0.toFixed(2)}` });
+
+  $('rsLookNote').textContent = rsLookFlux === 'unprocessed'
+    ? 'The raw photometry, flattened here on a five day median. Events lasting a day survive this, ' +
+      'and so does the scattered light, so expect it to be less tidy.'
+    : "The provider's own detrended flux. Cleaner to read, but its filter was built for short " +
+      'transits and removes anything lasting a day or more. A dip visible in the other view and ' +
+      'absent here is one this column deleted.';
+}
+
+async function rsLook(tic, sector) {
+  const meta = $('rsLookMeta');
+  meta.textContent = 'fetching…';
+  $('rsLookSectors').textContent = '';
+  try {
+    const q = `/api/research/curve?tic=${encodeURIComponent(tic)}` +
+      (sector ? `&sector=${encodeURIComponent(sector)}` : '');
+    const d = await (await fetch(q)).json();
+    if (!d.ok) { meta.textContent = d.message || 'nothing came back'; return; }
+
+    rsLookData = d;
+    meta.textContent = `TIC ${d.tic}, sector ${d.sector}, ${d.provider} · ` +
+      `${d.points.toLocaleString()} cadences at ${d.cadenceMinutes.toFixed(1)} min · ` +
+      `scatter ${Math.round(d.scatterPpm).toLocaleString()} ppm · ${d.tookSeconds.toFixed(1)} s`;
+
+    // Every other sector this star has, one click each, which is how you tell a transit from a
+    // one off artefact: a real repeating signal is in more than one of them.
+    $('rsLookSectors').innerHTML = 'sectors: ' + (d.sectors || []).map((s) =>
+      `<a href="#" data-sector="${s}" class="${s === d.sector ? 'on' : ''}">${s}</a>`).join(' ');
+    for (const a of $('rsLookSectors').querySelectorAll('a[data-sector]')) {
+      a.onclick = (e) => { e.preventDefault(); $('rsLookSector').value = a.dataset.sector;
+                           rsLook(tic, a.dataset.sector); };
+    }
+    $('rsLookFlux').hidden = false;
+    rsPaintLook();
+  } catch (err) {
+    meta.textContent = 'could not reach the archive: ' + err.message;
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const go = $('rsLookGo');
+  if (!go) return;
+  const fire = () => {
+    const tic = ($('rsLookTic').value || '').replace(/[^0-9]/g, '');
+    if (!tic) { $('rsLookMeta').textContent = 'a TIC number is needed'; return; }
+    rsLook(tic, ($('rsLookSector').value || '').trim());
+  };
+  go.onclick = fire;
+  for (const id of ['rsLookTic', 'rsLookSector']) {
+    $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') fire(); });
+  }
+  for (const chip of $('rsLookFlux').querySelectorAll('.chip')) {
+    chip.onclick = () => {
+      rsLookFlux = chip.dataset.flux;
+      for (const c of $('rsLookFlux').querySelectorAll('.chip')) c.classList.toggle('on', c === chip);
+      rsPaintLook();
+    };
+  }
+});
 
 // ------------------------------------------------------------------ field sweep
 

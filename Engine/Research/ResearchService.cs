@@ -348,6 +348,94 @@ namespace ExoStudio.Research
         /// same picture. Thinned by STRIDE rather than by averaging, because averaging a transit
         /// with its neighbours is exactly the shape being looked for and would flatten it.
         /// </summary>
+        /// <summary>
+        /// One star, one sector, drawn as fast as the archive can hand it over. No search.
+        ///
+        /// WHY THIS IS SEPARATE FROM SEARCHING. Planet Hunters shows a volunteer a light curve in
+        /// a second or two, and a full run here takes a minute and a half: 36 sectors fetched,
+        /// joined and folded against 25,000 trial periods. Those are not the same task, and
+        /// conflating them made the cheap one wait for the expensive one. Looking at a star is a
+        /// question anybody should be able to ask constantly, of any star, before deciding whether
+        /// it is worth searching at all.
+        ///
+        /// BOTH VERSIONS OF THE FLUX ARE RETURNED, because neither is the honest one on its own.
+        /// The provider's detrended column is flat and easy to read and has had events of a day or
+        /// more removed from it. The raw column keeps them and carries the scattered light too.
+        /// Anyone judging a dip by eye should be able to see it in both, and a dip present in one
+        /// and absent in the other is telling you which.
+        /// </summary>
+        public async Task<object> CurveAsync(long tic, int sector, int maxPoints = 3000)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+
+            // A NAMED SECTOR IS FETCHED DIRECTLY. Probing every sector to discover the one already
+            // asked for is a second and a half of waiting for an answer the caller supplied. The
+            // full list is still filled in afterwards so the page can offer the others, but the
+            // curve is on its way before that finishes.
+            MastClient.LightCurveProduct chosen = null;
+            Task<List<MastClient.LightCurveProduct>> listing = null;
+            if (sector > 0)
+            {
+                chosen = hlsp.At(tic, sector);
+                listing = hlsp.FindAsync(tic);
+            }
+            else
+            {
+                List<MastClient.LightCurveProduct> found = await hlsp.FindAsync(tic);
+                listing = Task.FromResult(found);
+                chosen = found.FirstOrDefault();
+            }
+
+            if (chosen == null)
+                return new
+                {
+                    ok = false,
+                    message = $"no full frame light curve exists for TIC {tic}. Not every star has "
+                            + "one: the extraction reaches to about magnitude 13.5.",
+                };
+
+            string path;
+            try { path = await hlsp.FetchAsync(chosen); }
+            catch
+            {
+                List<MastClient.LightCurveProduct> had = await listing;
+                return new
+                {
+                    ok = false,
+                    message = had.Count == 0
+                        ? $"no full frame light curve exists for TIC {tic}."
+                        : $"TIC {tic} has no sector {sector}; it has "
+                          + string.Join(", ", had.OrderBy(p => p.Sector).Select(p => p.Sector)),
+                };
+            }
+            TransitSearchPipeline.LightCurve processed = TransitSearchPipeline.Load(path);
+            TransitSearchPipeline.LightCurve rawFlux;
+            try { rawFlux = TransitSearchPipeline.Load(path, preferUnprocessed: true); }
+            catch { rawFlux = processed; }
+
+            // Flattened the same way the isolated event search flattens it, so what the eye sees
+            // here is what the search reads there rather than a prettier relative of it.
+            TransitSearchPipeline.LightCurve flattened;
+            try { flattened = TransitSearchPipeline.Detrend(rawFlux, IsolatedDetrendDays); }
+            catch { flattened = rawFlux; }
+
+            return new
+            {
+                ok = true,
+                tic,
+                sector = chosen.Sector,
+                provider = chosen.Provider,
+                sectors = (await listing).OrderBy(p => p.Sector).Select(p => p.Sector).ToArray(),
+                cadenceMinutes = processed.CadenceMinutes,
+                baselineDays = processed.BaselineDays,
+                scatterPpm = processed.ScatterPpm,
+                points = processed.Count,
+                tookSeconds = clock.Elapsed.TotalSeconds,
+                detrended = Series(processed, maxPoints),
+                unprocessed = Series(flattened, maxPoints),
+            };
+        }
+
         private static double[][] Series(TransitSearchPipeline.LightCurve flat, int maxPoints = 4000)
         {
             int stride = Math.Max(1, flat.Count / maxPoints);

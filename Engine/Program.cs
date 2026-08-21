@@ -910,6 +910,16 @@ app.MapPost("/api/research/search-file", async (SearchFileRequest req) =>
     catch (Exception e) { return Results.Json(new { ok = false, stage = "read", message = e.Message }); }
 });
 
+// LOOKING AT A STAR IS NOT SEARCHING IT, and it should not cost what searching costs. One
+// sector, fetched and drawn, so a person can judge a light curve by eye the way the Zooniverse
+// volunteers do, on any star they like rather than on the ones somebody preselected.
+app.MapGet("/api/research/curve", async (long tic, int? sector) =>
+{
+    if (tic <= 0) return Results.BadRequest(new { error = "a TIC number is needed" });
+    try { return Results.Json(await research.Value.CurveAsync(tic, sector ?? 0)); }
+    catch (Exception e) { return Results.Json(new { ok = false, message = e.Message }); }
+});
+
 app.MapGet("/api/research/runs", () => Results.Json(research.Value.List()));
 
 // A SWEEP runs the same search over every star in a field, which is the thing that actually finds
@@ -946,6 +956,25 @@ app.MapGet("/api/research/runs/{id}", (string id) =>
 
 app.MapGet("/api/research/export.csv", () =>
     Results.Text(research.Value.ExportCsv(), "text/csv"));
+
+// THINNING THE RECORD DIRECTORY. A field sweep writes one record per star, so a single afternoon
+// can leave hundreds of them and tens of megabytes, and the page needs a way to say so. Trim is
+// listed first and Clear second on purpose: the light curve is most of the bytes, and the row it
+// sits in is most of the value.
+app.MapPost("/api/research/runs/trim", () =>
+{
+    (int trimmed, long freed) = research.Value.TrimCurves();
+    return Results.Json(new { trimmed, freedBytes = freed });
+});
+
+app.MapPost("/api/research/runs/clear", (ClearRequest req) =>
+{
+    (int deleted, int kept) = research.Value.Clear(req?.Everything ?? false);
+    return Results.Json(new { deleted, kept });
+});
+
+app.MapDelete("/api/research/runs/{id}", (string id) =>
+    research.Value.Delete(id) ? Results.Json(new { ok = true }) : Results.NotFound());
 
 // The human verdict, which is the step the page exists for: a candidate nobody looked at is what
 // the mission pipeline already produces, and the eye is what community submissions add.
@@ -1282,6 +1311,10 @@ static string ResolveWebRoot(string contentRoot)
 
 
 record ReviewRequest(string Verdict, string Note, string Reviewer);
+
+// Everything false clears only the runs nothing came of; true clears the directory. Spelled out
+// as a field rather than carried in the URL so that "delete the lot" has to be said on purpose.
+record ClearRequest(bool Everything);
 
 record SearchFileRequest(string File, string Label, double RaDeg, double DecDeg,
                          double MinPeriodDays, double MaxPeriodDays,

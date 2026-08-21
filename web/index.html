@@ -421,6 +421,27 @@
       </p>
     </div>
 
+    <!-- LOOKING IS NOT SEARCHING. One star, one sector, drawn in a couple of seconds, so a light
+         curve can be judged by eye before deciding whether it is worth a minute of searching. -->
+    <div class="panel chart" id="rsLookPanel" hidden>
+      <div class="chart-head">
+        <h2>Look at a star</h2>
+        <span class="hint" id="rsLookMeta">a TIC number, and its light curve</span>
+      </div>
+      <div class="row" id="rsLookForm">
+        <input id="rsLookTic" type="text" inputmode="numeric" placeholder="TIC, e.g. 298663873">
+        <input id="rsLookSector" type="number" placeholder="sector (optional)" min="1" max="200">
+        <button id="rsLookGo" class="accent">Show the curve</button>
+      </div>
+      <div class="row" id="rsLookFlux" hidden>
+        <button class="chip on" data-flux="unprocessed">Unprocessed, flattened</button>
+        <button class="chip" data-flux="detrended">The provider's detrended flux</button>
+      </div>
+      <p class="hint" id="rsLookSectors"></p>
+      <canvas id="rsLookCurve" data-h="260"></canvas>
+      <p class="hint dim" id="rsLookNote"></p>
+    </div>
+
     <div class="panel chart" id="rsCurvePanel" hidden>
       <div class="chart-head">
         <h2>Light curve</h2>
@@ -494,17 +515,43 @@
       </p>
     </div>
 
-    <div class="panel chart" id="rsRunsPanel" hidden>
-      <div class="chart-head">
+    <!-- A <details> rather than a panel with a toggle bolted on: a sweep leaves one row per star,
+         so this list is routinely hundreds long and is the last thing on the page anyone wants
+         between them and the light curve. The element already knows how to fold, remembers
+         nothing, and works from the keyboard, so the script only has to decide the first state. -->
+    <details class="panel chart rsRunsFold" id="rsRunsPanel" hidden>
+      <summary>
+        <span class="rsCaret" aria-hidden="true"></span>
         <h2>Runs recorded</h2>
-        <a class="ghost" id="rsExport" href="/api/research/export.csv" download>Export dataset (CSV)</a>
+        <span class="hint dim" id="rsRunsCount"></span>
+      </summary>
+
+      <div class="rsRunsBar">
+        <div class="chips" id="rsRunsFilter" role="group" aria-label="Which runs to show">
+          <button class="chip on" data-filter="all">All</button>
+          <button class="chip" data-filter="candidates">Candidates</button>
+          <button class="chip" data-filter="events">Single events</button>
+          <button class="chip" data-filter="reviewed">Reviewed</button>
+        </div>
+        <div class="rsRunsActions">
+          <a class="ghost" id="rsExport" href="/api/research/export.csv" download>Export CSV</a>
+          <button class="ghost" id="rsTrim">Trim curves</button>
+          <button class="ghost rsDanger" id="rsClearNull">Clear empty runs</button>
+          <button class="ghost rsDanger" id="rsClearAll">Clear all</button>
+        </div>
       </div>
+      <p class="hint dim" id="rsRunsOut" hidden></p>
+
       <div id="rsRuns" class="researchRuns"></div>
       <p class="hint dim">
         Kept whether or not anything was found: completeness cannot be measured from detections
-        alone, which is what makes this a dataset rather than a list of hits.
+        alone, which is what makes this a dataset rather than a list of hits. That argument is
+        about the ROW, not the light curve stored beside it, which is two thirds of the bytes and
+        has nothing on it for a run that found nothing. <b>Trim curves</b> drops those and keeps
+        every run; <b>Clear</b> drops the runs themselves, and with them the record that those
+        stars were ever searched. Export first.
       </p>
-    </div>
+    </details>
 
     <div class="panel chart" id="seriesPanel" hidden>
       <div class="chart-head">

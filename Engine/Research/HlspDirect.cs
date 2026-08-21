@@ -178,6 +178,16 @@ namespace ExoStudio.Research
             return products.OrderByDescending(p => p.Sector).ToList();
         }
 
+        /// <summary>
+        /// The address of one named sector, without asking whether any others exist.
+        ///
+        /// Probing all 130 sectors costs a second and a half, which is worth it when the question
+        /// is what a star has. When the sector is already known it is a second and a half spent
+        /// learning nothing, and this is the path a person waits on while looking at a curve.
+        /// </summary>
+        public MastClient.LightCurveProduct At(long tic, int sector, Provider provider = null)
+            => Product(tic, sector, provider ?? Qlp);
+
         private static MastClient.LightCurveProduct Product(long tic, int sector, Provider provider)
             => new()
             {
