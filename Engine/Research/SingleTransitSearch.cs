@@ -50,6 +50,22 @@ namespace ExoStudio.Research
             public double NextBestFraction;
 
             /// <summary>
+            /// Cadences inside the dip against the number the light curve's own cadence would
+            /// provide over that span. One means the mission kept everything here. A small value
+            /// means the quality mask threw most of this stretch away, and what is being measured
+            /// is the remnant it left behind rather than the star.
+            /// </summary>
+            public double CoverageRatio = 1.0;
+
+            /// <summary>
+            /// How much noisier this light curve is on the timescale of the event than white noise
+            /// would predict. One means the scatter averages down as independent points should;
+            /// six means it barely averages down at all, and a dip has to be six times deeper to
+            /// mean the same thing.
+            /// </summary>
+            public double RedNoiseFactor = 1.0;
+
+            /// <summary>
             /// How far the centroid moved during the dip, in pixels, when the provider gave one.
             /// NaN when it did not. A real transit of THIS star does not move the centroid; a
             /// blended eclipsing binary nearby does, because the light that vanished came from
@@ -88,6 +104,33 @@ namespace ExoStudio.Research
             var candidates = new List<Event>();
             foreach (double dur in durations)
             {
+                // THE NOISE IS MEASURED AT THE DURATION OF THE EVENT, NOT EXTRAPOLATED FROM ONE
+                // CADENCE TO THE NEXT. This was the difference between a useful search and one
+                // that flagged every star in the field.
+                //
+                // Dividing the point to point scatter by the square root of the number of points
+                // in the dip assumes the points are independent, so that averaging a hundred of
+                // them is ten times more precise. Real light curves do not behave that way. They
+                // wander, on exactly the hours to days timescale a transit occupies, from
+                // scattered light, from the spacecraft's pointing, from the star itself. Measured
+                // on TIC 388242423: the point to point scatter is 905 ppm, so white noise predicts
+                // 79 ppm on a seven hour window, while the seven hour windows actually scatter by
+                // 757 ppm. Every depth was being divided by a number 6.6 times too small, which is
+                // why six stars out of six came back at signal to noise of thirty to seventy.
+                //
+                // This is the red noise problem set out by Pont, Zucker and Queloz in 2006, and
+                // the honest answer is the empirical one: bin the curve at the trial duration and
+                // see how much those bins really scatter.
+                double windowSigma = WindowScatter(curve, dur);
+                if (windowSigma <= 0) continue;
+
+                // The depth is a difference between the dip's level and the baseline's, and the
+                // baseline is drawn from two flanks each as wide as the dip, so it is the better
+                // determined of the two.
+                double depthSigma = windowSigma * Math.Sqrt(1.5);
+                double redFactor = windowSigma / Math.Max(noise / Math.Sqrt(
+                    Math.Max(2.0, dur * 24.0 * 60.0 / Math.Max(0.01, curve.CadenceMinutes))), 1e-12);
+
                 // The baseline is taken from a window either side, each as wide as the dip, with a
                 // gap between so ingress and egress do not contaminate what they are compared to.
                 double half = dur * 0.5;
@@ -125,12 +168,36 @@ namespace ExoStudio.Research
                     // what the edge of a data gap looks like.
                     if (inDip < 4 || before < 4 || after < 4) continue;
 
+                    // THE QUALITY MASK MUST NOT AGREE WITH THE EVENT. A transit hides light; it
+                    // does not delete cadences. So if this stretch retains far fewer measurements
+                    // per hour than the light curve nominally provides, the mission flagged most
+                    // of it as untrustworthy, and what survived is a biased remnant of a bad patch
+                    // rather than a measurement of the star.
+                    //
+                    // This is not a hypothetical failure. Sweeping one field flagged six stars out
+                    // of six, all at BJD 3874.75 to 3874.84, a couple of hours apart: a single bad
+                    // stretch before a downlink where the cadence count per six hours fell from
+                    // about 108 to 23, and the survivors sat 1.2 percent low. Every star in the
+                    // field wore the same artefact and each looked like a deep isolated transit.
+                    //
+                    // MEASURED AGAINST THE WHOLE CURVE, NOT THE NEIGHBOURHOOD. Comparing the dip
+                    // to its own flanks was tried first and does not work, because a bad patch is
+                    // wider than the window: the flanks sit inside it too, the ratio comes out
+                    // near one, and all six stars survived the test. The nominal cadence is the
+                    // median spacing over the entire light curve, so it describes the good part.
+                    double expected = dur / Math.Max(1e-9, curve.CadenceMinutes / (24.0 * 60.0));
+                    double coverage = inDip / Math.Max(1.0, expected);
+                    // The baseline sets the level the depth is measured against, so it has to be
+                    // real too; it is twice as wide as the dip.
+                    double baselineCoverage = (before + after) / Math.Max(1.0, expected * 2.0);
+                    if (coverage < 0.6 || baselineCoverage < 0.6) continue;
+
                     double b = MedianOf(curve.Flux, leftOuter, leftInner, rightInner, rightOuter);
                     double d = MedianOf(curve.Flux, dipLo, dipHi, 0, 0);
                     double depth = b - d;
                     if (depth <= 0) continue;
 
-                    double sigma = noise / Math.Sqrt(inDip);
+                    double sigma = depthSigma;
                     double snr = depth / sigma;
                     if (snr < snrThreshold) continue;
 
@@ -143,6 +210,8 @@ namespace ExoStudio.Research
                         Snr = snr,
                         PointsInDip = inDip,
                         PointsInBaseline = before + after,
+                        CoverageRatio = coverage,
+                        RedNoiseFactor = redFactor,
                     });
                 }
             }
@@ -180,6 +249,17 @@ namespace ExoStudio.Research
                 e.Concerns.Add($"only {e.PointsInDip} cadences inside the dip, so its shape is barely "
                              + "sampled and a couple of bad points could account for it.");
 
+            if (e.CoverageRatio < 0.85)
+                e.Concerns.Add($"the dip holds only {e.CoverageRatio:P0} of the cadences this light "
+                             + "curve's cadence would give over that span, so the mission flagged "
+                             + "part of this stretch and the depth rests on what survived the mask.");
+
+            if (e.RedNoiseFactor > 3.0)
+                e.Concerns.Add($"this light curve is {e.RedNoiseFactor:0.#} times noisier on the "
+                             + "timescale of the dip than independent points would be, so it wanders "
+                             + "on its own at roughly this duration and the significance above "
+                             + "already accounts for that.");
+
             if (e.NextBestFraction > 0.7)
                 e.Concerns.Add($"another window elsewhere in this light curve is {e.NextBestFraction:P0} "
                              + "as deep, so the curve is variable and this time is not special.");
@@ -216,6 +296,43 @@ namespace ExoStudio.Research
             }
         }
 
+
+        /// <summary>
+        /// How much the light curve actually scatters when averaged over windows of a given width.
+        ///
+        /// Non overlapping windows, each reduced to its median exactly as the search reduces the
+        /// dip and the baseline, and then a robust scatter of those medians. Robust because a real
+        /// transit is one of these windows and should not be allowed to inflate the noise it is
+        /// being judged against; the median absolute deviation ignores a handful of outliers by
+        /// construction.
+        /// </summary>
+        private static double WindowScatter(TransitSearchPipeline.LightCurve curve, double widthDays)
+        {
+            var levels = new List<double>();
+            int i = 0, n = curve.Count;
+            while (i < n)
+            {
+                double edge = curve.TimeDays[i] + widthDays;
+                int j = i;
+                while (j < n && curve.TimeDays[j] < edge) j++;
+                if (j - i >= 4)
+                {
+                    var bin = new double[j - i];
+                    Array.Copy(curve.Flux, i, bin, 0, j - i);
+                    Array.Sort(bin);
+                    levels.Add(bin.Length % 2 == 1 ? bin[bin.Length / 2]
+                                                   : 0.5 * (bin[bin.Length / 2 - 1] + bin[bin.Length / 2]));
+                }
+                i = j > i ? j : i + 1;
+            }
+            // Too few windows to say anything about how they scatter; fall back to the white noise
+            // estimate rather than inventing a number, and let the caller's other tests do the work.
+            if (levels.Count < 6)
+                return TransitSearchPipeline.PointToPointScatter(curve.Flux)
+                     / Math.Sqrt(Math.Max(2.0, widthDays * 24.0 * 60.0 / Math.Max(0.01, curve.CadenceMinutes)));
+
+            return Scatter(levels.ToArray());
+        }
 
         /// <summary>
         /// Median over one or two index ranges of an array, copying only what those ranges hold.

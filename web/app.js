@@ -2925,7 +2925,8 @@ function rsRenderSweep(s) {
   const p = $('rsSweepProgress');
   p.hidden = false;
   if (s.state === 'listing') {
-    p.textContent = 'Asking the archive what is in this field…';
+    p.textContent = 'Reading the registers of known planets and candidates, then listing the ' +
+      'stars in this field…';
   } else if (s.state === 'empty') {
     p.textContent = 'Nothing in this field has that many sectors. Lower the sector floor, or move.';
   } else if (s.state === 'failed') {
@@ -2937,11 +2938,33 @@ function rsRenderSweep(s) {
   }
 
   const worth = (s.hits || []).filter((h) => h.score > 0);
+  const f = s.filtered || {};
   $('rsSweepPanel').hidden = false;
   $('rsSweepMeta').textContent =
     `${s.field.radius}° around ${s.field.ra.toFixed(2)} ${s.field.dec >= 0 ? '+' : ''}` +
     `${s.field.dec.toFixed(2)}, at least ${s.field.minSectors} sectors · ` +
     `${worth.length} worth opening of ${s.done} searched`;
+
+  // WHAT WAS RULED OUT, AND WHY, rather than a list that silently omits things. A star already
+  // carrying a published planet or a mission candidate is dropped before anything is downloaded,
+  // so the list below holds only stars with no host on record. Saying so is the difference
+  // between a short list and a list that looks suspiciously short.
+  const note = $('rsSweepFiltered');
+  if (note) {
+    const bits = [];
+    if (f.listed) bits.push(`${f.listed} stars in the field`);
+    if (f.alreadyTaken) bits.push(`${f.alreadyTaken} skipped as already having a planet or candidate on record`);
+    if (f.tooFewSectors) bits.push(`${f.tooFewSectors} skipped for too little coverage`);
+    note.hidden = bits.length === 0;
+    note.innerHTML = bits.length
+      ? `<p class="hint dim">${bits.join(' · ')}.</p>` +
+        ((f.examples || []).length
+          ? `<details><summary>what was skipped</summary><ul>` +
+            f.examples.map((e) => `<li>${e}</li>`).join('') + `</ul></details>`
+          : '') +
+        (f.warning ? `<p class="hint warn">${f.warning}</p>` : '')
+      : '';
+  }
 
   $('rsSweepList').innerHTML = worth.length
     ? worth.map((h) => `<a class="rsRun hit" href="#" data-run="${h.runId}">` +

@@ -53,13 +53,17 @@ namespace ExoStudio.Research
     public sealed class ResearchService
     {
         private readonly MastClient mast;
+        private readonly HlspDirect hlsp;
         private readonly KnownObjects known;
+        private readonly KnownHostRegister register;
         private readonly string resultsDir;
 
         public ResearchService(HttpClient http, string cacheDir, string resultsDir)
         {
             mast = new MastClient(http, cacheDir);
+            hlsp = new HlspDirect(http, cacheDir);
             known = new KnownObjects(http);
+            register = new KnownHostRegister(http);
             this.resultsDir = resultsDir;
             Directory.CreateDirectory(resultsDir);
         }
@@ -74,6 +78,14 @@ namespace ExoStudio.Research
             public double DetrendWindowDays { get; set; } = 0.75;
             public double SnrThreshold { get; set; } = TransitDetector.DefaultSnrThreshold;
             public int Sector { get; set; }              // 0 means whichever is newest
+
+            /// <summary>
+            /// The star's TIC number, when it is known. Given one, the light curves are found by
+            /// constructing their addresses rather than by querying the observation catalogue,
+            /// which is the difference between one second and three minutes per star. Zero falls
+            /// back to the positional query.
+            /// </summary>
+            public long Tic { get; set; }
 
             /// <summary>
             /// Search for ONE dip as well as repeating ones. On by default, because it is the
@@ -93,8 +105,13 @@ namespace ExoStudio.Research
             double mark = 0;
             string Took() { double t = clock.Elapsed.TotalSeconds - mark; mark = clock.Elapsed.TotalSeconds; return $"{t:0.0} s"; }
 
-            List<MastClient.LightCurveProduct> products = await mast.FindLightCurvesAsync(
-                request.RaDeg, request.DecDeg);
+            // TWO WAYS TO FIND THE SAME FILES. With a catalogue number the addresses can simply be
+            // constructed and checked, which costs about a second; without one there is no choice
+            // but to ask the observation catalogue what is at this position, which costs minutes.
+            bool constructed = request.Tic > 0;
+            List<MastClient.LightCurveProduct> products = constructed
+                ? await hlsp.FindAsync(request.Tic)
+                : await mast.FindLightCurvesAsync(request.RaDeg, request.DecDeg);
             string listing = Took();
             if (products.Count == 0)
             {
@@ -112,15 +129,18 @@ namespace ExoStudio.Research
                 ? products.FirstOrDefault(p => p.Sector == request.Sector) ?? products[0]
                 : products[0];
             int fromFfi = products.Count(p => !p.IsMissionProduct);
-            log.Add($"the archive lists {mast.LastObservationCount} observation(s) at this position; "
-                  + $"opened the first that carried a light curve [{listing}]");
+            log.Add(constructed
+                ? $"probed the full frame products for TIC {request.Tic} by constructing their "
+                + $"addresses: {products.Count} sector(s) present [{listing}]"
+                : $"the archive lists {mast.LastObservationCount} observation(s) at this position; "
+                + $"opened the first that carried a light curve [{listing}]");
             log.Add($"using {(chosen.IsMissionProduct ? "the mission product" : chosen.Provider)}, "
                   + $"sector {chosen.Sector}, {chosen.ExposureSeconds:0} s cadence, {chosen.FileName}");
             if (!chosen.IsMissionProduct)
                 log.Add("this is a full frame extraction, which is the under searched half of the sky: "
                       + "the mission's own pipeline never examined this star individually");
 
-            string path = await mast.FetchAsync(chosen);
+            string path = constructed ? await hlsp.FetchAsync(chosen) : await mast.FetchAsync(chosen);
             string fetched = Took();
             TransitSearchPipeline.LightCurve raw = TransitSearchPipeline.Load(path);
             log.Add($"{raw.Count:N0} cadences the mission did not flag, spanning {raw.BaselineDays:0.0} days "
@@ -224,6 +244,9 @@ namespace ExoStudio.Research
                     secondarySigma = vetting.SecondarySignificanceSigma,
                     secondaryRatio = vetting.SecondaryToPrimaryRatio,
                     durationRatio = vetting.DurationRatio,
+                    transitsObserved = vetting.TransitsObserved,
+                    transitsPossible = vetting.TransitsPossible,
+                    transitCoverage = vetting.TransitCoverage,
                     concerns = vetting.Concerns,
                     passed = !vetting.AnyConcern,
                 },
@@ -491,6 +514,9 @@ namespace ExoStudio.Research
                     secondarySigma = vetting.SecondarySignificanceSigma,
                     secondaryRatio = vetting.SecondaryToPrimaryRatio,
                     durationRatio = vetting.DurationRatio,
+                    transitsObserved = vetting.TransitsObserved,
+                    transitsPossible = vetting.TransitsPossible,
+                    transitCoverage = vetting.TransitCoverage,
                     concerns = vetting.Concerns, passed = !vetting.AnyConcern,
                 },
                 known = new
@@ -537,6 +563,21 @@ namespace ExoStudio.Research
             public string Error { get; set; }
             public DateTime StartedUtc { get; } = DateTime.UtcNow;
             public List<Hit> Hits { get; } = new();
+
+            /// <summary>How many stars the region held before anything was ruled out.</summary>
+            public int Listed { get; set; }
+
+            /// <summary>Stars dropped because a planet or candidate is already registered on them.</summary>
+            public int AlreadyTaken { get; set; }
+
+            /// <summary>Stars dropped because too few sectors cover them to search.</summary>
+            public int TooFewSectors { get; set; }
+
+            /// <summary>Named examples of what was ruled out, so the filtering is visible rather than silent.</summary>
+            public List<string> TakenExamples { get; } = new();
+
+            /// <summary>Set when a register did not answer, because then the filtering is incomplete.</summary>
+            public string FilterWarning { get; set; }
         }
 
         public sealed class Hit
@@ -553,6 +594,20 @@ namespace ExoStudio.Research
 
         private readonly Dictionary<string, Sweep> sweeps = new();
 
+        /// <summary>
+        /// Searches a field, having first thrown away every star that is already spoken for.
+        ///
+        /// THE ORDER OF OPERATIONS IS THE POINT. A field contains stars with published planets and
+        /// stars already queued as mission candidates, and a search of those returns a rediscovery:
+        /// correct, and worth nothing to somebody looking for something new. The registers are
+        /// therefore consulted while choosing what to look at, not afterwards while explaining what
+        /// was found, so nothing is downloaded or searched on a star whose planet has a name.
+        ///
+        /// The three stages that remain each cost what they should. Listing the stars is a
+        /// positional query against the target catalogue, about ten seconds. Establishing which
+        /// sectors cover a star is a set of constructed addresses checked at once, about a second.
+        /// Searching is arithmetic on a light curve already on disk.
+        /// </summary>
         public Sweep StartSweep(double ra, double dec, double radius, int minSectors, int limit,
                                 Request template)
         {
@@ -568,20 +623,60 @@ namespace ExoStudio.Research
             {
                 try
                 {
-                    List<MastClient.RegionTarget> targets =
-                        await mast.FindTargetsAsync(ra, dec, radius, minSectors);
-                    sweep.Total = Math.Min(limit, targets.Count);
-                    sweep.State = sweep.Total == 0 ? "empty" : "searching";
+                    KnownHostRegister.Snapshot taken = await register.LoadAsync();
+                    if (taken.Unavailable.Count > 0)
+                        sweep.FilterWarning =
+                            "could not reach " + string.Join("; ", taken.Unavailable)
+                            + ", so some already known hosts may still appear below";
 
-                    foreach (MastClient.RegionTarget t in targets.Take(limit))
+                    List<MastClient.RegionTarget> targets =
+                        await mast.FindTicTargetsAsync(ra, dec, radius);
+                    sweep.Listed = targets.Count;
+                    sweep.Total = Math.Min(limit, targets.Count);
+                    sweep.State = targets.Count == 0 ? "empty" : "searching";
+
+                    int searched = 0;
+                    foreach (MastClient.RegionTarget t in targets)
                     {
-                        sweep.Current = $"TIC {t.Name}, {t.Sectors} sectors";
+                        if (searched >= limit) break;
+                        long tic = long.TryParse(t.Name, out long parsed) ? parsed : 0;
+
+                        // ALREADY SPOKEN FOR. An exact catalogue match is the usual case; the
+                        // positional test catches register rows whose identifier is missing, and
+                        // a known host within twenty one arcseconds shares this star's pixel
+                        // anyway, so a dip here would be its eclipse and not a discovery.
+                        KnownHostRegister.Entry near = taken.Near(t.RaDeg, t.DecDeg, 21.0);
+                        if (taken.Holds(tic) || near != null)
+                        {
+                            sweep.AlreadyTaken++;
+                            string why = taken.Holds(tic)
+                                ? $"TIC {tic} is already in the registers"
+                                : $"TIC {tic} sits {Separation(t.RaDeg, t.DecDeg, near.RaDeg, near.DecDeg) * 3600.0:0} arcsec "
+                                  + $"from {near.Name} ({near.Register})";
+                            lock (sweep.TakenExamples)
+                                if (sweep.TakenExamples.Count < 12) sweep.TakenExamples.Add(why);
+                            continue;
+                        }
+
+                        sweep.Current = $"TIC {t.Name}, checking coverage";
+                        List<int> sectors;
+                        try { sectors = await hlsp.SectorsAsync(tic, HlspDirect.Qlp); }
+                        catch { continue; }
+
+                        if (sectors.Count < Math.Max(1, minSectors))
+                        {
+                            sweep.TooFewSectors++;
+                            continue;
+                        }
+                        t.Sectors = sectors.Count;
+
+                        sweep.Current = $"TIC {t.Name}, {sectors.Count} sectors";
                         try
                         {
                             object raw = await RunAsync(new Request
                             {
-                                RaDeg = t.RaDeg, DecDeg = t.DecDeg,
-                                Label = $"TIC {t.Name} ({t.Sectors} sectors)",
+                                RaDeg = t.RaDeg, DecDeg = t.DecDeg, Tic = tic,
+                                Label = $"TIC {t.Name} ({sectors.Count} sectors)",
                                 MinPeriodDays = template.MinPeriodDays,
                                 MaxPeriodDays = template.MaxPeriodDays,
                                 DetrendWindowDays = template.DetrendWindowDays,
@@ -591,8 +686,12 @@ namespace ExoStudio.Research
                             if (hit != null) lock (sweep.Hits) sweep.Hits.Add(hit);
                         }
                         catch { /* one bad star does not end a field */ }
-                        sweep.Done++;
+
+                        searched++;
+                        sweep.Done = searched;
                     }
+
+                    sweep.Total = Math.Max(sweep.Done, Math.Min(limit, sweep.Done));
                     sweep.State = "done";
                     sweep.Current = "";
                 }
@@ -603,6 +702,14 @@ namespace ExoStudio.Research
                 }
             });
             return sweep;
+        }
+
+        private static double Separation(double ra1, double dec1, double ra2, double dec2)
+        {
+            const double d2r = Math.PI / 180.0;
+            double c = Math.Sin(dec1 * d2r) * Math.Sin(dec2 * d2r)
+                     + Math.Cos(dec1 * d2r) * Math.Cos(dec2 * d2r) * Math.Cos((ra1 - ra2) * d2r);
+            return Math.Acos(Math.Clamp(c, -1.0, 1.0)) / d2r;
         }
 
         /// <summary>
@@ -691,6 +798,14 @@ namespace ExoStudio.Research
                 current = s.Current, error = s.Error,
                 field = new { ra = s.RaDeg, dec = s.DecDeg, radius = s.RadiusDeg,
                               minSectors = s.MinSectors },
+                filtered = new
+                {
+                    listed = s.Listed,
+                    alreadyTaken = s.AlreadyTaken,
+                    tooFewSectors = s.TooFewSectors,
+                    examples = s.TakenExamples.ToArray(),
+                    warning = s.FilterWarning,
+                },
                 worthLooking = ranked.Count(h => h.Score > 0),
                 hits = ranked.Select(h => new
                 {

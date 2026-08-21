@@ -72,12 +72,13 @@ namespace ExoStudio.Research
 
             // THE FLUX COLUMN DEPENDS ON WHO MADE THE FILE. The mission's own two minute products
             // carry PDCSAP_FLUX; the light curves extracted from the full frame images by other
-            // groups do not, and each names its corrected flux differently. eleanor gives
-            // CORR_FLUX and PCA_FLUX, others give a plain FLUX. Preferring in this order takes
-            // the most processed version each provider offers, and falls back rather than
-            // failing, because the full frame products are the ones covering the sky nobody has
-            // searched star by star.
-            string fluxColumn = new[] { "PDCSAP_FLUX", "CORR_FLUX", "PCA_FLUX", "FLUX", "SAP_FLUX" }
+            // groups do not, and each names its corrected flux differently. QLP gives DET_FLUX,
+            // or KSPSAP_FLUX in its earlier versions. eleanor gives CORR_FLUX and PCA_FLUX,
+            // others give a plain FLUX. Preferring in this order takes the most processed version
+            // each provider offers, and falls back rather than failing, because the full frame
+            // products are the ones covering the sky nobody has searched star by star.
+            string fluxColumn = new[] { "PDCSAP_FLUX", "DET_FLUX", "KSPSAP_FLUX",
+                                        "CORR_FLUX", "PCA_FLUX", "FLUX", "SAP_FLUX" }
                 .FirstOrDefault(table.Has)
                 ?? throw new InvalidOperationException(
                     "no recognised flux column; the file has: " + string.Join(", ", table.ColumnNames));
@@ -89,10 +90,15 @@ namespace ExoStudio.Research
             double[] error = errorColumn != null ? table.Column1(errorColumn) : null;
             double[] quality = table.Has("QUALITY") ? table.Column1("QUALITY") : null;
 
+            // The centroid is what distinguishes a transit of this star from an eclipse of a
+            // neighbour bleeding into the same aperture, so every provider's spelling of it is
+            // worth knowing: the mission calls it MOM_CENTR, eleanor X_CENTROID, QLP SAP_X.
             double[] cx = table.Has("X_CENTROID") ? table.Column1("X_CENTROID")
-                        : table.Has("MOM_CENTR1") ? table.Column1("MOM_CENTR1") : null;
+                        : table.Has("MOM_CENTR1") ? table.Column1("MOM_CENTR1")
+                        : table.Has("SAP_X") ? table.Column1("SAP_X") : null;
             double[] cy = table.Has("Y_CENTROID") ? table.Column1("Y_CENTROID")
-                        : table.Has("MOM_CENTR2") ? table.Column1("MOM_CENTR2") : null;
+                        : table.Has("MOM_CENTR2") ? table.Column1("MOM_CENTR2")
+                        : table.Has("SAP_Y") ? table.Column1("SAP_Y") : null;
 
             var t = new List<double>(time.Length);
             var f = new List<double>(time.Length);
@@ -187,6 +193,20 @@ namespace ExoStudio.Research
             public double DurationHours;
             public double ExpectedDurationHoursAtSolarDensity;
             public double DurationRatio;
+
+            /// <summary>How many separate epochs actually carry enough data to show the transit.</summary>
+            public int TransitsObserved;
+
+            /// <summary>How many the period and the baseline would allow, had nothing been missing.</summary>
+            public int TransitsPossible;
+
+            /// <summary>
+            /// In-transit cadences against the number this light curve's own cadence would give
+            /// over the same total time. Well below one means the fold is standing on data the
+            /// mission mostly flagged away.
+            /// </summary>
+            public double TransitCoverage;
+
             public List<string> Concerns = new();
             public bool AnyConcern => Concerns.Count > 0;
         }
@@ -205,6 +225,17 @@ namespace ExoStudio.Research
         /// DURATION AGAINST PERIOD. Transit duration is set by the star's mean density through
         /// Kepler's third law, so a duration wildly inconsistent with any plausible main sequence
         /// star is a sign the box has fitted something that is not a transit at all.
+        ///
+        /// HOW MANY TRANSITS WERE ACTUALLY SEEN. A box search always returns a period, because it
+        /// reports whichever trial folded best and something always folds best. When the period
+        /// approaches the length of the observation only one event lies inside the data, so
+        /// nothing is being folded onto anything and "repeating" is a claim about a single dip.
+        ///
+        /// That failure is not theoretical either. With isolated artefacts excluded from the other
+        /// search, the same bad stretch of one sector came back through this one: four stars in a
+        /// field reported P = 17.926 d over a 23 day baseline, all at the identical period, each
+        /// resting on one event. A period longer than half the baseline deserves the single event
+        /// treatment and its vetting, not the credibility of repetition.
         /// </summary>
         public static Vetting Vet(LightCurve curve, DetectionResult found)
         {
@@ -250,6 +281,41 @@ namespace ExoStudio.Research
                 else if (dSecondary <= halfWidthPhase) secondary.Add(curve.Flux[i]);
                 else if (dIn > 2.0 * halfWidthPhase && dSecondary > 2.0 * halfWidthPhase) outside.Add(curve.Flux[i]);
             }
+
+            // WHAT THE FOLD IS ACTUALLY STANDING ON. Counted while walking the curve above would
+            // have been cheaper, but counting it here keeps the loop about phases and this about
+            // whether there is anything to fold.
+            var epochsSeen = new Dictionary<long, int>();
+            double span = curve.TimeDays[curve.Count - 1] - t0;
+            for (int i = 0; i < curve.Count; i++)
+            {
+                double cycles = (curve.TimeDays[i] - t0) / period;
+                double phase = cycles - Math.Floor(cycles);
+                if (PhaseDistance(phase, centre) > halfWidthPhase) continue;
+                long epoch = (long)Math.Floor(cycles);
+                epochsSeen[epoch] = epochsSeen.TryGetValue(epoch, out int c) ? c + 1 : 1;
+            }
+
+            double perTransit = durationDays / Math.Max(1e-9, curve.CadenceMinutes / (24.0 * 60.0));
+            // An epoch counts as observed only if it holds a real fraction of the cadences the
+            // transit should contain, so a couple of stray points at the edge of a gap do not
+            // amount to a transit.
+            v.TransitsObserved = epochsSeen.Count(kv => kv.Value >= Math.Max(3.0, perTransit * 0.5));
+            v.TransitsPossible = (int)Math.Floor(span / period) + 1;
+            v.TransitCoverage = epochsSeen.Values.Sum()
+                              / Math.Max(1.0, perTransit * Math.Max(1, v.TransitsPossible));
+
+            if (v.TransitsObserved < 2)
+                v.Concerns.Add(
+                    $"only {v.TransitsObserved} transit is actually covered by data at this period over a "
+                    + $"{span:0.#} day baseline, so nothing is being folded onto anything: the period is "
+                    + "whichever trial happened to score best, and the evidence is a single dip. Judge it "
+                    + "as an isolated event instead.");
+            else if (v.TransitCoverage < 0.5)
+                v.Concerns.Add(
+                    $"the folded transit holds {v.TransitCoverage:P0} of the cadences this light curve's "
+                    + "cadence would give across the epochs involved, so much of what should be in transit "
+                    + "was flagged away and the depth rests on the remainder.");
 
             if (outside.Count < 10) return v;
             double baseline = Median(outside.ToArray());
