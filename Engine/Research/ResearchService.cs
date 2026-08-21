@@ -225,12 +225,30 @@ namespace ExoStudio.Research
             // joined curve can cover. Leaving it there would silently step over real periods, so
             // the count is worked out here from the actual baseline and passed in.
             double baseline = raw.BaselineDays;
+
+            // HOW LONG A PERIOD THIS STAR CAN ACTUALLY SUPPORT, which is not the same as how long
+            // a period was asked for. Folding needs transits to fold, and a star watched in 17
+            // sectors spread over 969 days was only being recorded for about half of them, so
+            // beyond some period the epochs that fall in the gaps outnumber the ones that do not.
+            // Said in the log rather than enforced, because a search that quietly narrows what it
+            // was asked to do is worse than one that explains itself.
+            double covered = CoveredDays(raw);
+            double duty = baseline > 0 ? covered / baseline : 0;
+            double foldCeiling = duty > 0 ? baseline * duty / 3.0 : 0;
+
             int steps = PeriodSteps(baseline, request.MinPeriodDays, request.MaxPeriodDays);
             DetectionResult found = TransitDetector.Detect(
                 samples, request.MinPeriodDays, request.MaxPeriodDays,
                 periodSteps: steps, snrThreshold: request.SnrThreshold);
             log.Add($"box least squares over {request.MinPeriodDays:0.#} to {request.MaxPeriodDays:0.#} days, "
                   + $"{steps:N0} trial periods for a {baseline:0.#} day baseline [{Took()}]");
+            log.Add($"this star was actually being recorded for {covered:0} of those {baseline:0} days, "
+                  + $"{duty:P0} of the span, so three transits stop fitting inside the coverage past "
+                  + $"about {foldCeiling:0} days"
+                  + (request.MaxPeriodDays > foldCeiling
+                     ? ". Beyond that the fold has too little to work with and the isolated event "
+                     + "search is the one carrying the weight."
+                     : "."));
 
             if (!found.Detected)
             {
@@ -1171,6 +1189,25 @@ namespace ExoStudio.Research
         /// baseline with a wide period range would otherwise ask for millions of folds and the
         /// answer would arrive tomorrow.
         /// </summary>
+        /// <summary>
+        /// How many days of the span actually hold data, as opposed to how many the span covers.
+        ///
+        /// Counted as the time within a day of some cadence, which absorbs the ordinary downlink
+        /// gaps inside a sector and excludes the months between them, which is the distinction
+        /// that matters when asking whether a transit would have been seen.
+        /// </summary>
+        private static double CoveredDays(TransitSearchPipeline.LightCurve curve)
+        {
+            if (curve.Count < 2) return 0;
+            double covered = 0;
+            for (int i = 1; i < curve.Count; i++)
+            {
+                double step = curve.TimeDays[i] - curve.TimeDays[i - 1];
+                if (step > 0 && step <= 1.0) covered += step;
+            }
+            return covered;
+        }
+
         private static int PeriodSteps(double baselineDays, double minPeriodDays, double maxPeriodDays)
         {
             if (baselineDays <= 0 || minPeriodDays <= 0 || maxPeriodDays <= minPeriodDays) return 0;

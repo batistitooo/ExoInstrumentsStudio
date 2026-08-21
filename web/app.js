@@ -3008,10 +3008,17 @@ window.addEventListener('DOMContentLoaded', () => {
         $('rsTargetHint').textContent =
           'A hot Jupiter found in 2009. Useful for checking the pipeline works, not for discovery.';
       } else {
-        $('rsMinP').value = '8'; $('rsMaxP').value = '25'; $('rsWindow').value = '1.5';
+        // 25 DAYS WAS A LEFTOVER FROM SEARCHING ONE SECTOR AT A TIME. A sector is 27 days, so a
+        // period past about nine of them showed too few transits to fold and there was no point
+        // asking for more. Sectors are joined now, a continuous viewing zone star gives a baseline
+        // of years, and the cost of raising the ceiling is about a second. What stops it going
+        // further is not the search but the coverage: the run log works out the period past which
+        // three transits no longer fit inside the days this particular star was recorded.
+        $('rsMinP').value = '8'; $('rsMaxP').value = '60'; $('rsWindow').value = '1.5';
         $('rsTargetHint').textContent =
-          'Long periods are where the mission pipeline is weakest: it wants three transits and a ' +
-          'sector is 27 days, so anything beyond about 9 days is under searched.';
+          'Long periods are where the mission pipeline is weakest: it wants three transits, and its ' +
+          'own detrending removes anything lasting a day. Past the ceiling the run log reports, the ' +
+          'isolated event search is the one doing the work, and it needs no period at all.';
       }
     };
   }
