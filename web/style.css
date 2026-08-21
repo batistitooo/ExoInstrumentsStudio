@@ -809,3 +809,8 @@ table.signals tr.miss td { color: var(--ink-faint); }
 #rsLookSectors a:hover { opacity: 1; }
 #rsLookSectors a.on { opacity: 1; font-weight: 600; text-decoration: underline; }
 #rsLookForm input { min-width: 0; flex: 1 1 8rem; }
+
+/* The cursor readout under a chart. Monospaced so the digits do not jump around as the pointer
+   moves, and given a fixed height so the panel does not reflow when it empties. */
+.rsReadout { font-family: ui-monospace, Menlo, monospace; font-size: .74rem;
+             min-height: 1.1em; margin: .15rem 0 0; letter-spacing: .01em; }

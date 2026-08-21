@@ -2487,6 +2487,42 @@ function rsRow(label, value, note) {
  * afterwards in CSS pixels. Sizing the canvas by hand instead drew everything at twice the
  * intended scale on a retina display, which is the bug setupCanvas exists to prevent.
  */
+/**
+ * A line under a chart giving the cursor position in the data's own units.
+ *
+ * Attached once per canvas and fed by whatever painted it last, so it follows a chart that is
+ * redrawn with different data without accumulating listeners.
+ */
+function rsAttachReadout(cv) {
+  if (cv._rsReadout) return;
+  const out = document.createElement('p');
+  out.className = 'hint dim rsReadout';
+  out.textContent = ' ';
+  cv.insertAdjacentElement('afterend', out);
+  cv._rsReadout = out;
+
+  cv.addEventListener('mousemove', (e) => {
+    const m = cv._rsMap;
+    if (!m) return;
+    const r = cv.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+    if (px < m.pad.l || px > m.w - m.pad.r || py < m.pad.t || py > m.h - m.pad.b) {
+      out.textContent = ' ';
+      return;
+    }
+    const x = m.xMin + (px - m.pad.l) / (m.w - m.pad.l - m.pad.r) * (m.xMax - m.xMin);
+    const y = m.yMin + (m.h - m.pad.b - py) / (m.h - m.pad.t - m.pad.b) * (m.yMax - m.yMin);
+
+    // Flux is read twice: as the normalised number the arithmetic uses, and as the loss of light
+    // in parts per million, which is the quantity a transit is actually quoted in.
+    const yText = m.yKind === 'flux'
+      ? `${y.toFixed(6)}  (${((y - 1) * 1e6 >= 0 ? '+' : '')}${((y - 1) * 1e6).toFixed(0)} ppm)`
+      : y.toFixed(4);
+    out.textContent = `x = ${x.toFixed(4)}${m.xUnit ? ' ' + m.xUnit : ''}   y = ${yText}`;
+  });
+  cv.addEventListener('mouseleave', () => { out.textContent = ' '; });
+}
+
 function rsDrawCurve(cv, points, opts = {}) {
   // WATCHED, NOT TIMED. setupCanvas sizes the backing store from clientWidth, and a canvas in a
   // panel that was hidden a moment ago has not been laid out yet: measured here, one reported 262
@@ -2571,6 +2607,12 @@ function rsPaintCurve(cv, points, opts = {}) {
   g.fillStyle = dim;
   g.font = '11px system-ui, sans-serif';
   g.fillText(opts.xLabel || '', pad.l, h - 8);
+
+  // WHERE THE CURSOR IS, IN THE UNITS OF THE DATA. A chart spanning a thousand days in eight
+  // hundred pixels puts a day and a half in every pixel, so pointing at a feature and knowing when
+  // it happened is not something the eye can do unaided.
+  cv._rsMap = { pad, w, h, xMin, xMax, yMin, yMax, xUnit: opts.xUnit || '', yKind: opts.yKind || 'flux' };
+  rsAttachReadout(cv);
   g.textAlign = 'right';
   // THE AXIS SAYS WHAT IT SHOWS. It printed the full plotted range in ppm at the top, directly
   // above a "1.000", which reads as two numbers in different units with no relation stated. A
@@ -2579,6 +2621,15 @@ function rsPaintCurve(cv, points, opts = {}) {
   g.fillText('+' + ((yMax - 1) * 1e6).toFixed(0) + ' ppm', pad.l - 6, pad.t + 8);
   g.fillText('1.000', pad.l - 6, sy(1) + 4);
   g.fillText(((yMin - 1) * 1e6).toFixed(0) + ' ppm', pad.l - 6, h - pad.b - 2);
+  // The y axis carries two units at once: a normalised flux, and the deviation from it in parts
+  // per million. Saying so once beats leaving the reader to infer it from the labels.
+  g.save();
+  g.translate(11, (pad.t + h - pad.b) / 2);
+  g.rotate(-Math.PI / 2);
+  g.textAlign = 'center';
+  g.fillText('normalised flux, deviation in ppm', 0, 0);
+  g.restore();
+  g.textAlign = 'right';
   g.textAlign = 'left';
 }
 
@@ -2863,7 +2914,7 @@ function renderResearch(d) {
   if (shown && shown.length) {
     const t0 = shown[0][0];
     rsDrawCurve($('rsCurve'), shown.map((p) => ({ x: p[0] - t0, y: p[1] })),
-                { xLabel: 'days from the first cadence',
+                { xLabel: 'days from the first cadence', xUnit: 'd',
                   marks: (d.singleTransits || []).map((e) => e.centreTimeDays - t0) });
     if (shown === d.isolatedSeries) {
       $('rsCurveNote').textContent +=
@@ -2904,7 +2955,7 @@ function renderResearch(d) {
     });
     $('rsFoldPanel').hidden = false;
     $('rsFoldMeta').textContent = `period ${rsFmt(c.periodDays, 5)} d · depth ${rsFmt(c.depthPpm, 0)} ppm`;
-    rsDrawCurve($('rsFold'), folded, { xLabel: 'phase, transit near 0' });
+    rsDrawCurve($('rsFold'), folded, { xLabel: 'phase, transit near 0', xUnit: 'in phase' });
   }
 
   $('rsResultPanel').hidden = false;
@@ -3024,7 +3075,7 @@ function rsDrawZoom(ev) {
   const pts = source
     .filter((p) => Math.abs(p[0] - ev.centreTimeDays) <= half)
     .map((p) => ({ x: (p[0] - ev.centreTimeDays) * 24, y: p[1] }));
-  rsDrawCurve(cv, pts, { xLabel: 'hours from the centre of the dip' });
+  rsDrawCurve(cv, pts, { xLabel: 'hours from the centre of the dip', xUnit: 'h' });
 
   $('rsZoomNote').textContent =
     `${ev.depthPpm.toFixed(0)} ppm deep over ${ev.durationHours.toFixed(1)} h, signal to noise ` +
@@ -3157,7 +3208,7 @@ function rsPaintLook() {
   // is how far into the observation it happened.
   const t0 = raw.length ? raw[0][0] : 0;
   rsDrawCurve($('rsLookCurve'), raw.map((p) => ({ x: p[0] - t0, y: p[1] })),
-              { xLabel: `days from BTJD ${t0.toFixed(2)}` });
+              { xLabel: `days from BTJD ${t0.toFixed(2)}`, xUnit: 'd' });
 
   $('rsLookNote').textContent = rsLookFlux === 'unprocessed'
     ? 'The raw photometry, flattened here on a five day median. Events lasting a day survive this, ' +
