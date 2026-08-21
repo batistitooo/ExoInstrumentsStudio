@@ -312,7 +312,7 @@ namespace ExoStudio.Research
         {
             JsonElement found = await InvokeAsync("Mast.Catalogs.Filtered.Tic.Position", new
             {
-                columns = "ID,ra,dec,Tmag,rad",
+                columns = "ID,ra,dec,Tmag,rad,lumclass",
                 filters = new object[]
                 {
                     new { paramName = "Tmag", values = new object[] { new { min = brightestTmag, max = faintestTmag } } },
@@ -338,11 +338,21 @@ namespace ExoStudio.Research
                     // A GIANT IS THE WRONG PLACE TO LOOK, however bright and however well
                     // observed. Depth goes as the square of the ratio of radii, so a Jupiter that
                     // blocks one percent of a sun sized star blocks a quarter of that in front of
-                    // one twice the size, and a fortieth in front of a red giant. Stars with no
-                    // radius in the catalogue are kept, since an unknown radius is not a large
-                    // one and throwing them away would discard the poorly characterised stars,
-                    // which are precisely the ones nobody has examined.
+                    // one twice the size, and a fortieth in front of a red giant.
                     if (rad > 0 && rad > maxRadiusSolar) continue;
+
+                    // AND AN UNKNOWN RADIUS IS NOT A SMALL ONE. Keeping stars with no catalogued
+                    // radius is right, since the poorly characterised stars are precisely the ones
+                    // nobody has examined, but the catalogue often says GIANT in a separate column
+                    // while leaving the radius empty. TIC 141281260 came through that gap: no
+                    // radius, luminosity class GIANT, and the local Gaia catalogue puts it at 1650
+                    // parsecs with absolute V of zero, which is 17 solar radii. Its 1.6 day
+                    // eclipsing signal cannot be an orbit at all, since that orbit would fit
+                    // inside the star, so it is a blended binary diluted by a giant, and it sat at
+                    // the top of a field's results.
+                    string lum = Text(row, "lumclass");
+                    if (!string.IsNullOrEmpty(lum)
+                        && lum.IndexOf("GIANT", StringComparison.OrdinalIgnoreCase) >= 0) continue;
 
                     targets.Add(new RegionTarget
                     {
