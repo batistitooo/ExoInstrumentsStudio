@@ -68,6 +68,19 @@ namespace ExoStudio.Research
             public double NextBestFraction;
 
             /// <summary>
+            /// How far apart the two baseline flanks sit, as a fraction of the depth.
+            ///
+            /// A TRANSIT SITS ON A FLAT BASELINE. The star is the same brightness before and after,
+            /// because nothing happened to it. A slow wave is not: its minimum has a falling side
+            /// and a rising side, and the flux two days before is nowhere near the flux two days
+            /// after. Measuring the depth alone cannot tell the two apart, and did not: an event
+            /// of 3371 ppm over 24 hours, clearing its curve's best brightening four times over
+            /// with an unmoved centroid, turned out to be the bottom of a 4800 ppm wave that
+            /// declined steadily across four days.
+            /// </summary>
+            public double BaselineTilt;
+
+            /// <summary>
             /// The strongest BRIGHTENING of the same duration anywhere in this light curve, in the
             /// same units as Snr. A transit removes light; noise and systematics move both ways.
             /// So whatever this curve manages upward is what it can also manage downward for no
@@ -229,6 +242,15 @@ namespace ExoStudio.Research
                     double d = MedianOf(curve.Flux, dipLo, dipHi, 0, 0);
                     double depth = b - d;
 
+                    // THE TWO SIDES HAVE TO AGREE. Taken together the flanks give a baseline even
+                    // when the curve is sloping through the event, and their average sits happily
+                    // in the middle of a wave. Apart, they say whether the star was the same
+                    // brightness before and after, which a transit requires and a wave cannot
+                    // manage.
+                    double leftLevel = MedianOf(curve.Flux, leftOuter, leftInner, 0, 0);
+                    double rightLevel = MedianOf(curve.Flux, rightInner, rightOuter, 0, 0);
+                    double tilt = depth > 0 ? Math.Abs(leftLevel - rightLevel) / depth : 0;
+
                     // A TRANSIT CANNOT REMOVE MORE LIGHT THAN THE STAR EMITS. Depths beyond a few
                     // tens of percent are not deep eclipses, they are broken photometry: a raw
                     // flux that wandered near zero, a division by a baseline that did, an aperture
@@ -271,6 +293,7 @@ namespace ExoStudio.Research
                         PointsInDip = inDip,
                         PointsInBaseline = before + after,
                         CoverageRatio = coverage,
+                        BaselineTilt = tilt,
                         RedNoiseFactor = redFactor,
                     });
                 }
@@ -328,6 +351,15 @@ namespace ExoStudio.Research
                              + "planet. Around a star of ordinary size that needs a companion larger "
                              + "than any planet can be, so this is an eclipsing binary or a fault in "
                              + "the photometry.");
+
+            // A quarter of the depth is generous: real transits on well behaved curves come in
+            // near zero, and anything past this is a curve going somewhere rather than a star
+            // being crossed.
+            if (e.BaselineTilt > 0.25)
+                e.Concerns.Add($"the baseline before the dip and the baseline after it differ by "
+                             + $"{e.BaselineTilt:P0} of the depth. A transit leaves the star exactly "
+                             + "as it found it, so this is the bottom of something slower, not an "
+                             + "object crossing.");
 
             if (e.CoverageRatio < 0.85)
                 e.Concerns.Add($"the dip holds only {e.CoverageRatio:P0} of the cadences this light "

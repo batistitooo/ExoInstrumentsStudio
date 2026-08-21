@@ -597,6 +597,7 @@ namespace ExoStudio.Research
             pointsInDip = e.PointsInDip,
             nextBestFraction = e.NextBestFraction,
             coverageRatio = e.CoverageRatio,
+            baselineTilt = e.BaselineTilt,
             redNoiseFactor = e.RedNoiseFactor,
             brighteningSnr = e.BrighteningSnr,
             centroidShiftPixels = e.CentroidShiftPixels,
