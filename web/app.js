@@ -2523,7 +2523,11 @@ function rsPaintCurve(cv, points, opts = {}) {
   const { g, w, h } = setupCanvas(cv);
   if (!points.length) return;
 
-  const pad = { l: 46, r: 12, t: 14, b: 26 };
+  // WIDE ENOUGH FOR THE LABEL THAT GOES IN IT. The y labels are right aligned against this
+  // margin, and at 46 px a value like "+4564 ppm" ran off the left edge and rendered as "64 ppm",
+  // which reads as a plausible number and is not one. A curve whose points scatter by thousands of
+  // ppm appeared to span sixty four of them.
+  const pad = { l: 74, r: 12, t: 14, b: 26 };
   let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
   for (const p of points) {
     if (p.x < xMin) xMin = p.x; if (p.x > xMax) xMax = p.x;
@@ -2550,6 +2554,17 @@ function rsPaintCurve(cv, points, opts = {}) {
   g.beginPath(); g.moveTo(pad.l, sy(1)); g.lineTo(w - pad.r, sy(1)); g.stroke();
   g.setLineDash([]);
 
+  // WHERE THE SEARCH SAYS SOMETHING IS. Over a baseline of years a dip of a few hours is a couple
+  // of pixels wide, so without a mark the reader is asked to find it unaided in a picture where it
+  // is smaller than the sentence describing it.
+  for (const m of (opts.marks || [])) {
+    if (m < xMin || m > xMax) continue;
+    g.strokeStyle = 'rgba(255,255,255,0.35)';
+    g.setLineDash([2, 3]);
+    g.beginPath(); g.moveTo(sx(m), pad.t); g.lineTo(sx(m), h - pad.b); g.stroke();
+    g.setLineDash([]);
+  }
+
   g.fillStyle = accent;
   for (const p of points) g.fillRect(sx(p.x) - 0.6, sy(p.y) - 0.6, 1.2, 1.2);
 
@@ -2557,8 +2572,13 @@ function rsPaintCurve(cv, points, opts = {}) {
   g.font = '11px system-ui, sans-serif';
   g.fillText(opts.xLabel || '', pad.l, h - 8);
   g.textAlign = 'right';
-  g.fillText(((yMax - yMin) * 1e6).toFixed(0) + ' ppm', pad.l - 6, pad.t + 8);
+  // THE AXIS SAYS WHAT IT SHOWS. It printed the full plotted range in ppm at the top, directly
+  // above a "1.000", which reads as two numbers in different units with no relation stated. A
+  // transit is a fractional loss of light, so the labels that help are how far above and below
+  // the normal level the plot reaches.
+  g.fillText('+' + ((yMax - 1) * 1e6).toFixed(0) + ' ppm', pad.l - 6, pad.t + 8);
   g.fillText('1.000', pad.l - 6, sy(1) + 4);
+  g.fillText(((yMin - 1) * 1e6).toFixed(0) + ' ppm', pad.l - 6, h - pad.b - 2);
   g.textAlign = 'left';
 }
 
@@ -2823,11 +2843,17 @@ function renderResearch(d) {
   const lc = d.lightCurve;
   $('rsCurvePanel').hidden = false;
   $('rsCurveMeta').textContent =
-    `${lc.target || ''} · sector ${lc.sector} · ${fmt.int(lc.cadences)} cadences · ` +
+    `${lc.target || ''} · ` +
+    ((lc.sectors && lc.sectors.length > 1)
+      ? `${lc.sectors.length} sectors, ${lc.sectors[0]} to ${lc.sectors[lc.sectors.length - 1]} · `
+      : `sector ${(lc.sectors && lc.sectors[0]) || lc.sector} · `) +
+    `${fmt.int(lc.cadences)} cadences · ` +
     `${rsFmt(lc.baselineDays, 1)} d · ${rsFmt(lc.cadenceMinutes, 1)} min`;
   $('rsCurveNote').textContent =
-    `scatter ${rsFmt(lc.scatterPpmRaw, 0)} ppm before detrending, ${rsFmt(lc.scatterPpmDetrended, 0)} after. ` +
-    d.log[0];
+    `scatter ${rsFmt(lc.scatterPpmRaw, 0)} ppm before detrending, ${rsFmt(lc.scatterPpmDetrended, 0)} after, ` +
+    'per cadence. The plot averages the cadences into about four thousand points, so the scatter ' +
+    'you see is smaller than that by roughly the root of the group size, while a real dip keeps ' +
+    'its depth. ' + d.log[0];
   // THE CURVE SHOWN MUST BE THE ONE THE RESULT CAME FROM. The fold reads the provider's
   // detrended flux and the isolated search reads the raw flux flattened on a five day median.
   // Showing the first for every result made every star in a field look identical, because that
@@ -2837,7 +2863,8 @@ function renderResearch(d) {
   if (shown && shown.length) {
     const t0 = shown[0][0];
     rsDrawCurve($('rsCurve'), shown.map((p) => ({ x: p[0] - t0, y: p[1] })),
-                { xLabel: 'days from the first cadence' });
+                { xLabel: 'days from the first cadence',
+                  marks: (d.singleTransits || []).map((e) => e.centreTimeDays - t0) });
     if (shown === d.isolatedSeries) {
       $('rsCurveNote').textContent +=
         ' Shown here is the unprocessed flux, flattened on a five day median, which is where the ' +

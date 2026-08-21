@@ -246,11 +246,11 @@ namespace ExoStudio.Research
                           + $"{e.DepthPpm:0} ppm over {e.DurationHours:0.#} h, SNR {e.Snr:0.#}");
 
                 string emptyId = Save(request, chosen, raw, flat, found, null, null, log, alone,
-                                      isolatedCurveForEmpty);
+                                      isolatedCurveForEmpty, opening.Select(p => p.Sector));
                 return new
                 {
                     ok = true, detected = false, id = emptyId, log,
-                    lightCurve = Describe(raw, flat),
+                    lightCurve = Describe(raw, flat, opening.Select(p => p.Sector)),
                     series = Series(flat),
                 // THE CURVE THE ISOLATED EVENTS ACTUALLY LIVE IN, which is not the one above.
                 // The fold reads the provider's detrended flux; the isolated search reads the raw
@@ -299,7 +299,7 @@ namespace ExoStudio.Research
             foreach (string u in registry.Unavailable) log.Add("could not check " + u);
 
             string id = Save(request, chosen, raw, flat, found, vetting, registry, log, singles,
-                             isolatedCurve);
+                             isolatedCurve, opening.Select(p => p.Sector));
 
             return new
             {
@@ -307,7 +307,7 @@ namespace ExoStudio.Research
                 detected = true,
                 id,
                 log,
-                lightCurve = Describe(raw, flat),
+                lightCurve = Describe(raw, flat, opening.Select(p => p.Sector)),
                 series = Series(flat),
                 // THE CURVE THE ISOLATED EVENTS ACTUALLY LIVE IN, which is not the one above.
                 // The fold reads the provider's detrended flux; the isolated search reads the raw
@@ -489,12 +489,39 @@ namespace ExoStudio.Research
             return report;
         }
 
+        /// <summary>
+        /// The curve reduced to something a chart can hold, by AVERAGING rather than by keeping
+        /// one point in every so many.
+        ///
+        /// WHY THE DIFFERENCE MATTERS MORE THAN IT SOUNDS. Joining seventeen sectors gives 169,000
+        /// cadences, and a chart four thousand points wide. Keeping every forty second cadence
+        /// preserves the full scatter of the noise while throwing away forty one of every forty
+        /// two measurements, so a transit spanning four hundred cadences survives as ten points
+        /// buried among four thousand at full amplitude. It cannot be seen, and every star in a
+        /// field looks like the same cloud of dots regardless of what is in it.
+        ///
+        /// Averaging each group keeps every measurement instead, and divides the visible scatter
+        /// by the root of the group size, about six here, while leaving a real dip at its true
+        /// depth because every cadence inside it is in the average. That is the difference between
+        /// a picture of the noise and a picture of the star.
+        ///
+        /// Grouped by position rather than on a fixed time grid, so the months between sectors
+        /// cost no bins at all instead of thousands of empty ones.
+        /// </summary>
         private static double[][] Series(TransitSearchPipeline.LightCurve flat, int maxPoints = 4000)
         {
-            int stride = Math.Max(1, flat.Count / maxPoints);
-            var outp = new List<double[]>(flat.Count / stride + 1);
-            for (int i = 0; i < flat.Count; i += stride)
-                outp.Add(new[] { flat.TimeDays[i], flat.Flux[i] });
+            int n = flat.Count;
+            if (n == 0) return Array.Empty<double[]>();
+
+            int group = Math.Max(1, (int)Math.Ceiling(n / (double)maxPoints));
+            var outp = new List<double[]>(n / group + 1);
+            for (int i = 0; i < n; i += group)
+            {
+                int to = Math.Min(n, i + group);
+                double t = 0, f = 0;
+                for (int j = i; j < to; j++) { t += flat.TimeDays[j]; f += flat.Flux[j]; }
+                outp.Add(new[] { t / (to - i), f / (to - i) });
+            }
             return outp.ToArray();
         }
 
@@ -557,11 +584,18 @@ namespace ExoStudio.Research
             passed = e.Concerns.Count == 0,
         };
 
+        /// <summary>
+        /// A JOINED CURVE HAS NO SECTOR. Stitch leaves the field at zero because seventeen sectors
+        /// do not have one number, and the page duly reported "sector 0", which is not a sector
+        /// and told the reader nothing. What a joined curve has is a list, so it is passed in.
+        /// </summary>
         private static object Describe(TransitSearchPipeline.LightCurve raw,
-                                       TransitSearchPipeline.LightCurve flat) => new
+                                       TransitSearchPipeline.LightCurve flat,
+                                       IEnumerable<int> sectors = null) => new
         {
             target = raw.Target,
             sector = raw.Sector,
+            sectors = sectors?.OrderBy(x => x).ToArray() ?? Array.Empty<int>(),
             cadences = raw.Count,
             baselineDays = raw.BaselineDays,
             cadenceMinutes = raw.CadenceMinutes,
@@ -579,7 +613,8 @@ namespace ExoStudio.Research
                             DetectionResult found, TransitSearchPipeline.Vetting vetting,
                             KnownObjects.Report registry, List<string> log,
                             List<SingleTransitSearch.Event> singles = null,
-                            TransitSearchPipeline.LightCurve isolated = null)
+                            TransitSearchPipeline.LightCurve isolated = null,
+                            IEnumerable<int> sectors = null)
         {
             string id = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)
                       + "-" + Math.Abs(HashCode.Combine(request.RaDeg, request.DecDeg)).ToString("x8");
@@ -605,7 +640,7 @@ namespace ExoStudio.Research
                     detrend = "running median",
                     detector = "Core/TransitDetector, box least squares, Kovacs et al. 2002",
                 },
-                lightCurve = Describe(raw, flat),
+                lightCurve = Describe(raw, flat, sectors),
 
                 // THE CURVE ITSELF, not only what was measured from it. Without this a recorded
                 // run could be reopened and would show every number and no light curve, which is
