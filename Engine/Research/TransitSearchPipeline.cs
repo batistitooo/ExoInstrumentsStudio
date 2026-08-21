@@ -450,6 +450,22 @@ namespace ExoStudio.Research
             public int TransitsPossible;
 
             /// <summary>
+            /// The depth actually present in the folded curve, against the depth the search
+            /// claimed. One means they agree.
+            ///
+            /// A BOX SEARCH REPORTS THE BEST FIT, WHICH IS NOT THE SAME AS A MEASUREMENT. It scans
+            /// tens of thousands of trial periods and keeps whichever box scored highest, and with
+            /// that many chances the winner is biased upward: it lands where the noise happened to
+            /// help. Folding on the reported period and measuring the dip independently is the
+            /// check, and nothing was making it. Two candidates in one field claimed 1637 and 1488
+            /// ppm while their folds held 516 and 492, and both had passed every other test.
+            /// </summary>
+            public double DepthConsistency;
+
+            /// <summary>The depth measured in the fold, in ppm, averaged over odd and even transits.</summary>
+            public double FoldedDepthPpm;
+
+            /// <summary>
             /// In-transit cadences against the number this light curve's own cadence would give
             /// over the same total time. Well below one means the fold is standing on data the
             /// mission mostly flagged away.
@@ -603,6 +619,22 @@ namespace ExoStudio.Research
                         $"odd and even transits differ in depth by {v.OddEvenDifferenceSigma:0.#} sigma "
                         + $"({v.OddDepthPpm:0} against {v.EvenDepthPpm:0} ppm). That is the signature of an "
                         + "eclipsing binary at twice this period, with the true period being the pair.");
+            }
+
+            // THE DEPTH THE FOLD ACTUALLY HOLDS, against the depth the search claimed. Measured
+            // from the same odd and even sets the test above uses, so it costs nothing extra.
+            var both = new List<double>(odd); both.AddRange(even);
+            v.FoldedDepthPpm = DepthPpm(both);
+            if (found.BestDepthPpm > 0 && !double.IsNaN(v.FoldedDepthPpm))
+            {
+                v.DepthConsistency = v.FoldedDepthPpm / found.BestDepthPpm;
+                if (v.DepthConsistency < 0.5)
+                    v.Concerns.Add(
+                        $"folding on this period gives a dip of {v.FoldedDepthPpm:0} ppm, against the "
+                      + $"{found.BestDepthPpm:0} ppm the search reported: {v.DepthConsistency:P0} of it. "
+                      + "A box search keeps whichever of tens of thousands of trials scored highest, so "
+                      + "its depth is biased upward by the search itself. When the fold does not "
+                      + "confirm it, what was found is where the noise helped rather than a transit.");
             }
 
             v.SecondaryDepthPpm = DepthPpm(secondary);

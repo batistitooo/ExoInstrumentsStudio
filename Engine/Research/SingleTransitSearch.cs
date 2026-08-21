@@ -229,6 +229,15 @@ namespace ExoStudio.Research
                     double d = MedianOf(curve.Flux, dipLo, dipHi, 0, 0);
                     double depth = b - d;
 
+                    // A TRANSIT CANNOT REMOVE MORE LIGHT THAN THE STAR EMITS. Depths beyond a few
+                    // tens of percent are not deep eclipses, they are broken photometry: a raw
+                    // flux that wandered near zero, a division by a baseline that did, an aperture
+                    // that lost the star. One field returned events of 2,879,574 ppm, which is 288
+                    // percent, alongside 713,271 and 309,297. Reported with a signal to noise of
+                    // 541 and ranked at the top, they crowded out everything a person should have
+                    // been looking at.
+                    if (depth > 0.30) continue;
+
                     // THE SAME SEARCH, RUN UPWARDS, IS THE CONTROL. Every window that comes out
                     // BRIGHTER than its surroundings is measured with the identical statistic and
                     // the strongest is kept. No star brightens by a percent for an hour in the
@@ -310,6 +319,15 @@ namespace ExoStudio.Research
             if (e.PointsInDip < 6)
                 e.Concerns.Add($"only {e.PointsInDip} cadences inside the dip, so its shape is barely "
                              + "sampled and a couple of bad points could account for it.");
+
+            // Between a few percent and thirty, the photometry may be sound but the companion is
+            // not a planet: a Jupiter in front of a sun sized star is one percent, and three
+            // percent already needs a body larger than any planet.
+            if (e.DepthPpm > 50000)
+                e.Concerns.Add($"a dip of {e.DepthPpm / 10000.0:0.#} percent is far too deep for a "
+                             + "planet. Around a star of ordinary size that needs a companion larger "
+                             + "than any planet can be, so this is an eclipsing binary or a fault in "
+                             + "the photometry.");
 
             if (e.CoverageRatio < 0.85)
                 e.Concerns.Add($"the dip holds only {e.CoverageRatio:P0} of the cadences this light "

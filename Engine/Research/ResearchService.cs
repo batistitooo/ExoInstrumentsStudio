@@ -340,6 +340,8 @@ namespace ExoStudio.Research
                     transitsObserved = vetting.TransitsObserved,
                     transitsPossible = vetting.TransitsPossible,
                     transitCoverage = vetting.TransitCoverage,
+                    foldedDepthPpm = vetting.FoldedDepthPpm,
+                    depthConsistency = vetting.DepthConsistency,
                     concerns = vetting.Concerns,
                     passed = !vetting.AnyConcern,
                 },
@@ -831,6 +833,8 @@ namespace ExoStudio.Research
                     transitsObserved = vetting.TransitsObserved,
                     transitsPossible = vetting.TransitsPossible,
                     transitCoverage = vetting.TransitCoverage,
+                    foldedDepthPpm = vetting.FoldedDepthPpm,
+                    depthConsistency = vetting.DepthConsistency,
                     concerns = vetting.Concerns, passed = !vetting.AnyConcern,
                 },
                 known = new
