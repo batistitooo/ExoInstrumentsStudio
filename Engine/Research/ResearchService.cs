@@ -276,9 +276,9 @@ namespace ExoStudio.Research
 
             TransitSearchPipeline.Vetting vetting = TransitSearchPipeline.Vet(flat, found);
             log.Add($"single transit search [{Took()}]");
-            KnownObjects.Report registry = await known.LookUpAsync(
+            KnownObjects.Report registry = await RegistryAtAsync(
                 request.RaDeg, request.DecDeg, found.BestPeriodDays);
-            log.Add($"cross matched against the registers [{Took()}]");
+            log.Add($"cross matched against the registers held in memory [{Took()}]");
 
             log.Add($"candidate at {found.BestPeriodDays:0.#####} d, {found.BestDepthPpm:0} ppm, "
                   + $"SNR {found.Snr:0.#}");
@@ -434,6 +434,41 @@ namespace ExoStudio.Research
                 detrended = Series(processed, maxPoints),
                 unprocessed = Series(flattened, maxPoints),
             };
+        }
+
+        /// <summary>
+        /// What is already registered at a position, answered from the register held in memory
+        /// rather than by asking the archives again.
+        ///
+        /// The network version of this cost 23.7 s per star, more than joining seventeen sectors
+        /// and folding them put together. It is kept as the fallback for the one case that has no
+        /// register loaded, and used nowhere else.
+        /// </summary>
+        private async Task<KnownObjects.Report> RegistryAtAsync(
+            double raDeg, double decDeg, double candidatePeriodDays, double radiusArcsec = 30.0)
+        {
+            KnownHostRegister.Snapshot snapshot;
+            try { snapshot = await register.LoadAsync(); }
+            catch { return await known.LookUpAsync(raDeg, decDeg, candidatePeriodDays, radiusArcsec); }
+
+            if (!snapshot.Usable)
+                return await known.LookUpAsync(raDeg, decDeg, candidatePeriodDays, radiusArcsec);
+
+            var report = new KnownObjects.Report();
+            foreach (string u in snapshot.Unavailable) report.Unavailable.Add(u);
+            foreach (KnownHostRegister.Entry e in snapshot.Around(raDeg, decDeg, radiusArcsec))
+            {
+                report.Matches.Add(new KnownObjects.Match
+                {
+                    Register = e.Register,
+                    Name = e.Name,
+                    PeriodDays = e.PeriodDays,
+                    SeparationArcsec = Separation(raDeg, decDeg, e.RaDeg, e.DecDeg) * 3600.0,
+                    PeriodRatio = e.PeriodDays > 0 ? candidatePeriodDays / e.PeriodDays : 0,
+                    Note = e.Note,
+                });
+            }
+            return report;
         }
 
         private static double[][] Series(TransitSearchPipeline.LightCurve flat, int maxPoints = 4000)
@@ -681,7 +716,7 @@ namespace ExoStudio.Research
             KnownObjects.Report registry = null;
             if (request.RaDeg != 0 || request.DecDeg != 0)
             {
-                registry = await known.LookUpAsync(request.RaDeg, request.DecDeg,
+                registry = await RegistryAtAsync(request.RaDeg, request.DecDeg,
                                                    found.Detected ? found.BestPeriodDays : 0);
             }
             else
@@ -788,6 +823,13 @@ namespace ExoStudio.Research
             /// <summary>Stars dropped because too few sectors cover them to search.</summary>
             public int TooFewSectors { get; set; }
 
+            /// <summary>
+            /// Stars the archive would not answer about, so their coverage is unknown rather than
+            /// thin. Kept apart from TooFewSectors because a busy archive must not be able to look
+            /// like an empty sky.
+            /// </summary>
+            public int CoverageUnknown { get; set; }
+
             /// <summary>Named examples of what was ruled out, so the filtering is visible rather than silent.</summary>
             public List<string> TakenExamples { get; } = new();
 
@@ -844,16 +886,30 @@ namespace ExoStudio.Research
                             "could not reach " + string.Join("; ", taken.Unavailable)
                             + ", so some already known hosts may still appear below";
 
+                    int takenCount = 0, thinCount = 0, unknownCount = 0;
                     List<MastClient.RegionTarget> targets =
                         await mast.FindTicTargetsAsync(ra, dec, radius);
                     sweep.Listed = targets.Count;
                     sweep.Total = Math.Min(limit, targets.Count);
                     sweep.State = targets.Count == 0 ? "empty" : "searching";
 
-                    int searched = 0;
-                    foreach (MastClient.RegionTarget t in targets)
+                    // STARS ARE SEARCHED SEVERAL AT A TIME. Most of a star is now the fold, which
+                    // is arithmetic on one core, and the rest is waiting on the archive. Running
+                    // them one after another left the other cores idle through both. The archive
+                    // sees no more traffic than before, because the gate inside HlspDirect bounds
+                    // that separately.
+                    int workers = Math.Max(1, Math.Min(4, Environment.ProcessorCount - 1));
+                    int next = -1, searched = 0;
+                    var queue = targets;
+
+                    async Task WorkAsync()
                     {
-                        if (searched >= limit) break;
+                    while (true)
+                    {
+                        if (Volatile.Read(ref searched) >= limit) break;
+                        int index = Interlocked.Increment(ref next);
+                        if (index >= queue.Count) break;
+                        MastClient.RegionTarget t = queue[index];
                         long tic = long.TryParse(t.Name, out long parsed) ? parsed : 0;
 
                         // ALREADY SPOKEN FOR. An exact catalogue match is the usual case; the
@@ -863,7 +919,7 @@ namespace ExoStudio.Research
                         KnownHostRegister.Entry near = taken.Near(t.RaDeg, t.DecDeg, 21.0);
                         if (taken.Holds(tic) || near != null)
                         {
-                            sweep.AlreadyTaken++;
+                            Interlocked.Increment(ref takenCount);
                             string why = taken.Holds(tic)
                                 ? $"TIC {tic} is already in the registers"
                                 : $"TIC {tic} sits {Separation(t.RaDeg, t.DecDeg, near.RaDeg, near.DecDeg) * 3600.0:0} arcsec "
@@ -873,14 +929,22 @@ namespace ExoStudio.Research
                             continue;
                         }
 
-                        sweep.Current = $"TIC {t.Name}, checking coverage";
                         List<int> sectors;
                         try { sectors = await hlsp.SectorsAsync(tic, HlspDirect.Qlp); }
-                        catch { continue; }
+                        catch (Exception probe)
+                        {
+                            // Coverage unknown, which is not the same as thin. Counted apart so a
+                            // struggling archive cannot masquerade as an empty sky.
+                            Interlocked.Increment(ref unknownCount);
+                            lock (sweep.TakenExamples)
+                                if (sweep.TakenExamples.Count < 12)
+                                    sweep.TakenExamples.Add(probe.Message);
+                            continue;
+                        }
 
                         if (sectors.Count < Math.Max(1, minSectors))
                         {
-                            sweep.TooFewSectors++;
+                            Interlocked.Increment(ref thinCount);
                             continue;
                         }
                         t.Sectors = sectors.Count;
@@ -902,11 +966,16 @@ namespace ExoStudio.Research
                         }
                         catch { /* one bad star does not end a field */ }
 
-                        searched++;
-                        sweep.Done = searched;
+                        sweep.Done = Interlocked.Increment(ref searched);
+                    }
                     }
 
-                    sweep.Total = Math.Max(sweep.Done, Math.Min(limit, sweep.Done));
+                    await Task.WhenAll(Enumerable.Range(0, workers).Select(_ => WorkAsync()));
+
+                    sweep.AlreadyTaken = takenCount;
+                    sweep.TooFewSectors = thinCount;
+                    sweep.CoverageUnknown = unknownCount;
+                    sweep.Total = sweep.Done;
                     sweep.State = "done";
                     sweep.Current = "";
                 }
@@ -966,7 +1035,13 @@ namespace ExoStudio.Research
             {
                 JsonElement best = singles.Where(e => Bool(e, "passed"))
                                           .OrderByDescending(e => Dbl(e, "snr")).First();
-                score = Dbl(best, "snr") * 2.0;
+                // RANKED BY THE MARGIN, NOT BY THE DEPTH. What separates a candidate from a deep
+                // patch of noise is how far it stands above what the same curve manages in the
+                // direction that cannot be a planet. A dip twice the best brightening is worth
+                // more attention than a deeper one that barely clears it.
+                double bump = Dbl(best, "brighteningSnr");
+                double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
+                score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0);
                 why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
                     + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}";
             }
@@ -1038,6 +1113,7 @@ namespace ExoStudio.Research
                     listed = s.Listed,
                     alreadyTaken = s.AlreadyTaken,
                     tooFewSectors = s.TooFewSectors,
+                    coverageUnknown = s.CoverageUnknown,
                     examples = s.TakenExamples.ToArray(),
                     warning = s.FilterWarning,
                 },

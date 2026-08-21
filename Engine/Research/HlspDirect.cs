@@ -120,10 +120,14 @@ namespace ExoStudio.Research
         /// endpoint answers a HEAD for files it does not have; asking for content makes it commit.
         /// A 206 or a 200 means the file is there, and nothing is transferred either way.
         /// </summary>
+        /// <summary>How many probes for the last star could not be answered either way.</summary>
+        public int LastUnanswered { get; private set; }
+
         public async Task<List<int>> SectorsAsync(long tic, Provider provider, int maxSector = 0)
         {
             int top = maxSector > 0 ? maxSector : SectorCeiling;
             var found = new List<int>();
+            int unanswered = 0;
             var work = new List<Task>();
 
             for (int s = 1; s <= top; s++)
@@ -131,30 +135,61 @@ namespace ExoStudio.Research
                 int sector = s;
                 work.Add(Task.Run(async () =>
                 {
-                    if (await ExistsAsync(provider.Uri(tic, sector)))
-                        lock (found) found.Add(sector);
+                    bool? there = await ExistsAsync(provider.Uri(tic, sector));
+                    if (there == true) lock (found) found.Add(sector);
+                    else if (there == null) Interlocked.Increment(ref unanswered);
                 }));
             }
             await Task.WhenAll(work);
             found.Sort();
+            LastUnanswered = unanswered;
+
+            // A star whose coverage could not be established is a star this pass knows nothing
+            // about, and saying so is the difference between a gap in the search and a silent one.
+            if (unanswered > 0 && found.Count == 0)
+                throw new InvalidOperationException(
+                    $"the archive did not answer {unanswered} of {top} probes for TIC {tic}, "
+                    + "so its coverage is unknown rather than absent");
+
             return found;
         }
 
-        private async Task<bool> ExistsAsync(string dataUri)
+        /// <summary>
+        /// Whether the archive holds this file.
+        ///
+        /// A FAILURE IS NOT AN ABSENCE, and treating it as one is how a sweep quietly stops
+        /// searching. The first version returned false for anything that threw, so a timeout under
+        /// load read as "this sector does not exist". Once several stars were probed at once that
+        /// became the normal outcome: a field whose stars each hold 17 sectors reported 65 of 95
+        /// as too thinly covered to search, and they were dropped without a word. Only a refusal
+        /// from the archive means absent; everything else is retried, and what still will not
+        /// answer is reported as unknown rather than counted either way.
+        /// </summary>
+        private async Task<bool?> ExistsAsync(string dataUri)
         {
-            await Gate.WaitAsync();
-            try
+            for (int attempt = 0; attempt < 3; attempt++)
             {
-                // The uri is deliberately NOT escaped; the archive's endpoint wants it raw.
-                using var message = new HttpRequestMessage(HttpMethod.Get, Download + dataUri);
-                message.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
-                using HttpResponseMessage response =
-                    await http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead);
-                return response.StatusCode == HttpStatusCode.PartialContent
-                    || response.StatusCode == HttpStatusCode.OK;
+                await Gate.WaitAsync();
+                try
+                {
+                    // The uri is deliberately NOT escaped; the archive's endpoint wants it raw.
+                    using var message = new HttpRequestMessage(HttpMethod.Get, Download + dataUri);
+                    message.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+                    using HttpResponseMessage response =
+                        await http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead);
+
+                    if (response.StatusCode == HttpStatusCode.PartialContent
+                        || response.StatusCode == HttpStatusCode.OK) return true;
+                    if (response.StatusCode == HttpStatusCode.NotFound
+                        || response.StatusCode == HttpStatusCode.Forbidden) return false;
+                    // Anything else is the archive being busy rather than the file being missing.
+                }
+                catch { /* network, timeout: try again */ }
+                finally { Gate.Release(); }
+
+                await Task.Delay(250 * (attempt + 1));
             }
-            catch { return false; }
-            finally { Gate.Release(); }
+            return null;
         }
 
         /// <summary>

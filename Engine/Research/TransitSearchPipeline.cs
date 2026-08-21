@@ -357,11 +357,31 @@ namespace ExoStudio.Research
         {
             int n = curve.Count;
             var flat = new double[n];
-            var window = new List<double>();
+            if (n == 0) return curve;
+
+            // THE BASELINE IS EVALUATED ON A COARSE GRID AND INTERPOLATED, not recomputed at every
+            // cadence. The straightforward version took a median of the whole window at each of
+            // the samples, and once sectors were joined that became 169,000 windows of about 2,200
+            // points, each copied and sorted: 6.7 s for a 1.5 day window and 16.7 s for a 5 day
+            // one, which was two thirds of the time a star took to search.
+            //
+            // It was also work that could not pay off. The baseline is a median over a window
+            // wider than any transit, so it cannot vary appreciably faster than that window; a
+            // sixteenth of it is far finer than anything the median can express. Anchors are
+            // placed on the data rather than on a fixed grid, so the months between sectors
+            // produce no anchors instead of thousands of empty ones, and each sample is divided by
+            // the straight line between the anchors either side of it.
+            double step = Math.Max(windowDays / 16.0, 1e-9);
+            var anchorTime = new List<double>();
+            var anchorLevel = new List<double>();
 
             int lo = 0, hi = 0;
+            var window = new List<double>();
             for (int i = 0; i < n; i++)
             {
+                if (anchorTime.Count > 0 && curve.TimeDays[i] - anchorTime[anchorTime.Count - 1] < step
+                    && i != n - 1) continue;
+
                 double from = curve.TimeDays[i] - windowDays * 0.5;
                 double to = curve.TimeDays[i] + windowDays * 0.5;
                 while (lo < n && curve.TimeDays[lo] < from) lo++;
@@ -369,7 +389,24 @@ namespace ExoStudio.Research
 
                 window.Clear();
                 for (int j = lo; j < hi; j++) window.Add(curve.Flux[j]);
-                double baseline = window.Count > 0 ? Median(window.ToArray()) : 1.0;
+                anchorTime.Add(curve.TimeDays[i]);
+                anchorLevel.Add(window.Count > 0 ? Median(window.ToArray()) : 1.0);
+            }
+
+            int a = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double t = curve.TimeDays[i];
+                while (a + 1 < anchorTime.Count && anchorTime[a + 1] < t) a++;
+
+                double baseline;
+                if (a + 1 >= anchorTime.Count || anchorTime[a] >= t) baseline = anchorLevel[a];
+                else
+                {
+                    double gap = anchorTime[a + 1] - anchorTime[a];
+                    double f = gap > 0 ? (t - anchorTime[a]) / gap : 0.0;
+                    baseline = anchorLevel[a] + f * (anchorLevel[a + 1] - anchorLevel[a]);
+                }
                 flat[i] = baseline > 0 ? curve.Flux[i] / baseline : 1.0;
             }
 

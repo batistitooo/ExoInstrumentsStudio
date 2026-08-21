@@ -37,12 +37,22 @@ namespace ExoStudio.Research
     public static class SingleTransitSearch
     {
         /// <summary>
-        /// How far a dip must clear the strongest brightening of the same duration before it
-        /// counts. Symmetric noise gives the two the same distribution, so anything at or near
-        /// parity is simply the downward half of it; a real transit leaves it far behind. WASP 18
-        /// b clears its own curve's best brightening several times over.
+        /// How far a dip must clear the strongest brightening of the same duration before it is
+        /// worth reporting at all.
+        ///
+        /// PARITY IS THE ONLY DEFENSIBLE PLACE TO CUT. Symmetric noise gives dips and brightenings
+        /// the same distribution, so a dip that does not even exceed the best brightening in its
+        /// own curve carries no information whatever and is dropped. Anything above that is kept
+        /// and allowed to sink instead, because the margin is a matter of degree and the reader is
+        /// better served by a ranked list with its reservations attached than by a short list that
+        /// deleted things without saying so.
+        ///
+        /// A stricter cut of 1.5 was tried and it silently removed TOI-2180 b, whose dip clears
+        /// its curve's best brightening by 1.7. Losing the one transit a citizen scientist
+        /// actually found, and losing it without a trace, is a far worse failure than showing a
+        /// few too many rows.
         /// </summary>
-        private const double BrighteningMargin = 1.5;
+        private const double BrighteningMargin = 1.0;
 
         public sealed class Event
         {
@@ -261,10 +271,8 @@ namespace ExoStudio.Research
             foreach (Event e in candidates)
                 e.BrighteningSnr = brightestByDuration.GetValueOrDefault(e.DurationHours / 24.0);
 
-            // A dip that does not clear the best brightening of the same duration is not a
-            // detection, it is the deeper half of this curve's own scatter. Dropped outright
-            // rather than reported with a caveat, because a list where most entries are noise is
-            // not a list anybody can use.
+            // A dip that does not even reach the best brightening of the same duration is the
+            // deeper half of this curve's own scatter and nothing else.
             candidates = candidates
                 .Where(e => e.BrighteningSnr <= 0 || e.Snr >= e.BrighteningSnr * BrighteningMargin)
                 .ToList();

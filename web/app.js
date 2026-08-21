@@ -3211,6 +3211,8 @@ function rsRenderSweep(s) {
     if (f.listed) bits.push(`${f.listed} stars in the field`);
     if (f.alreadyTaken) bits.push(`${f.alreadyTaken} skipped as already having a planet or candidate on record`);
     if (f.tooFewSectors) bits.push(`${f.tooFewSectors} skipped for too little coverage`);
+    if (f.coverageUnknown) bits.push(`${f.coverageUnknown} the archive would not answer about, ` +
+      `whose coverage is unknown rather than absent`);
     note.hidden = bits.length === 0;
     note.innerHTML = bits.length
       ? `<p class="hint dim">${bits.join(' · ')}.</p>` +

@@ -54,6 +54,12 @@ namespace ExoStudio.Research
             public double DecDeg { get; init; }
             public string Name { get; init; }
             public string Register { get; init; }
+
+            /// <summary>The registered period, where the register publishes one. Zero when it does not.</summary>
+            public double PeriodDays { get; init; }
+
+            /// <summary>What a match here means for somebody hoping to have found something.</summary>
+            public string Note { get; init; }
         }
 
         public sealed class Snapshot
@@ -68,6 +74,28 @@ namespace ExoStudio.Research
             public List<string> Unavailable { get; } = new();
 
             public bool Usable => Tics.Count > 0;
+
+            /// <summary>
+            /// Everything registered near a position, answered from memory.
+            ///
+            /// The same question used to go out to the NASA archive as a cone query for every
+            /// star searched, which measured 23.7 s and was the single largest cost in a sweep,
+            /// larger than the fold. The whole register is already held here to decide what to
+            /// search at all, so asking it again over the network was paying a network round trip
+            /// to learn something already in memory.
+            /// </summary>
+            public List<Entry> Around(double raDeg, double decDeg, double radiusArcsec)
+            {
+                double radius = radiusArcsec / 3600.0;
+                var hits = new List<Entry>();
+                int lo = LowerBound(ByDec, decDeg - radius);
+                for (int i = lo; i < ByDec.Length && ByDec[i].DecDeg <= decDeg + radius; i++)
+                    if (Separation(raDeg, decDeg, ByDec[i].RaDeg, ByDec[i].DecDeg) <= radius)
+                        hits.Add(ByDec[i]);
+                hits.Sort((a, b) => Separation(raDeg, decDeg, a.RaDeg, a.DecDeg)
+                          .CompareTo(Separation(raDeg, decDeg, b.RaDeg, b.DecDeg)));
+                return hits;
+            }
 
             /// <summary>Whether this exact star is already spoken for.</summary>
             public bool Holds(long tic) => tic > 0 && Tics.Contains(tic);
@@ -94,6 +122,14 @@ namespace ExoStudio.Research
                     }
                 }
                 return best;
+            }
+
+            private static double Separation(double ra1, double dec1, double ra2, double dec2)
+            {
+                const double d2r = Math.PI / 180.0;
+                double c = Math.Sin(dec1 * d2r) * Math.Sin(dec2 * d2r)
+                         + Math.Cos(dec1 * d2r) * Math.Cos(dec2 * d2r) * Math.Cos((ra1 - ra2) * d2r);
+                return Math.Acos(Math.Clamp(c, -1.0, 1.0)) / d2r;
             }
 
             private static int LowerBound(Entry[] sorted, double dec)
@@ -138,15 +174,19 @@ namespace ExoStudio.Research
         {
             try
             {
-                const string query = "select distinct tic_id,ra,dec,pl_name from ps where default_flag=1";
+                const string query =
+                    "select distinct tic_id,ra,dec,pl_name,pl_orbper from ps where default_flag=1";
                 string csv = await http.GetStringAsync(
                     ArchiveTap + "?query=" + Uri.EscapeDataString(query) + "&format=csv");
 
-                foreach (string[] f in Rows(csv, 4))
+                foreach (string[] f in Rows(csv, 5))
                 {
                     long tic = Tic(f[0]);
                     if (!TryDeg(f[1], out double ra) || !TryDeg(f[2], out double dec)) continue;
-                    Add(snapshot, tic, ra, dec, f[3], "NASA Exoplanet Archive (confirmed planet)");
+                    TryDeg(f[4], out double period);
+                    Add(snapshot, tic, ra, dec, f[3], "NASA Exoplanet Archive (confirmed planet)",
+                        period,
+                        "already published; anything found here is a recovery, not a discovery");
                 }
             }
             catch (Exception e) { snapshot.Unavailable.Add($"NASA Exoplanet Archive: {Short(e)}"); }
@@ -165,7 +205,12 @@ namespace ExoStudio.Research
                 int iName = IndexOfAny(header, "TOI", "CTOI");
                 int iRa = IndexOfAny(header, "RA");
                 int iDec = IndexOfAny(header, "Dec");
+                int iPeriod = IndexOfAny(header, "Period (days)", "Period");
                 if (iTic < 0 && (iRa < 0 || iDec < 0)) return;
+
+                string note = register.Contains("CTOI")
+                    ? "already submitted by someone outside the mission"
+                    : "already a TESS Object of Interest, so it is in the follow up queue";
 
                 foreach (string line in lines.Skip(1))
                 {
@@ -178,15 +223,17 @@ namespace ExoStudio.Research
                                && TryDeg(f[iRa], out ra) && TryDeg(f[iDec], out dec);
                     if (tic == 0 && !placed) continue;
 
+                    double period = 0;
+                    if (iPeriod >= 0 && iPeriod < f.Length) TryDeg(f[iPeriod], out period);
                     Add(snapshot, tic, placed ? ra : double.NaN, placed ? dec : double.NaN,
-                        iName >= 0 && iName < f.Length ? f[iName] : null, register);
+                        iName >= 0 && iName < f.Length ? f[iName] : null, register, period, note);
                 }
             }
             catch (Exception e) { snapshot.Unavailable.Add($"{register}: {Short(e)}"); }
         }
 
         private static void Add(Snapshot snapshot, long tic, double ra, double dec,
-                                string name, string register)
+                                string name, string register, double periodDays, string note)
         {
             if (tic > 0) snapshot.Tics.Add(tic);
             if (double.IsNaN(ra) || double.IsNaN(dec)) return;
@@ -194,7 +241,7 @@ namespace ExoStudio.Research
             {
                 Tic = tic, RaDeg = ra, DecDeg = dec,
                 Name = string.IsNullOrWhiteSpace(name) ? (tic > 0 ? "TIC " + tic : "?") : name,
-                Register = register,
+                Register = register, PeriodDays = periodDays, Note = note,
             });
         }
 
