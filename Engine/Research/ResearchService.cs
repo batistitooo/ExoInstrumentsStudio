@@ -911,6 +911,15 @@ namespace ExoStudio.Research
             public double Score { get; init; }
             public string Why { get; init; }
             public bool Known { get; init; }
+
+            /// <summary>
+            /// Nothing was raised against it. A row without this is still worth having in the
+            /// list, ranked and with its numbers, but it is not a row anybody should open first.
+            /// </summary>
+            public bool Clean { get; init; }
+
+            /// <summary>Depth in ppm, so an implausible one can be seen without opening the run.</summary>
+            public double DepthPpm { get; init; }
         }
 
         private readonly Dictionary<string, Sweep> sweeps = new();
@@ -1089,6 +1098,8 @@ namespace ExoStudio.Research
                 singles.AddRange(st.EnumerateArray());
 
             double score; string why;
+            bool clean = false;
+            double depth = 0;
             if (known)
             {
                 string first = matches.EnumerateArray().First().TryGetProperty("name", out JsonElement n)
@@ -1106,6 +1117,8 @@ namespace ExoStudio.Research
                 double bump = Dbl(best, "brighteningSnr");
                 double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
                 score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0);
+                clean = true;
+                depth = Dbl(best, "depthPpm");
                 why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
                     + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}, "
                     + $"{margin:0.##}x the best brightening";
@@ -1119,6 +1132,7 @@ namespace ExoStudio.Research
                 double bump = Dbl(best, "brighteningSnr");
                 double margin = bump > 0 ? Dbl(best, "snr") / bump : 3.0;
                 score = Dbl(best, "snr") * Math.Clamp(margin - 1.0, 0.0, 2.0) * 0.25;
+                depth = Dbl(best, "depthPpm");
                 why = $"isolated dip, {Dbl(best, "depthPpm"):0} ppm over "
                     + $"{Dbl(best, "durationHours"):0.#} h, SNR {Dbl(best, "snr"):0.#}, "
                     + $"{margin:0.##}x the best brightening; vetting raised something";
@@ -1128,6 +1142,8 @@ namespace ExoStudio.Research
                 JsonElement c = r.GetProperty("candidate");
                 bool passed = r.TryGetProperty("vetting", out JsonElement v) && Bool(v, "passed");
                 score = passed ? Dbl(c, "snr") : 0.1;
+                clean = passed;
+                depth = Dbl(c, "depthPpm");
                 why = $"repeating, P {Dbl(c, "periodDays"):0.####} d, {Dbl(c, "depthPpm"):0} ppm, "
                     + $"SNR {Dbl(c, "snr"):0.#}" + (passed ? "" : "; vetting raised something");
             }
@@ -1137,6 +1153,7 @@ namespace ExoStudio.Research
             {
                 RunId = runId, Target = t.Name, RaDeg = t.RaDeg, DecDeg = t.DecDeg,
                 Sectors = t.Sectors, Score = score, Why = why, Known = known,
+                Clean = clean, DepthPpm = depth,
             };
         }
 
@@ -1188,11 +1205,20 @@ namespace ExoStudio.Research
                     examples = s.TakenExamples.ToArray(),
                     warning = s.FilterWarning,
                 },
-                worthLooking = ranked.Count(h => h.Score > 0),
+                // WHAT IS ACTUALLY WORTH OPENING, which is not the same as what has a score above
+                // zero. Counting the latter reported 27 of 43 in a field where the top score was
+                // 8 and the rest were under 3, which tells a reader to go and look at everything
+                // and is therefore the same as telling them nothing. A row counts here only if
+                // nothing was raised against it and the depth is one a planet could actually
+                // produce: above about three percent the companion is a small star, not a planet.
+                worthLooking = ranked.Count(h => h.Clean && !h.Known
+                                              && h.DepthPpm > 0 && h.DepthPpm < 30000),
+                listed = ranked.Count,
                 hits = ranked.Select(h => new
                 {
                     runId = h.RunId, target = h.Target, ra = h.RaDeg, dec = h.DecDeg,
                     sectors = h.Sectors, score = h.Score, why = h.Why, known = h.Known,
+                    clean = h.Clean, depthPpm = h.DepthPpm,
                 }),
             };
         }

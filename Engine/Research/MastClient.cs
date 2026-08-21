@@ -229,6 +229,20 @@ namespace ExoStudio.Research
 
             /// <summary>TESS magnitude, which decides whether a shallow dip is detectable at all.</summary>
             public double Tmag { get; init; }
+
+            /// <summary>Stellar radius in solar radii, where the catalogue has one.</summary>
+            public double RadiusSolar { get; init; }
+
+            /// <summary>
+            /// How detectable a given planet would be here, as a bare ordering rather than a
+            /// number with units.
+            ///
+            /// Transit depth is the square of the ratio of radii, so the same planet is four times
+            /// deeper in front of a half sized star than a sun sized one, and the noise it must
+            /// stand out from grows with faintness. Both matter and only their combination decides
+            /// whether anything could be seen at all.
+            /// </summary>
+            public double Detectability { get; init; }
         }
 
         public async Task<List<RegionTarget>> FindTargetsAsync(
@@ -293,11 +307,12 @@ namespace ExoStudio.Research
         /// </summary>
         public async Task<List<RegionTarget>> FindTicTargetsAsync(
             double raDeg, double decDeg, double radiusDeg,
-            double brightestTmag = 8.0, double faintestTmag = 13.5, int limit = 400)
+            double brightestTmag = 8.0, double faintestTmag = 13.5, int limit = 400,
+            double maxRadiusSolar = 1.5)
         {
             JsonElement found = await InvokeAsync("Mast.Catalogs.Filtered.Tic.Position", new
             {
-                columns = "ID,ra,dec,Tmag",
+                columns = "ID,ra,dec,Tmag,rad",
                 filters = new object[]
                 {
                     new { paramName = "Tmag", values = new object[] { new { min = brightestTmag, max = faintestTmag } } },
@@ -317,21 +332,39 @@ namespace ExoStudio.Research
                     if (string.IsNullOrEmpty(id)) continue;
                     double ra = Number(row, "ra"), dec = Number(row, "dec");
                     if (ra == 0 && dec == 0) continue;
+                    double tmag = Number(row, "Tmag");
+                    double rad = Number(row, "rad");
+
+                    // A GIANT IS THE WRONG PLACE TO LOOK, however bright and however well
+                    // observed. Depth goes as the square of the ratio of radii, so a Jupiter that
+                    // blocks one percent of a sun sized star blocks a quarter of that in front of
+                    // one twice the size, and a fortieth in front of a red giant. Stars with no
+                    // radius in the catalogue are kept, since an unknown radius is not a large
+                    // one and throwing them away would discard the poorly characterised stars,
+                    // which are precisely the ones nobody has examined.
+                    if (rad > 0 && rad > maxRadiusSolar) continue;
+
                     targets.Add(new RegionTarget
                     {
                         Name = id,
                         RaDeg = ra,
                         DecDeg = dec,
-                        Tmag = Number(row, "Tmag"),
+                        Tmag = tmag,
+                        RadiusSolar = rad,
+                        // Depth scales as one over the square of the radius; the noise a dip must
+                        // clear grows as roughly ten to the fifth of the magnitude, which is the
+                        // photon count. Their ratio orders the stars by what could be seen on them.
+                        Detectability = 1.0 / (Math.Max(0.1, rad > 0 ? rad : 1.0) * Math.Max(0.1, rad > 0 ? rad : 1.0))
+                                      / Math.Pow(10.0, 0.2 * tmag),
                         Sectors = 0,          // established later, by probing
                     });
                 }
             }
 
-            // Brightest first: for a given planet the transit is the same depth, but the photon
-            // noise it has to stand out from is smaller, so these are the stars where a shallow
-            // event is detectable at all.
-            return targets.OrderBy(t => t.Tmag).Take(limit).ToList();
+            // Ordered by what a planet would look like here rather than by brightness alone. A
+            // bright giant sits below a fainter dwarf, because the same planet is invisible on one
+            // and obvious on the other.
+            return targets.OrderByDescending(t => t.Detectability).Take(limit).ToList();
         }
 
         /// <summary>

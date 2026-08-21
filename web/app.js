@@ -3246,13 +3246,16 @@ function rsRenderSweep(s) {
       (s.state === 'done' ? ' · finished' : '');
   }
 
+  // Everything with a score is listed, because the numbers are there to be compared. The count
+  // above says how many are worth OPENING, which is a different and much smaller question.
   const worth = (s.hits || []).filter((h) => h.score > 0);
   const f = s.filtered || {};
   $('rsSweepPanel').hidden = false;
   $('rsSweepMeta').textContent =
     `${s.field.radius}° around ${s.field.ra.toFixed(2)} ${s.field.dec >= 0 ? '+' : ''}` +
     `${s.field.dec.toFixed(2)}, at least ${s.field.minSectors} sectors · ` +
-    `${worth.length} worth opening of ${s.done} searched, ranked by how far each dip stands above what the same curve manages upward`;
+    `${s.worthLooking} worth opening of ${s.done} searched, ${worth.length} listed, ranked by ` +
+    `how far each dip stands above what the same curve manages upward`;
 
   // WHAT WAS RULED OUT, AND WHY, rather than a list that silently omits things. A star already
   // carrying a published planet or a mission candidate is dropped before anything is downloaded,
@@ -3279,7 +3282,8 @@ function rsRenderSweep(s) {
 
   $('rsSweepList').innerHTML = worth.length
     ? worth.map((h) => `<a class="rsRun hit" href="#" data-run="${h.runId}">` +
-        `<b>TIC ${h.target}</b><span>${h.why}</span>` +
+        `<b>TIC ${h.target}${h.clean ? '' : ' <span class="dim">(flagged)</span>'}</b>` +
+        `<span>${h.why}</span>` +
         `<time>${h.score.toFixed(1)} · ${h.sectors} sectors</time></a>`).join('')
     : (s.state === 'done'
         ? '<p class="hint dim">Nothing in this field worth opening. That is the usual answer, and ' +
