@@ -748,13 +748,23 @@ namespace ExoStudio.Simulation
             double areaCm2 = 1e4 * Math.PI * 0.25 * spec.ApertureMeters * spec.ApertureMeters
                            * (1.0 - spec.SecondaryObstructionFraction * spec.SecondaryObstructionFraction);
 
-            // Scintillation: sigma from the real Young relation; one multiplier per frame for
-            // resolved light, a separate draw for point sources, as the camera does. In orbit it
-            // does not exist: scintillation IS the atmosphere, so both multipliers are exactly 1
-            // rather than a draw from a small sigma.
+            // Scintillation: the FULL relation, not the excess over the zenith. One multiplier
+            // per frame for resolved light, a separate draw for point sources, as the camera
+            // does. In orbit it does not exist: scintillation IS the atmosphere, so both
+            // multipliers are exactly 1 rather than a draw from a small sigma.
+            //
+            // THIS USED TO CALL THE EXCESS FORM AND THAT WAS WRONG HERE. The excess,
+            // sqrt(sigma(X)^2 - sigma(1)^2), exists so that scintillation can be added to an
+            // instrument's published ReferencePrecision without counting twice what that
+            // measured number already contains. A rendered frame has no such reference: every
+            // term in it is built from first principles, so there was nothing for the
+            // subtraction to avoid double-counting and it simply deleted real noise - all of it
+            // at the zenith, 60 per cent of the amplitude at airmass 1.05, 31 per cent at 1.2.
+            // A transit is observed near culmination, so frames sat where most of it was gone.
+            // See AtmosphericImagingNoise.ScintillationSigma.
             double scintSigma = space
                 ? 0.0
-                : AtmosphericImagingNoise.ScintillationExcessSigma(
+                : AtmosphericImagingNoise.ScintillationSigma(
                       spec.ApertureMeters, atmosphereAltM, airmass, req.ExposureSeconds);
             var rngScint = new Pcg32(req.Seed, Pcg32.StreamScintillation);
             double scint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));

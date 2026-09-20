@@ -128,11 +128,53 @@ namespace ExoInstruments.Core
         public static double ScintillationExcessSigma(double apertureMeters, double siteAltitudeMeters, double airmass, double exposureSeconds, double angularDiameterRad = 0.0)
         {
             if (double.IsNaN(airmass) || double.IsInfinity(airmass) || airmass <= 1.0) return 0.0;
-            double sourceSizeMeters = Math.Max(0.0, angularDiameterRad) * TurbulenceLayerHeightMeters;
-            double effectiveApertureMeters = Math.Sqrt(apertureMeters * apertureMeters + sourceSizeMeters * sourceSizeMeters);
-            double atZenith = AtmosphericNoise.YoungSigmaRaw(effectiveApertureMeters, siteAltitudeMeters, 1.0, exposureSeconds);
-            double atAirmass = AtmosphericNoise.YoungSigmaRaw(effectiveApertureMeters, siteAltitudeMeters, airmass, exposureSeconds);
+            double effective = EffectiveAveragingAperture(apertureMeters, angularDiameterRad);
+            double atZenith = AtmosphericNoise.YoungSigmaRaw(effective, siteAltitudeMeters, 1.0, exposureSeconds);
+            double atAirmass = AtmosphericNoise.YoungSigmaRaw(effective, siteAltitudeMeters, airmass, exposureSeconds);
             return Math.Sqrt(Math.Max(0.0, atAirmass * atAirmass - atZenith * atZenith));
+        }
+
+        /// <summary>
+        /// The scintillation the atmosphere actually delivers, rather than the excess of it over
+        /// the zenith: the full Dravins et al. (1998) equation (10), with the same extended-source
+        /// averaging as above.
+        ///
+        /// WHY BOTH EXIST, because having two is otherwise just a trap. ScintillationExcessSigma
+        /// returns sqrt(sigma(X)^2 - sigma(1)^2), which is the right quantity when it is being
+        /// added to an instrument's published ReferencePrecision: that number was measured on
+        /// sky and already contains the scintillation of a typical pointing, so only the excess
+        /// over it may be added or the term is counted twice. That is the case AtmosphericNoise
+        /// serves.
+        ///
+        /// A RENDERED FRAME IS NOT THAT CASE. The imaging path builds every noise term from
+        /// first principles - photons, dark, read, quantisation - and has no measured reference
+        /// precision anywhere in it, so there is nothing for an excess to be an excess OVER.
+        /// Subtracting the zenith value there deletes scintillation that nothing else supplies:
+        /// exactly zero at the zenith, 40 per cent of the true amplitude at airmass 1.05, 69 per
+        /// cent at 1.2, and only within 5 per cent of it beyond airmass 2. A transit observed
+        /// near culmination, which is how transits are observed, sat in the part of that curve
+        /// where most of the scintillation was missing.
+        ///
+        /// So the imaging path calls this one.
+        /// </summary>
+        public static double ScintillationSigma(double apertureMeters, double siteAltitudeMeters,
+                                                 double airmass, double exposureSeconds,
+                                                 double angularDiameterRad = 0.0)
+        {
+            if (double.IsNaN(airmass) || double.IsInfinity(airmass) || airmass < 1.0) return 0.0;
+            double effective = EffectiveAveragingAperture(apertureMeters, angularDiameterRad);
+            return AtmosphericNoise.YoungSigmaRaw(effective, siteAltitudeMeters, airmass, exposureSeconds);
+        }
+
+        /// <summary>
+        /// The aperture that does the averaging: the real pupil, enlarged by the linear size the
+        /// source's own angular diameter projects to at the turbulent layer, combined in
+        /// quadrature. Shared by both forms above so they cannot drift apart.
+        /// </summary>
+        private static double EffectiveAveragingAperture(double apertureMeters, double angularDiameterRad)
+        {
+            double sourceSizeMeters = Math.Max(0.0, angularDiameterRad) * TurbulenceLayerHeightMeters;
+            return Math.Sqrt(apertureMeters * apertureMeters + sourceSizeMeters * sourceSizeMeters);
         }
 
         // Sensor noise no longer lives here. The imaging pipeline now carries real ELECTRON

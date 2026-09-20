@@ -3,10 +3,38 @@ using System;
 namespace ExoInstruments.Core
 {
     /// <summary>
-    /// Atmospheric scintillation for ground-based photometry (Young 1967).
-    /// ReferencePrecision already bakes in typical-conditions scintillation,
-    /// so only the excess above the zenith value is added here in quadrature —
-    /// airmass 1 changes nothing, low targets get penalized. RV instruments excluded.
+    /// Atmospheric scintillation for ground-based photometry.
+    ///
+    /// THE CITATION, corrected. This relation is habitually credited to Young (1967), and that
+    /// is wrong for the form written here. Young's own equation (1) carries X^(3/2) and a
+    /// measurement BANDWIDTH (delta-f)^(1/2), not an exposure time. The X^(7/4) together with
+    /// the (2T)^(-1/2) first appear as a pair in
+    ///
+    ///     Dravins, D., Lindegren, L., Mezey, E. and Young, A. T. 1998, "Atmospheric Intensity
+    ///     Scintillation of Stars. III. Effects for Different Telescope Apertures",
+    ///     PASP 110, 610, equation (10), page 625. DOI 10.1086/316161.
+    ///     (Erratum: 1998, PASP 110, 1118, DOI 10.1086/316232.)
+    ///
+    /// who attribute the scaling to "Young 1967, 1974", the 1974 reference being a book chapter.
+    /// Young (1967), AJ 72, 747, DOI 10.1086/110303, remains the origin of the 0.09 coefficient
+    /// and of the 8000 m scale height, and Young states explicitly that 0.09 is the value for an
+    /// aperture in centimetres.
+    ///
+    /// WHAT THIS MODEL IS NOT. It is the classical relation, and it is known to be low. Osborn,
+    /// Foehring, Dhillon and Wilson 2015, MNRAS 452, 1707 (DOI 10.1093/mnras/stv1400) measured
+    /// the median scintillation at six observatories and found the classical form underestimates
+    /// it by a factor of roughly 1.5; their equation (7) carries an empirical site coefficient
+    /// C_Y, which is 1.56 at Paranal. Nothing here applies such a coefficient, so every
+    /// scintillation figure this class produces is about a third to a half low against that
+    /// measured median. Deliberate, because C_Y is site-specific and the roster spans sites with
+    /// no published value; recorded so that nobody reads the output as a best estimate.
+    ///
+    /// ONLY THE EXCESS ABOVE THE ZENITH IS RETURNED BY ScintillationExcessSigma, and that is
+    /// correct HERE and only here: this path modifies an instrument's published
+    /// ReferencePrecision, which was measured on sky and therefore already contains the
+    /// scintillation of a typical pointing. Adding the full relation on top would count it
+    /// twice. The imaging path builds its noise from first principles and has no such reference
+    /// to correct, so it must use the full relation; see AtmosphericImagingNoise.
     /// </summary>
     public static class AtmosphericNoise
     {
