@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 540" width="800" height="540" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<title>how much water reaches the fitted depth</title>
+<rect width="800" height="540" fill="#ffffff"/>
+<text x="96.0" y="32.0" font-size="15" fill="#16181d" text-anchor="start" font-weight="600">How much of a water error actually reaches the measured depth</text>
+<text x="96.0" y="50.0" font-size="11" fill="#6b7280" text-anchor="start" font-weight="400">750-1000 nm, 2600 K against 5800 K, 1.0 h transit in a 3.0 h window, baseline fitted on the out-of-transit points</text>
+<text x="96.0" y="66.0" font-size="11" fill="#6b7280" text-anchor="start" font-weight="400">The perturbation is the same everywhere on this axis. Only its TIMESCALE changes, and the detrend does the rest.</text>
+<line x1="96.0" y1="404.0" x2="696.0" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="88.0" y="408.0" font-size="11" fill="#6b7280" text-anchor="end" font-weight="400">1</text>
+<line x1="96.0" y1="315.2" x2="696.0" y2="315.2" stroke="#e3e6ea" stroke-width="1"/>
+<text x="88.0" y="319.2" font-size="11" fill="#6b7280" text-anchor="end" font-weight="400">10</text>
+<line x1="96.0" y1="226.3" x2="696.0" y2="226.3" stroke="#e3e6ea" stroke-width="1"/>
+<text x="88.0" y="230.3" font-size="11" fill="#6b7280" text-anchor="end" font-weight="400">100</text>
+<line x1="96.0" y1="137.5" x2="696.0" y2="137.5" stroke="#e3e6ea" stroke-width="1"/>
+<text x="88.0" y="141.5" font-size="11" fill="#6b7280" text-anchor="end" font-weight="400">1,000</text>
+<line x1="143.4" y1="84.0" x2="143.4" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="143.4" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">0.25</text>
+<line x1="207.8" y1="84.0" x2="207.8" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="207.8" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">0.5</text>
+<line x1="272.2" y1="84.0" x2="272.2" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="272.2" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">1</text>
+<line x1="336.5" y1="84.0" x2="336.5" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="336.5" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">2</text>
+<line x1="400.9" y1="84.0" x2="400.9" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="400.9" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">4</text>
+<line x1="465.3" y1="84.0" x2="465.3" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="465.3" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">8</text>
+<line x1="567.3" y1="84.0" x2="567.3" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="567.3" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">24</text>
+<line x1="696.0" y1="84.0" x2="696.0" y2="404.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="696.0" y="422.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">96</text>
+<line x1="272.2" y1="80.0" x2="272.2" y2="404.0" stroke="#6b7280" stroke-width="1.4" stroke-dasharray="4 4"/>
+<text x="272.2" y="76.0" font-size="10" fill="#6b7280" text-anchor="middle" font-weight="600">transit duration</text>
+<line x1="374.2" y1="80.0" x2="374.2" y2="404.0" stroke="#d62728" stroke-width="1.4" stroke-dasharray="4 4"/>
+<text x="374.2" y="76.0" font-size="10" fill="#d62728" text-anchor="middle" font-weight="600">observing window</text>
+<rect x="96.0" y="84.0" width="600.0" height="58.0" fill="#2ca02c" opacity="0.05"/>
+<line x1="96.0" y1="142.0" x2="696.0" y2="142.0" stroke="#2ca02c" stroke-width="1.6"/>
+<text x="692.0" y="135.0" font-size="10" fill="#2ca02c" text-anchor="end" font-weight="600">photon noise floor, 889 ppm</text>
+<path d="M 96.00 211.78 L 108.77 233.75 L 121.53 254.80 L 134.30 192.27 L 147.06 234.52 L 159.83 191.13 L 172.60 247.80 L 185.36 164.85 L 198.13 221.56 L 210.89 247.88 L 223.66 166.56 L 236.43 143.59 L 249.19 169.90 L 261.96 289.53 L 274.72 251.29 L 287.49 199.44 L 300.26 150.10 L 313.02 122.53 L 325.79 107.62 L 338.55 100.44 L 351.32 98.30 L 364.09 99.62 L 376.85 103.36 L 389.62 108.83 L 402.38 115.57 L 415.15 123.25 L 427.91 131.62 L 440.68 140.51 L 453.45 149.80 L 466.21 159.38 L 478.98 169.18 L 491.74 179.15 L 504.51 189.23 L 517.28 199.41 L 530.04 209.64 L 542.81 219.92 L 555.57 230.22 L 568.34 240.52 L 581.11 250.85 L 593.87 261.16 L 606.64 271.41 L 619.40 281.69 L 632.17 291.98 L 644.94 302.16 L 657.70 312.62 L 670.47 322.66 L 683.23 331.56 L 696.00 340.13" fill="none" stroke="#0b3d91" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="96.0" y1="404.0" x2="696.0" y2="404.0" stroke="#16181d" stroke-width="1.4"/>
+<line x1="96.0" y1="84.0" x2="96.0" y2="404.0" stroke="#16181d" stroke-width="1.4"/>
+<text x="396.0" y="444.0" font-size="12" fill="#16181d" text-anchor="middle" font-weight="400">timescale of the water-column variation  (hours, log scale)</text>
+<text transform="translate(44,244.0) rotate(-90)" font-size="12" fill="#16181d" text-anchor="middle">bias on the fitted depth  (ppm per mm of PWV)</text>
+<text x="96.0" y="470.0" font-size="10.5" fill="#6b7280" text-anchor="start" font-weight="400">Slow water is absorbed by the baseline. Fast water averages out. Only water moving on the visit's own timescale survives.</text>
+<text x="96.0" y="484.0" font-size="10.5" fill="#6b7280" text-anchor="start" font-weight="400">The spikes below 1 h are a single sinusoid beating against the 1 h transit; a real spectrum would follow the envelope, not the nulls.</text>
+<text x="96.0" y="500.0" font-size="10.5" fill="#16181d" text-anchor="start" font-weight="600">How often the column actually moves on this timescale is the one thing nobody has measured.</text>
+</svg>

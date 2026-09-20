@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using ExoInstruments.Visualization;
 
 namespace ExoInstruments.Core
@@ -39,6 +41,13 @@ namespace ExoInstruments.Core
 
     public sealed class VisualTelescopeSpec
     {
+        /// <summary>
+        /// A copy that can be edited without touching the roster's own entry. Used where a caller
+        /// needs the instrument's optics, detector and site but a passband of its own - pricing a
+        /// band no instrument here carries, for instance.
+        /// </summary>
+        public VisualTelescopeSpec ShallowCopy() => (VisualTelescopeSpec)MemberwiseClone();
+
         public string Name;
 
         /// <summary>
@@ -207,6 +216,82 @@ namespace ExoInstruments.Core
         public SpectralCurve RedFilterCurve;
         public SpectralCurve GreenFilterCurve;
         public SpectralCurve BlueFilterCurve;
+
+        /// <summary>
+        /// What each filter POSITION is actually called on this instrument, when the position's own
+        /// name would mislead.
+        ///
+        /// WHY THIS EXISTS. CameraFilter is a fixed enum of ten amateur wheel positions - Luminance,
+        /// Red, Green, Blue, HAlpha and the narrowbands - and that is the vocabulary the whole
+        /// pipeline is built on. An observer defining their own instrument does not have those
+        /// filters: DUET's blue arm carries g' r' i' z' I+z', none of which is in the enum. Their
+        /// bands therefore have to be MOUNTED IN a position, and the position's name then says
+        /// something false about the band.
+        ///
+        /// That is not a cosmetic problem. A frame taken in a 750-1000 nm band was writing
+        /// FILTER = 'Luminance' into its FITS header, where every reader takes Luminance to mean
+        /// broad visible; the true span sat two cards lower in WAVELNTH and BANDWID and nobody
+        /// reads those first. A label here is carried into the header, the API and the interface,
+        /// so the position stays an internal slot and the NAME is the observer's own.
+        ///
+        /// Null, or a position absent from it, means the position's own name is the honest one.
+        /// </summary>
+        public Dictionary<CameraFilter, string> FilterLabels;
+
+        /// <summary>The name to show and to record for a position: the observer's label if they gave one.</summary>
+        public string LabelFor(CameraFilter f)
+            => FilterLabels != null && FilterLabels.TryGetValue(f, out string n)
+               && !string.IsNullOrWhiteSpace(n) ? n : f.ToString();
+
+        /// <summary>
+        /// One band this instrument can observe in, named by whoever built it.
+        ///
+        /// WHY THIS REPLACES THE FIXED LIST. CameraFilter is ten names from an amateur filter
+        /// wheel - Luminance, Red, Green, Blue, HAlpha and four narrowbands - and nothing physical
+        /// makes ten the right number. An instrument with nine Sloan and near-infrared bands has
+        /// no room in it, and mounting g' in the "Green" slot makes every downstream label lie.
+        /// A band is a name, a passband and optionally a measured curve; there is no reason for
+        /// there to be a limit, and now there is not one.
+        ///
+        /// The enum survives as the roster's own vocabulary and as the INTERNAL slot a band is
+        /// materialised into for one exposure. Nothing outside this class needs to know that.
+        /// </summary>
+        public sealed class Band
+        {
+            public string Name;
+            public double CentralWavelengthNm;
+            public double BandwidthAngstrom;
+            /// <summary>1.0 means the filter's own loss is not modelled, the catalogue's convention.</summary>
+            public double PeakTransmission = 1.0;
+            /// <summary>Measured transmission. Null means the band is integrated as a top-hat.</summary>
+            public SpectralCurve Curve;
+        }
+
+        /// <summary>
+        /// The bands this instrument carries, when it carries its own rather than the enum's.
+        /// Null or empty means the roster behaviour, unchanged: AvailableFilters and the enum.
+        /// </summary>
+        public List<Band> Bands;
+
+        /// <summary>A band by name, case-insensitively. Null when this instrument has no such band.</summary>
+        public Band FindBand(string name)
+        {
+            if (Bands == null || string.IsNullOrWhiteSpace(name)) return null;
+            foreach (Band b in Bands)
+                if (string.Equals(b.Name, name.Trim(), StringComparison.OrdinalIgnoreCase))
+                    return b;
+            return null;
+        }
+
+        /// <summary>Every name this instrument answers to, bands first when it has them.</summary>
+        public IEnumerable<string> BandNames()
+        {
+            if (Bands != null && Bands.Count > 0)
+                foreach (Band b in Bands) yield return b.Name;
+            else
+                foreach (CameraFilter f in AvailableFilters ?? new[] { CameraFilter.Luminance })
+                    yield return LabelFor(f);
+        }
 
         // Site (feeds the shared atmospheric/scintillation model in AtmosphericImagingNoise)
         public double SiteAltitudeMeters;
@@ -397,6 +482,46 @@ namespace ExoInstruments.Core
         /// from does and does not state.
         /// </summary>
         public double LinearityDeviationAtFullWell = double.NaN;
+
+        /// <summary>
+        /// How long the array takes to clock its whole image area out through itself, in seconds,
+        /// for a detector that is STILL BEING ILLUMINATED while that happens. NaN means the effect
+        /// does not exist on this device, which is the case for every instrument on this roster and
+        /// is a statement about architecture rather than about missing data.
+        ///
+        /// See Core.ChargeTransferSmear for the mechanism and the exact inverse. The short of it:
+        /// charge travels through every row between its own and the serial register, and if the
+        /// array is lit during that journey each packet arrives carrying a sample of everything it
+        /// passed over. A bright star therefore lays a stripe down its entire column.
+        ///
+        /// WHY EVERY ENTRY HERE IS NaN, per device, because "unpublished" and "impossible" are
+        /// different claims and only one of them is waiting for a number:
+        ///
+        ///   * The three ZWO ASI294MM Pro instruments (RedCat 51, RC20, CDK1000) carry a CMOS
+        ///     sensor. Every pixel is read where it sits through its own amplifier, so no charge
+        ///     ever crosses another pixel. IMPOSSIBLE, not unmeasured.
+        ///   * FORS2 and WFC3/UVIS are full-frame CCDs with mechanical shutters. The shutter is
+        ///     shut before the first row is clocked, so the array is dark for the whole transfer.
+        ///     IMPOSSIBLE while the shutter works.
+        ///   * WFC3/IR is an HgCdTe array, which has no charge transfer at all. Core.InfraredArray
+        ///     already lists this as one of the three absences that make it a different chain.
+        ///   * SPHERE/ZIMPOL is the one device here where the mechanism is genuinely PRESENT: its
+        ///     detector is a back-illuminated FRAME-TRANSFER CCD, so the image area is shifted into
+        ///     a masked store while still exposed to the sky. What this project has from Schmid et
+        ///     al. (2018) Table 4 is the full well, the read noise, the dark current, the
+        ///     conversion factor and the minimum integration time; a transfer time is not among
+        ///     them. So this one is NOT SOURCED rather than impossible, and it is left NaN instead
+        ///     of filled with a plausible millisecond figure, on exactly the grounds
+        ///     Core.BrighterFatter states for the same situation: the model is here and waiting for
+        ///     a number, rather than absent because a number was believed not to exist. Anyone who
+        ///     has the figure can put it in this one field and every ZIMPOL frame will carry it.
+        ///
+        /// An observer who is modelling a real shutterless instrument supplies this through the
+        /// custom-instrument endpoint, and the frame then carries the stripe and the reduction can
+        /// take it back off. The pipeline refuses the field on an HgCdTe array rather than applying
+        /// it, because there the effect has no path to exist along.
+        /// </summary>
+        public double FrameTransferSeconds = double.NaN;
 
         /// <summary>
         /// Side of a square field stop in the focal plane, in arcminutes, for an instrument whose

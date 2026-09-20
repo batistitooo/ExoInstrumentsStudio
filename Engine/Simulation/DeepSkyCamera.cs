@@ -31,10 +31,15 @@ namespace ExoStudio.Simulation
             "No solar-system bodies: the mod photographs KSP's own rendered planets, and there is no KSP here. Deep sky only.",
             "Zodiacal light uses the flat polar constant, not the angle-resolved Leinert table (up to ~2 mag brighter near the ecliptic at low elongation).",
             "New moon is assumed: no moonlight term in the sky background.",
-            "Photo-response non-uniformity and offset fixed-pattern noise ARE modelled, from the published EMVA figures, drawn once per sensor so a flat and a bias really remove them (see CalibrationFrames). Still omitted: fringing, cosmic rays, charge-transfer smear, hot pixels, and dark-current non-uniformity, which no device in this roster publishes.",
+            "Photo-response non-uniformity and offset fixed-pattern noise ARE modelled, from the published EMVA figures, drawn once per sensor so a flat and a bias really remove them (see CalibrationFrames). Charge-transfer smear IS modelled, with an exact inverse, and is refused on any detector whose charge does not transfer; no instrument in this roster is one that smears, and Core.ChargeTransferSmear says per device whether that is impossible or merely unpublished. Still omitted: fringing, cosmic rays, hot pixels, and dark-current non-uniformity, which no device in this roster publishes.",
             "The photo-response is white. Real thick back-illuminated CCDs also show tree rings and brick walls (Luo et al. 2024, AJ 168, 251); neither pattern is published for any detector here, and borrowing another device's would put specific, visible, wrong structure into every frame.",
             "Gain is fixed at unity; no ND filters (deep-sky targets never need one).",
             "Scintillation multiplier is 1+N(0,sigma) clamped at zero, sigma from the real Young relation.",
+            "Frames are laid out NORTH UP, a fixed sky orientation - which is what every instrument here delivers, being equatorially mounted or alt-az with a derotator. A requested position angle is not modelled: a real visit is scheduled at an ORIENT the observer asks for.",
+            "WATER VAPOUR IS MODELLED when a series is given and the transmission table is installed: T(lambda, PWV, airmass) from ESO's own telluric library (LBLRTM at R = 60,000 for Cerro Paranal; Noll et al. 2012, Jones et al. 2013), multiplied into the passband integral per wavelength rather than applied as a band factor, with the column a pure function of ut so warp still changes pacing and not results. The frame's PWV and the identifier of the series that produced it go into the FITS header. Outside the table's range - 0.5 to 20 mm, airmass 1 to 3 - the capture is REFUSED rather than extrapolated. Without a series, or without the table, the term is absent and the frame is what it was before it existed.",
+            "The water-vapour table is computed for Cerro Paranal and is applied at every site. The column is the parameter, so the first-order dependence is explicit; the difference in pressure broadening between one mountain and another is not carried.",
+            "ESO's library is the whole molecular atmosphere at a given water column, not the water alone, and there is no species-resolved version of it: at airmass 1 it puts 0.98 at 550 nm and 0.68 at 760 nm, neither of which moves with the water - ozone's Chappuis band and molecular oxygen's A band. Both are divided out by referencing the table to its driest column (0.5 mm), so what is applied is the water IN EXCESS of it, and anything independent of the column cancels exactly in that division. The two species are removed for different reasons and only one of them is a correction. OZONE would be double counted: the extinction law here is pinned at Johnson V to 0.20 mag/airmass, a typical MEASURED coefficient, and a measured coefficient already contains its ozone. MOLECULAR OXYGEN would not be - Studio models no oxygen anywhere and a smooth aerosol law has no A band - so dividing it out is a choice, made because the band does not vary with the water column and so carries none of the differential signal this term exists for. STUDIO THEREFORE STILL HAS NO MOLECULAR OXYGEN, at 760 nm or anywhere else; that is a simplification, not a term that was corrected. And the zero point: the extinction constant reflects real nights, which had water in them, while the reference column is 0.5 mm, drier than most of them - so absolute water sits low while every difference between two columns is exact.",
+            "The rest of the weather is still absent: no cloud, no transparency variation beyond the water term, no aerosol variability, and the seeing follows airmass alone rather than varying through a night.",
         };
 
         /// <summary>
@@ -49,7 +54,7 @@ namespace ExoStudio.Simulation
             "The spacecraft does not slew: retargeting is instantaneous, so no exposure is streaked by a repoint and no guide-star acquisition is charged. What is left is the platform's own jitter floor.",
             "The orbit is circular and only its J2 nodal regression is propagated; drag does not decay it.",
             "The Sun is placed on the real ecliptic for this path, where the ground path keeps Core's declination-0 Sun; the Moon is on the ecliptic too, ignoring its 5.1 deg inclination.",
-            "One roll angle: the sensor is laid out with the spacecraft's local zenith up. A real visit is scheduled at an ORIENT the observer asks for.",
+            "One roll angle: the sensor is laid out north up, the same fixed sky orientation the ground path uses. A real visit is scheduled at an ORIENT the observer asks for.",
             "No detector effects specific to the orbit: no cosmic-ray hits (heavy in the South Atlantic Anomaly) and, on the IR channel, no persistence from the previous exposure.",
         };
 
@@ -107,6 +112,20 @@ namespace ExoStudio.Simulation
             /// sky is shut at that moment rather than being quietly moved.
             /// </summary>
             public double RequestedUt = double.NaN;
+
+            /// <summary>
+            /// The water overhead, as a function of ut. Null leaves the term absent, which is what
+            /// every frame did before this existed and what every frame still does when the grid is
+            /// not installed. See Simulation/PwvSeries.cs for why the signature is a pure function.
+            /// </summary>
+            public PwvSeries Pwv;
+
+            /// <summary>
+            /// A transit of known depth to inject into one star of the field, or null. Applied to
+            /// the deposited pixels and to the truth record with the SAME factor, so the reduction
+            /// can be scored against what actually went in.
+            /// </summary>
+            public TransitInjection Transient;
         }
 
         /// <summary>
@@ -122,6 +141,90 @@ namespace ExoStudio.Simulation
             site != null && !double.IsNaN(site.AmbientTemperatureCelsius)
                 ? site.AmbientTemperatureCelsius
                 : spec.SiteAmbientTemperatureCelsius;
+
+        /// <summary>
+        /// The altitude the atmosphere above this exposure starts at, for the same reason as
+        /// AmbientAt: Core keys it to the instrument's home mountain, and an astrograph pointed
+        /// from another site was extinguishing and scintillating through the wrong air column.
+        /// Rayleigh extinction scales as exp(-h/8000 m), so the RC20 carried to Paranal was
+        /// paying Haute-Provence's extra 1985 m of air.
+        ///
+        /// The spec's figure is the fallback for NO SITE AT ALL, which is the orbital path, where
+        /// it is then unused. It is deliberately NOT a fallback for a site that omitted its
+        /// altitude: unlike ambient, which Core carries as NaN when unknown, an altitude of zero
+        /// is a legitimate sea-level site and cannot be told apart from an unanswered one here.
+        /// That question belongs where the answer is known - CustomInstruments declares an omitted
+        /// altitude as an assumption when it builds the site - rather than being guessed here.
+        /// </summary>
+        public static double AtmosphereAltitudeMeters(VisualTelescopeSpec spec, ObservingSites.Site site) =>
+            site != null ? site.AltitudeMeters : spec.SiteAltitudeMeters;
+
+        /// <summary>
+        /// The frame a sensor is laid out in for a given boresight: up toward the celestial pole,
+        /// so the field is FIXED ON THE SKY rather than on the horizon.
+        ///
+        /// It used to be up toward the zenith, which made the atmospheric dispersion vertical by
+        /// construction and cost nothing while Studio only ever produced one frame at a time.
+        /// Across a SEQUENCE it is a first-order error: a zenith-referenced frame rotates with the
+        /// parallactic angle, so the same star lands somewhere different in every exposure - 104
+        /// degrees of rotation and up to 1400 px of travel over one night on a field at dec +36
+        /// from Roque de los Muchachos, measured. That is the behaviour of an alt-az telescope with
+        /// no derotator, and NOTHING IN THE ROSTER IS ONE: the RC20, the RedCat 51 and the CDK1000
+        /// are equatorially mounted, and FORS2 and SPHERE are alt-az instruments that carry
+        /// derotators. Every one of them holds a fixed sky orientation.
+        ///
+        /// On the pole itself "toward the pole" degenerates, and the fallback has to be another
+        /// direction fixed ON THE SKY or the frame goes straight back to turning: the zenith is
+        /// fixed to the horizon, so a dec = +/-90 field would roll at the full sidereal rate. The
+        /// vernal equinox cannot degenerate where this branch is reached, because it is reached
+        /// only when the boresight IS the pole and RA 0, dec 0 is exactly perpendicular to that.
+        ///
+        /// Public because the harness checks THIS frame rather than keeping a second copy of it;
+        /// a copy is how the two came apart the last time the frame changed.
+        /// </summary>
+        public static void ImageFrame(SkyVector boresight, double observerLatitudeDeg,
+                                      double meridianRaDeg, out SkyVector up, out SkyVector right)
+        {
+            SkyVector pole = SkyVector.FromHorizontal(observerLatitudeDeg, 0.0);
+            up = PerpendicularTo(boresight, pole);
+
+            if (double.IsNaN(up.X))
+            {
+                HorizontalCoordinates eq = SkyCoordinates.EquatorialToHorizontal(
+                    0.0, 0.0, meridianRaDeg, observerLatitudeDeg);
+                up = PerpendicularTo(boresight, SkyVector.FromHorizontal(eq.AltitudeDeg, eq.AzimuthDeg));
+            }
+            if (double.IsNaN(up.X)) up = PerpendicularTo(boresight, new SkyVector(0, 0, 1));
+
+            right = SkyVector.Normalized(up.Y * boresight.Z - up.Z * boresight.Y,
+                                         up.Z * boresight.X - up.X * boresight.Z,
+                                         up.X * boresight.Y - up.Y * boresight.X);
+        }
+
+        /// <summary>
+        /// The component of <paramref name="reference"/> perpendicular to <paramref name="axis"/>,
+        /// normalised: the direction "reference" points to as seen in the tangent plane at "axis".
+        /// Returns a NaN vector where the two are parallel and the answer does not exist, so the
+        /// caller chooses its own fallback rather than getting a silently arbitrary frame.
+        /// </summary>
+        private static SkyVector PerpendicularTo(SkyVector axis, SkyVector reference)
+        {
+            double d = reference.Dot(axis);
+            double x = reference.X - d * axis.X, y = reference.Y - d * axis.Y, z = reference.Z - d * axis.Z;
+            double len = Math.Sqrt(x * x + y * y + z * z);
+            if (len < 1e-9) return new SkyVector(double.NaN, double.NaN, double.NaN);
+            return new SkyVector(x / len, y / len, z / len);
+        }
+
+        /// <summary>A direction as unit components along the image's right and up axes.</summary>
+        private static void ResolveInFrame(SkyVector boresight, SkyVector up, SkyVector right,
+                                           SkyVector direction, out double alongRight, out double alongUp)
+        {
+            SkyVector p = PerpendicularTo(boresight, direction);
+            if (double.IsNaN(p.X)) { alongRight = 0.0; alongUp = 0.0; return; }
+            alongRight = p.X * right.X + p.Y * right.Y + p.Z * right.Z;
+            alongUp = p.X * up.X + p.Y * up.Y + p.Z * up.Z;
+        }
 
         /// <summary>Coldest setpoint this cooler can hold at that site. The TEC's published delta is a DELTA, so where it lands depends on where it starts.</summary>
         public static double CoolerMinimumAt(VisualTelescopeSpec spec, ObservingSites.Site site) =>
@@ -144,6 +247,15 @@ namespace ExoStudio.Simulation
 
         public sealed class Result
         {
+            /// <summary>
+            /// What the injected transit did to this frame: the exposure-averaged fraction of the
+            /// host star's light that reached the detector, how many catalogue stars the match
+            /// radius caught, and which injection it was. 1.0 and 0 when there is none.
+            /// </summary>
+            public double TransitFactor = 1.0;
+            public int TransitStarsMatched;
+            public string TransitId;
+
             public byte[] Png;
             public int Width, Height;
             public double PlateScaleArcsec;
@@ -159,18 +271,24 @@ namespace ExoStudio.Simulation
             /// </summary>
             public string StarCatalogUsed;
 
-            /// <summary>
-            /// Set when a deeper patch exists but did not cover the whole field, naming it and
-            /// saying by how much it fell short. Null the rest of the time.
-            /// </summary>
-            public string StarCatalogNote;
-
             public int GalaxiesDrawn;
             public List<string> GalaxiesFromImages = new();
             public string EmissionLinesRendered;
+
+            /// <summary>
+            /// How far the unguided drift carried the field, in pixels, and how many positions the
+            /// extended sources were deposited at along it. Zero and one on a tracked frame and in
+            /// orbit. Reported so the sampling of a trailed frame is never a silent choice; see
+            /// ExtendedDriftPasses for the cap and what binding it costs.
+            /// </summary>
+            public double ExtendedDriftPixels;
+            public int ExtendedDriftPasses = 1;
             public double SkyElectronsPerPixel;
             public double DarkElectronsPerPixel;
             public double SaturatedFraction;
+            /// <summary>Of the saturated pixels, the ones the CONVERTER lost rather than the well.
+            /// Separate because the cures differ: a shorter exposure against less binning.</summary>
+            public double SaturatedByConverterFraction;
             public int PsfKernelRadiusPx;
             public double ComputeMs;
             public string Error;
@@ -247,6 +365,22 @@ namespace ExoStudio.Simulation
             public bool Trailed;
             public double TargetPixelX, TargetPixelY;
 
+            /// <summary>
+            /// The altitude the atmospheric terms were evaluated at: the site's, falling back to
+            /// the spec's home mountain (AtmosphereAltitudeMeters). Recorded so a reduction can
+            /// rebuild the SAME SystemResponse the frame was made with.
+            /// </summary>
+            public double AtmosphereAltitudeMeters;
+
+            /// <summary>
+            /// The water column this frame was taken through, millimetres, and the identifier of the
+            /// series it came from. NaN when the term was absent. Recorded for the same reason the
+            /// airmass is: a reduction has to be able to rebuild the atmosphere the pixels were made
+            /// through, and a header has to be able to name the night.
+            /// </summary>
+            public double PwvMm = double.NaN;
+            public string PwvSeriesId;
+
             /// <summary>Header photometry: the response's flat effective width, the grey throughput, and the zero point they give.</summary>
             public double EffectiveWidthAngstromFlat;
             public double OpticalThroughput;
@@ -277,6 +411,19 @@ namespace ExoStudio.Simulation
             public float[] IlluminationMap;
             public double CornerIlluminationFalloff = 1.0;
 
+            /// <summary>
+            /// The dimensionless charge-transfer smear constant for this exposure: the fraction of
+            /// one row's light that every subsequent row picks up from it, which is the frame
+            /// transfer time divided by the exposure and the row count. Zero on every detector that
+            /// cannot smear, so the digitiser tests one number rather than repeating the
+            /// architecture rules. See Core.ChargeTransferSmear.
+            ///
+            /// It depends on the EXPOSURE, so it belongs to the prepared frame rather than to the
+            /// instrument: the same detector smears badly on a 0.5 s frame and imperceptibly on a
+            /// 600 s one, which is the whole reason the effect is a bright-target problem.
+            /// </summary>
+            public double SmearConstant;
+
             /// <summary>The capture metadata as the API reports it, noise-independent fields filled.</summary>
             public Result Meta;
         }
@@ -303,9 +450,11 @@ namespace ExoStudio.Simulation
             PreparedExposure prep = Prepare(req, data);
             if (prep.Meta.Error != null) return prep.Meta;
 
-            float[] adu = Digitise(prep, req.Seed, out double saturatedFraction);
+            float[] adu = Digitise(prep, req.Seed, out double saturatedFraction,
+                                   out double saturatedByConverter);
             Result res = prep.Meta;
             res.SaturatedFraction = saturatedFraction;
+            res.SaturatedByConverterFraction = saturatedByConverter;
             res.Png = PngWriter.GrayscaleFromAdu(adu, prep.W, prep.H);
             sw.Stop();
             res.ComputeMs = sw.Elapsed.TotalMilliseconds;
@@ -394,23 +543,8 @@ namespace ExoStudio.Simulation
             }
             else
             {
-                double bestUt = double.NaN, bestAlt = double.NegativeInfinity;
-                for (double t = req.Ut; t <= req.Ut + 25.0 * 3600.0; t += 300.0)
-                {
-                    double mer = SkyCoordinates.ComputeLocalMeridianRaDeg(
-                        t, ObservingSites.EarthSiderealDaySeconds, ObservingSites.GmstAtJ2000Deg,
-                        req.Site.LongitudeDeg);
-                    double sunAltAtT = SkyCoordinates.EquatorialToHorizontal(
-                        ImagingObservingConditions.ComputeSunRaDeg(t, siteCtx), 0.0,
-                        mer, req.Site.LatitudeDeg).AltitudeDeg;
-                    if (sunAltAtT >= ImagingObservingConditions.TwilightSunAltitudeDeg) continue;
-                    SkyCoordinates.PrecessFromJ2000(req.RaDeg, req.DecDeg,
-                        t * SkyCoordinates.JulianCenturiesPerSecond,
-                        out double raAtT, out double decAtT);
-                    double alt = SkyCoordinates.EquatorialToHorizontal(
-                        raAtT, decAtT, mer, req.Site.LatitudeDeg).AltitudeDeg;
-                    if (alt > bestAlt) { bestAlt = alt; bestUt = t; }
-                }
+                ScheduleUnbooked(req.Ut, req.RaDeg, req.DecDeg, req.Site, siteCtx,
+                                 out double bestUt, out double bestAlt);
                 if (double.IsNaN(bestUt) || bestAlt <= ImagingObservingConditions.MinTelescopeAltitudeDeg)
                 {
                     res.Error = bestAlt <= -900 || double.IsNaN(bestUt)
@@ -452,6 +586,24 @@ namespace ExoStudio.Simulation
                     obsUt, ObservingSites.EarthSiderealDaySeconds, ObservingSites.GmstAtJ2000Deg,
                     req.Site.LongitudeDeg);
                 observerLatitudeDeg = req.Site.LatitudeDeg;
+            }
+
+            // A FRAME CANNOT BE LAID OUT AROUND A POINTING THAT IS NOT A DIRECTION, and NaN does
+            // not fail here - it SUCCEEDS. Every degeneracy guard downstream is a comparison, and
+            // every comparison against NaN is false: PerpendicularTo's `len < 1e-9`, Normalized's
+            // `m < 1e-12`, TryProject's `w <= 1e-9`. So ImageFrame's three fallbacks each return
+            // NaN rather than trapping it, every source projects to a NaN pixel and is silently
+            // dropped, and what comes back is bias and read noise delivered as a Light Frame with
+            // no WCS and no complaint - after the full exposure's compute. Reachable: an orbital
+            // element posted as the literal NaN survives Math.Clamp, which also returns NaN.
+            // Refused with the reason, the way an occulted pointing is.
+            if (double.IsNaN(meridianRa) || double.IsNaN(observerLatitudeDeg)
+                || double.IsNaN(req.RaDeg) || double.IsNaN(req.DecDeg))
+            {
+                res.Error = "The pointing is not a direction: the observer's meridian, latitude or "
+                          + "the requested coordinates came through as NaN. Check the orbital "
+                          + "elements or the site.";
+                return new PreparedExposure { Meta = res };
             }
 
             // TWO FRAMES, ON PURPOSE, AND THE SPLIT IS WHERE IT IS FOR A REASON.
@@ -498,18 +650,43 @@ namespace ExoStudio.Simulation
             res.AirmassX = airmass;
             if (space) res.TargetAltitudeDeg = double.NaN;   // no horizon to be above
 
-            // Boresight frame with up toward the zenith, exactly as the harness builds it; the
-            // atmospheric-dispersion offsets below are then purely vertical by construction.
+            // THE LAYOUT FRAME IS FIXED ON THE SKY: north up, not the zenith.
+            //
+            // It used to be zenith up, which put the atmospheric dispersion vertical by
+            // construction and cost nothing while Studio only ever made ONE frame. Across a
+            // SEQUENCE it is a first-order error: a zenith-referenced frame rotates with the
+            // parallactic angle, so the same star lands somewhere different in every exposure -
+            // 104 degrees of rotation and up to 1400 px of travel over one night on a field at
+            // dec +36 from Roque de los Muchachos, measured. That is the behaviour of an alt-az
+            // telescope with no derotator, and NOTHING IN THE ROSTER IS ONE: the RC20, the
+            // RedCat 51 and the CDK1000 are equatorially mounted, and FORS2 and SPHERE are alt-az
+            // instruments that carry derotators. Every one of them holds a fixed sky orientation.
+            //
+            // What it cost, measured (MILESTONE_0B.md): the field rotation moved each star to a
+            // new sub-pixel phase every frame, and a hard-edged photometric aperture turned that
+            // into a 0.6 % flux jitter, six times the photon noise. The differential floor came
+            // out at 4.21x the photon limit against 1.65x with the geometry held still.
+            //
+            // North is the celestial pole projected into the tangent plane. On the pole itself that
+            // degenerates, and THE FALLBACK HAS TO BE ANOTHER DIRECTION FIXED ON THE SKY or the
+            // frame goes straight back to turning: the zenith is fixed to the HORIZON, so a field
+            // at dec = +/-90, where the boresight and the pole are the same direction to within
+            // 1e-16 and the azimuth comes back exactly 0, would roll at the full sidereal rate -
+            // 15 degrees an hour, which is the very defect this frame exists to remove.
+            //
+            // The vernal equinox is a sky direction and cannot degenerate here, because this branch
+            // is only reached when the boresight IS the pole and RA 0, dec 0 is exactly
+            // perpendicular to that. Up then means "RA 0 toward the top": arbitrary, as any roll on
+            // the pole is, but the SAME arbitrary roll in every frame of the night.
             SkyVector boresight = SkyVector.FromHorizontal(altAz.AltitudeDeg, altAz.AzimuthDeg);
             var zenith = new SkyVector(0, 0, 1);
-            double d = zenith.Dot(boresight);
-            SkyVector up = SkyVector.Normalized(zenith.X - d * boresight.X,
-                                                zenith.Y - d * boresight.Y,
-                                                zenith.Z - d * boresight.Z);
-            SkyVector right = SkyVector.Normalized(up.Y * boresight.Z - up.Z * boresight.Y,
-                                                   up.Z * boresight.X - up.X * boresight.Z,
-                                                   up.X * boresight.Y - up.Y * boresight.X);
+            ImageFrame(boresight, observerLatitudeDeg, meridianRa, out SkyVector up, out SkyVector right);
             var projection = new GnomonicProjection(boresight, up, right, fovDeg, w, h);
+
+            // The zenith direction resolved into that frame, which is where the dispersion points.
+            // With the old zenith-up frame this came out (0, 1) and the offsets were purely
+            // vertical; it is the same quantity, no longer assumed.
+            ResolveInFrame(boresight, up, right, zenith, out double zenithRight, out double zenithUp);
 
             // The instrument's own seeing at its own site, degraded by the field's airmass. Zero in
             // orbit, and zero is the physically correct value rather than a stand-in: the two
@@ -524,7 +701,50 @@ namespace ExoStudio.Simulation
             res.FovArcminY = h * plateScale / 60.0;
 
             // --- photometric chain -------------------------------------------------------
-            SystemResponse response = BuildSystemResponse(spec, req.Filter, airmass);
+            double atmosphereAltM = AtmosphereAltitudeMeters(spec, req.Site);
+
+            // THE WATER OVERHEAD AT THIS INSTANT, evaluated from ut and nothing else. Absent in
+            // orbit, absent without a series, absent without the table - and absent means the
+            // frame is bit-for-bit what it was before this term existed, which Verify asserts.
+            double pwvMm = double.NaN;
+            SpectralCurve pwvCurve = null;
+
+            // ASKING FOR WATER ABOVE THE ATMOSPHERE IS REFUSED, not quietly ignored. The term used
+            // to be dropped here for an orbital instrument while PwvSeriesId was still stamped into
+            // the frame's FITS header further down - a water-vapour provenance card on photons that
+            // never crossed an atmosphere. Silently ignoring a control the caller set is the one
+            // thing this program does not do.
+            if (space && req.Pwv != null)
+            {
+                res.Error = $"{spec.Name} observes from orbit, where there is no water column to "
+                          + "model. Remove the water-vapour series, or point a ground astrograph.";
+                return new PreparedExposure { Meta = res };
+            }
+
+            if (!space && req.Pwv != null && data?.Pwv != null)
+            {
+                pwvMm = req.Pwv.PwvMm(obsUt);
+                string refusal = data.Pwv.Refuse(pwvMm, airmass);
+                if (refusal != null)
+                {
+                    res.Error = refusal;
+                    return new PreparedExposure { Meta = res };
+                }
+                pwvCurve = data.Pwv.CurveFor(pwvMm, airmass);
+            }
+
+            SystemResponse response = BuildSystemResponse(spec, req.Filter, airmass, atmosphereAltM,
+                                                          pwvCurve, out string waterUnapplied);
+
+            // A WATER SERIES THAT COULD NOT BE APPLIED IS REFUSED, not dropped. This used to return
+            // the dry transmission and carry on, so a VLT FORS2 frame came back bit-for-bit
+            // identical to a dry one while its header carried PWV and PWVSRC - the same lie the
+            // orbital path told before it was made to refuse.
+            if (waterUnapplied != null)
+            {
+                res.Error = waterUnapplied;
+                return new PreparedExposure { Meta = res };
+            }
             double areaCm2 = 1e4 * Math.PI * 0.25 * spec.ApertureMeters * spec.ApertureMeters
                            * (1.0 - spec.SecondaryObstructionFraction * spec.SecondaryObstructionFraction);
 
@@ -535,7 +755,7 @@ namespace ExoStudio.Simulation
             double scintSigma = space
                 ? 0.0
                 : AtmosphericImagingNoise.ScintillationExcessSigma(
-                      spec.ApertureMeters, spec.SiteAltitudeMeters, airmass, req.ExposureSeconds);
+                      spec.ApertureMeters, atmosphereAltM, airmass, req.ExposureSeconds);
             var rngScint = new Pcg32(req.Seed, Pcg32.StreamScintillation);
             double scint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
             double starScint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
@@ -602,7 +822,7 @@ namespace ExoStudio.Simulation
                 // spectrum through Core/Airglow. Extinction on the zodiacal term only, as in
                 // GatherSkyBackground; twilight and moonlight are calibrated post-extinction.
                 double transmission = AtmosphericImagingNoise.ExtinctionTransmissionAt(
-                    airmass, wavelength, spec.SiteAltitudeMeters);
+                    airmass, wavelength, atmosphereAltM);
 
                 double sunRa = ImagingObservingConditions.ComputeSunRaDeg(obsUt, siteCtx);
                 double sunAlt = SkyCoordinates.EquatorialToHorizontal(sunRa, 0.0, meridianRa, observerLatitudeDeg).AltitudeDeg;
@@ -661,10 +881,50 @@ namespace ExoStudio.Simulation
             double fieldEBv = data.Dust != null && data.Dust.IsLoaded
                 ? data.Dust.ReddeningAt(req.RaDeg, req.DecDeg) : double.NaN;
 
+            // HOW MANY POSITIONS THE EXTENDED SOURCES ARE DEPOSITED AT, and why this exists at all.
+            //
+            // An unguided mount lets the sky walk across the sensor, and it does that to EVERYTHING
+            // in the field. Stars have always trailed here, because StarFieldRenderer is handed
+            // both the start and the end meridian and lays each source down along the path between
+            // them. The galaxies and the diffuse emission were handed only the END meridian, so
+            // they were stamped once, sharp, at the position the field finished at - a sharp galaxy
+            // sitting under star trails, which is not a thing any mount does. Worse than merely
+            // untrailed: it also put them at the far end of the drift, so an untracked frame had
+            // its extended sources displaced from where its star trails began.
+            //
+            // The fix is the same one the stars get, for the same reason StarFieldRenderer gives:
+            // deposit along the path rather than smearing the finished image sideways, because
+            // sideways cannot reproduce a trail that CURVES, nor field rotation, which makes the
+            // frame's edges travel further than its centre. Each pass carries its share of the
+            // exposure, so the total flux is unchanged and a tracked frame is bit-for-bit what it
+            // was: with tracking on the two meridians are equal, the drift is zero, and this is 1.
+            int extendedPasses = ExtendedDriftPasses(
+                projection, meridianRa, endMeridianRa, observerLatitudeDeg,
+                req.RaDeg, req.DecDeg, fieldRadiusDeg, out double extendedDriftPx);
+            res.ExtendedDriftPixels = extendedDriftPx;
+            res.ExtendedDriftPasses = extendedPasses;
+
+            // RENDERED ONCE, THEN LAID DOWN ALONG THE PATH, rather than re-rendered at each
+            // position. Both are correct and they differ only in cost, but the difference is not
+            // small: re-rendering measured 11 to 15 SECONDS per position on an M51 field, because
+            // every pass re-reads the galaxy imagery and re-samples the whole emission map, so a
+            // 30 s untracked frame wanted six minutes. Warping a finished plane is a bilinear
+            // resample per pixel and the whole trail costs less than one render.
+            //
+            // The warp is EXACT rather than an approximation to the drift: see TrailExtended.
+            // Nothing is lost by rendering once, because the sky does not change over the exposure
+            // - only where it lands on the sensor does.
+            //
+            // Rendered at the STARTING meridian now, where this used to render at the ending one.
+            // For a tracked frame the two are the same number and nothing moves; for an untracked
+            // one the old behaviour put the galaxies at the far end of a drift whose star trails
+            // began somewhere else, which was the second half of this bug.
+            var extended = new float[w * h];
+
             if (data.Galaxies != null)
             {
                 res.GalaxiesDrawn = DepositGalaxies(
-                    signal, w, h, projection, endMeridianRa, observerLatitudeDeg,
+                    extended, w, h, projection, meridianRa, observerLatitudeDeg,
                     data, req.RaDeg, req.DecDeg, fieldRadiusDeg,
                     response, double.IsNaN(fieldEBv) ? 0.0 : fieldEBv,
                     areaCm2, req.ExposureSeconds, nonAtmTransmission * scint,
@@ -674,16 +934,16 @@ namespace ExoStudio.Simulation
             // Stars: cone search wide enough for the trails, photometry through the same
             // response the galaxies used, deposited by Core's own renderer.
             //
-            // Which catalogue serves this field. The search cone is the frame's own radius with
-            // the trailing margin already on it, and that WHOLE cone is what a deep patch has to
-            // cover before it may be used: a patch that reaches part of the frame would put stars
-            // on one side and bare sky on the other, which reads as data rather than as absence.
-            // See StarFieldCatalogs. Exactly one layer serves a frame, never two, or every star
-            // the two share would be deposited twice.
+            // Which catalogue serves this field: the deep all-sky one when it is installed, the
+            // chart's otherwise. Both reach everywhere, so this does not depend on where the
+            // telescope is pointed and no field has an edge to fall off. See StarFieldCatalogs.
+            // Exactly one layer serves a frame, never two, or every star the two share would be
+            // deposited twice.
+            //
+            // The search cone is the frame's own radius with the trailing margin already on it.
             double starSearchRadiusDeg = fieldRadiusDeg * 1.3;
-            StarFieldLayer starLayer = data.Fields.Select(req.RaDeg, req.DecDeg, starSearchRadiusDeg);
+            StarFieldLayer starLayer = data.Fields.ForFrames;
             res.StarCatalogUsed = starLayer?.Describe();
-            res.StarCatalogNote = data.Fields.NearMiss(req.RaDeg, req.DecDeg, starSearchRadiusDeg);
 
             if (starLayer != null && starLayer.Catalog.IsLoaded)
             {
@@ -706,6 +966,52 @@ namespace ExoStudio.Simulation
                 // Projected here with the SAME call DepositStars uses one line below, deliberately:
                 // a second projection written by hand would be a second thing to keep in step, and
                 // a truth catalogue half a pixel from the pixels is worse than none.
+                // THE INJECTION, applied ONCE and to both sides. The factor is the mean over the
+                // exposure, not the value at its midpoint, because a frame straddling ingress
+                // collects part of each level; sampling at one instant would quantise the ramp onto
+                // the frame grid. At depth zero it is exactly 1.0 and nothing below changes, which
+                // is what makes "no transit" bit-for-bit the frame it always was.
+                double transitFactor = req.Transient != null
+                    ? req.Transient.MeanFactorOver(obsUt, exposure)
+                    : 1.0;
+                int transitStars = 0;
+                if (req.Transient != null && transitFactor != 1.0)
+                {
+                    for (int si = 0; si < stars.Count; si++)
+                    {
+                        RenderedStar s0 = stars[si];
+                        if (!req.Transient.Matches(s0.RaDeg, s0.DecDeg)) continue;
+                        // The SAME expression DepositStars would have evaluated for this star, so
+                        // the override is the star's own brightness times the factor and nothing
+                        // else. RenderedStar is a struct: the list element has to be written back.
+                        double baseElectrons = StellarPhotometry.CollectedElectrons(
+                            s0.VMag, s0.ColorIndexBV, s0.ReddeningEBv,
+                            response, reddening, areaCm2, exposure, starTransmission);
+                        s0.FixedElectrons = transitFactor * baseElectrons;
+                        stars[si] = s0;
+                        transitStars++;
+                    }
+                }
+                res.TransitFactor = transitFactor;
+                res.TransitStarsMatched = transitStars;
+                res.TransitId = req.Transient?.Id;
+
+                // AN INJECTION THAT MATCHED NOTHING IS REFUSED. Asking for a 6 ppt transit and
+                // getting a frame with no transit in it - because the given position is a field
+                // centre rather than a star - is the same class of silence as a water series that
+                // was dropped: the caller would measure a null result and read it as physics.
+                // Only when the factor is not 1, because out of transit there is nothing to apply
+                // and a run must be allowed to have frames on either side of the event.
+                if (req.Transient != null && transitFactor != 1.0 && transitStars == 0)
+                {
+                    res.Error =
+                        $"No catalogue star lies within {req.Transient.MatchRadiusArcsec:0.#} arcsec of "
+                      + $"RA {req.Transient.TargetRaDeg:0.####}, Dec {req.Transient.TargetDecDeg:0.####}, "
+                      + "so the transit would have been injected into empty sky. Give the host star's "
+                      + "own position, or widen the match radius.";
+                    return new PreparedExposure { Meta = res };
+                }
+
                 injected = new List<InjectedStar>(stars.Count);
                 foreach (RenderedStar star in stars)
                 {
@@ -726,9 +1032,13 @@ namespace ExoStudio.Simulation
                         ReddeningEBv = star.ReddeningEBv,
                         RaDeg = star.RaDeg,
                         DecDeg = star.DecDeg,
-                        Electrons = StellarPhotometry.CollectedElectrons(
-                            star.VMag, star.ColorIndexBV, star.ReddeningEBv,
-                            response, reddening, areaCm2, exposure, starTransmission),
+                        // The deposit used FixedElectrons for the injected star and this must be
+                        // the same number, or the reduction would score the injection as an error.
+                        Electrons = star.FixedElectrons > 0.0
+                            ? star.FixedElectrons
+                            : StellarPhotometry.CollectedElectrons(
+                                star.VMag, star.ColorIndexBV, star.ReddeningEBv,
+                                response, reddening, areaCm2, exposure, starTransmission),
                     });
                 }
 
@@ -740,11 +1050,17 @@ namespace ExoStudio.Simulation
                         response, reddening, areaCm2, exposure, starTransmission));
             }
 
-            // Diffuse emission, independent of any star landing in the field.
+            // Diffuse emission, into the same extended plane and at the same meridian: a nebula is
+            // no more exempt from an unguided mount than a galaxy is, and both trail together.
             res.EmissionLinesRendered = DepositEmission(
-                signal, w, h, bin, projection, endMeridianRa, observerLatitudeDeg,
+                extended, w, h, bin, projection, meridianRa, observerLatitudeDeg,
                 data, req.RaDeg, req.DecDeg, fieldRadiusDeg,
                 response, plateScale, areaCm2, req.ExposureSeconds * nonAtmTransmission);
+
+            // And now the drift, applied to everything extended at once. With tracking on this is
+            // a straight addition and the frame is bit-for-bit what it was.
+            TrailExtended(extended, signal, w, h, projection,
+                          meridianRa, endMeridianRa, observerLatitudeDeg, extendedPasses);
 
             // --- optics --------------------------------------------------------------------
             // The chromatic PSF across the passband with Filippenko dispersion, the harness's
@@ -761,7 +1077,8 @@ namespace ExoStudio.Simulation
             }
             else
             {
-                subBands = BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale, spec.SiteAltitudeMeters);
+                subBands = BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale, atmosphereAltM,
+                                         zenithRight, zenithUp);
             }
             float[] kernel = OpticalPsf.BuildChromaticKernel(
                 plateScale, spec.ApertureMeters, spec.SecondaryObstructionFraction, seeing,
@@ -833,6 +1150,11 @@ namespace ExoStudio.Simulation
                 Trailed = !space && !req.Tracking,
                 TargetPixelX = targetPx,
                 TargetPixelY = targetPy,
+                AtmosphereAltitudeMeters = atmosphereAltM,
+                PwvMm = pwvMm,
+                // Tied to the value, not to the request: a series that produced no column produced
+                // no provenance either, and a header carrying PWVSRC with no PWV describes nothing.
+                PwvSeriesId = double.IsNaN(pwvMm) ? null : req.Pwv?.Id,
                 EffectiveWidthAngstromFlat = widthFlat,
                 OpticalThroughput = throughput,
                 ApertureAreaCm2 = areaCm2,
@@ -842,6 +1164,7 @@ namespace ExoStudio.Simulation
                 OffsetMap = offsetMap,
                 IlluminationMap = illuminationMap,
                 CornerIlluminationFalloff = cornerFalloff,
+                SmearConstant = SmearConstantFor(spec, req.ExposureSeconds, h),
                 Meta = res,
             };
         }
@@ -852,10 +1175,23 @@ namespace ExoStudio.Simulation
         /// else, so two subs differ exactly by their seeds.
         /// </summary>
         public static float[] Digitise(PreparedExposure p, ulong seed, out double saturatedFraction)
+            => Digitise(p, seed, out saturatedFraction, out _);
+
+        /// <summary>
+        /// The same digitisation, separating the two ways a pixel stops carrying information: the
+        /// well filling, and the converter running out of codes. See the comment in the loop.
+        /// </summary>
+        public static float[] Digitise(PreparedExposure p, ulong seed, out double saturatedFraction,
+                                       out double saturatedByConverterFraction)
         {
             int n = p.W * p.H;
             var raw = new float[n];
-            var rng = new Pcg32(seed, Pcg32.StreamShotNoise);
+
+            // THE MEAN LIGHT PLANE, built in full before anything samples it. It has to exist as a
+            // whole array rather than one pixel at a time because smear below is not a per-pixel
+            // operation: what a pixel reads out depends on every pixel its charge crossed on the
+            // way to the register, so the plane must be complete before any of it is known.
+            var light = new float[n];
             for (int i = 0; i < n; i++)
             {
                 // PRNU MULTIPLIES LIGHT AND NOTHING ELSE. It is a photo-response: the pixel's own
@@ -867,21 +1203,57 @@ namespace ExoStudio.Simulation
                 // Dark-current non-uniformity (DSNU) is the matching fixed pattern on the dark
                 // term. No device in this roster publishes it, so it is absent rather than
                 // invented, and a master dark here corrects the dark's LEVEL but not its structure.
-                double light = (Math.Max(0.0, p.Signal[i]) + p.SkyElectronsPerPixel)
-                             * SensorNonUniformity.PhotoResponse(p.PhotoResponseMap, i)
-                             * Illumination(p.IlluminationMap, i);
-                raw[i] = (float)NoiseSampler.Poisson(rng, light + p.DarkElectronsPerPixel);
+                light[i] = (float)((Math.Max(0.0, p.Signal[i]) + p.SkyElectronsPerPixel)
+                                 * SensorNonUniformity.PhotoResponse(p.PhotoResponseMap, i)
+                                 * Illumination(p.IlluminationMap, i));
             }
+
+            // CHARGE-TRANSFER SMEAR, and it goes HERE for two reasons that are both about ordering.
+            //
+            // AFTER the photo response and the illumination, because the smear charge is collected
+            // in the pixels the packet TRANSITS: it takes their quantum efficiency and their
+            // vignetting, not its destination's. Applying it to a bare signal plane would give the
+            // stripe the wrong response wherever the two differ.
+            //
+            // BEFORE the Poisson draw, because smear is real photo-charge that arrived as photons
+            // and therefore carries shot noise of its own. Adding it to the mean lets the sampler
+            // give it that noise and couples it correctly to the rest of the pixel. Adding it to an
+            // already-sampled frame - the obvious way, and the usual way - produces a perfectly
+            // smooth stripe, which is a frame whose noise is wrong in precisely the region any
+            // desmearing algorithm is about to be judged on.
+            //
+            // p.SmearConstant is zero unless the detector is one that can smear at all; see
+            // VisualTelescopeSpec.FrameTransferSeconds for which architectures those are.
+            ChargeTransferSmear.Add(light, p.W, p.H, p.SmearConstant, ChargeTransferSmear.ReadoutAxis.Columns);
+
+            var rng = new Pcg32(seed, Pcg32.StreamShotNoise);
+            for (int i = 0; i < n; i++)
+                raw[i] = (float)NoiseSampler.Poisson(rng, light[i] + p.DarkElectronsPerPixel);
 
             ApplyBlooming(raw, p.W, p.H, (float)p.FullWellElectrons);
 
-            int saturated = 0;
+            // TWO CEILINGS, AND ONLY ONE OF THEM WAS BEING COUNTED.
+            //
+            // A pixel stops carrying information when it fills the WELL, and also when its charge
+            // exceeds what the CONVERTER can express - and those are different numbers. This loop
+            // counted the first and clipped the second silently at the Math.Min below, so a frame
+            // could be reported at 0.04 % saturated with 62 % of its pixels railed at MaxAdu. It
+            // was measured that way on FORS2: 150000 e- per pixel, which BINNING multiplies by
+            // bin*bin to 600000 at bin 2, against a 16-bit converter that stops at 65535 ADU and
+            // does not move with binning at all. So the discrepancy is not a corner case - it grows
+            // with exactly the binning a photometrist reaches for, and the frame's own header
+            // already knew, because SaturationAdu below takes the MINIMUM of the two ceilings.
+            //
+            // Counted separately as well as together, because the two have different cures: a full
+            // well wants a shorter exposure, a railed converter wants less binning or more gain.
+            int saturatedWell = 0, saturatedConverter = 0;
             var rngRead = new Pcg32(seed, Pcg32.StreamReadNoise);
             var adu = new float[n];
             for (int i = 0; i < n; i++)
             {
                 double e = raw[i];
-                if (e >= p.FullWellElectrons) { e = p.FullWellElectrons; saturated++; }
+                bool wellFull = e >= p.FullWellElectrons;
+                if (wellFull) { e = p.FullWellElectrons; saturatedWell++; }
 
                 // Offset fixed-pattern noise is ADDITIVE and belongs after saturation and before
                 // the amplifier: it is where the pixel reads out FROM, not what it collected. This
@@ -898,10 +1270,235 @@ namespace ExoStudio.Simulation
                 e += SensorNonUniformity.OffsetElectrons(p.OffsetMap, i);
 
                 e += NoiseSampler.Gaussian(rngRead, p.Spec.ReadNoiseElectrons);
-                adu[i] = (float)Math.Min(p.MaxAdu, Math.Max(0.0, Math.Floor(e / p.ElectronsPerAdu + p.BiasAdu)));
+                // COUNTED BEFORE THE CLIP, which is the whole point: after Math.Min the evidence
+                // that this pixel ran off the top of the converter is gone.
+                double counts = Math.Floor(e / p.ElectronsPerAdu + p.BiasAdu);
+                if (counts >= p.MaxAdu && !wellFull) saturatedConverter++;
+                adu[i] = (float)Math.Min(p.MaxAdu, Math.Max(0.0, counts));
             }
-            saturatedFraction = (double)saturated / n;
+            saturatedByConverterFraction = (double)saturatedConverter / n;
+            saturatedFraction = (double)(saturatedWell + saturatedConverter) / n;
             return adu;
+        }
+
+        /// <summary>
+        /// Lays a rendered extended-source plane down at every position along the unguided drift,
+        /// accumulating into the signal plane.
+        ///
+        /// WHAT AN UNGUIDED MOUNT DOES TO A GALAXY. Exactly what it does to a star: the sky walks
+        /// across the sensor and the source is spread along the path it walked. Stars have always
+        /// trailed here because StarFieldRenderer is handed both meridians; the galaxies and the
+        /// diffuse emission were handed only one and came out sharp, which is a picture no mount
+        /// has ever taken.
+        ///
+        /// WHY THE PLANE IS WARPED RATHER THAN RE-RENDERED. Re-rendering is the obvious way and it
+        /// was the first implementation, and on a real M51 field it measured 11 to 15 seconds per
+        /// position, because every pass re-reads the galaxy imagery and re-samples the whole
+        /// emission map. A 30 s untracked frame drifts about 30 pixels at this plate scale, which
+        /// is 30 passes, which is six minutes for one frame. The sky does not change during the
+        /// exposure - only where it lands does - so rendering it once and moving the result is not
+        /// an approximation to re-rendering, it is the same answer arrived at cheaply.
+        ///
+        /// THE WARP IS EXACT, and no fitting or small-angle assumption is involved. For each output
+        /// pixel it asks what the sky is doing there, and where that same piece of sky sat when the
+        /// plane was rendered:
+        ///
+        ///   1. `Deproject` gives the direction the pixel looks at, which is fixed in the
+        ///      HORIZONTAL frame and does not depend on the meridian at all.
+        ///   2. That direction's hour angle and declination follow from the latitude alone, so they
+        ///      are computed ONCE per pixel and reused by every pass. This is the whole reason the
+        ///      trail is cheap: the expensive half of the transform does not repeat.
+        ///   3. A pass at meridian offset d sees that piece of sky at hour angle H - d, because
+        ///      advancing the meridian and turning the sky are the same motion viewed twice.
+        ///   4. Convert back to horizontal, project, sample the source plane bilinearly.
+        ///
+        /// Every step uses the projection and the coordinate transforms the rest of the pipeline
+        /// uses, so a trailed galaxy lands on the same track as the star trails beside it rather
+        /// than on a track computed by a second implementation that has to be kept in step.
+        ///
+        /// FLUX IS CONSERVED. Each pass carries 1/passes of the plane, and the drift is a rotation,
+        /// whose Jacobian is one: no pixel is stretched, so bilinear resampling neither creates nor
+        /// destroys signal. What leaves the frame at the edge is light that really did leave.
+        /// </summary>
+        public static void TrailExtended(float[] src, float[] dst, int w, int h,
+                                         GnomonicProjection projection,
+                                         double meridianRa, double endMeridianRa, double latDeg,
+                                         int passes)
+        {
+            if (src == null || dst == null) return;
+
+            // The tracked case, and the only one that used to exist. A straight addition, so a
+            // tracked frame is bit-for-bit what it was before any of this.
+            if (passes <= 1 || endMeridianRa == meridianRa)
+            {
+                for (int i = 0; i < src.Length && i < dst.Length; i++) dst[i] += src[i];
+                return;
+            }
+
+            int n = w * h;
+            var hourAngle = new double[n];
+            var declination = new double[n];
+
+            // Step 2: the expensive half, done once. Pixel centres, matching the convention
+            // StarFieldRenderer.Splat uses for where a pixel's centre lies.
+            void Precompute(int y)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    SkyVector dir = projection.Deproject(x + 0.5, y + 0.5);
+                    double alt = Math.Asin(Math.Clamp(dir.Z, -1.0, 1.0)) * 180.0 / Math.PI;
+                    double az = Math.Atan2(dir.Y, dir.X) * 180.0 / Math.PI;
+                    SkyCoordinates.HorizontalToEquatorial(alt, az, meridianRa, latDeg,
+                                                          out double ra, out double dec);
+                    hourAngle[y * w + x] = meridianRa - ra;
+                    declination[y * w + x] = dec;
+                }
+            }
+
+            if (ParallelWork.Worthwhile(n)) Parallel.For(0, h, ParallelWork.Options, Precompute);
+            else for (int y = 0; y < h; y++) Precompute(y);
+
+            double weight = 1.0 / passes;
+            for (int k = 0; k < passes; k++)
+            {
+                // The same parameterisation StarFieldRenderer uses for a star's trail: inclusive of
+                // both endpoints, t from 0 to 1, so the two kinds of source lie along one track.
+                double delta = (endMeridianRa - meridianRa) * ((double)k / (passes - 1));
+
+                void Pass(int y)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        int i = y * w + x;
+                        HorizontalCoordinates at = SkyCoordinates.EquatorialToHorizontal(
+                            meridianRa - (hourAngle[i] - delta), declination[i], meridianRa, latDeg);
+                        if (!projection.TryProject(
+                                SkyVector.FromHorizontal(at.AltitudeDeg, at.AzimuthDeg),
+                                out double sx, out double sy))
+                            continue;
+                        double v = SampleBilinear(src, w, h, sx - 0.5, sy - 0.5);
+                        if (v != 0.0) dst[i] += (float)(v * weight);
+                    }
+                }
+
+                if (ParallelWork.Worthwhile(n)) Parallel.For(0, h, ParallelWork.Options, Pass);
+                else for (int y = 0; y < h; y++) Pass(y);
+            }
+        }
+
+        /// <summary>
+        /// Bilinear sample of a plane at a continuous position, zero outside it. Zero rather than
+        /// edge-clamped: sky that has drifted off the sensor is gone, and clamping would smear the
+        /// edge row inward as though the frame kept collecting light from beyond its own border.
+        /// </summary>
+        private static double SampleBilinear(float[] plane, int w, int h, double x, double y)
+        {
+            int x0 = (int)Math.Floor(x), y0 = (int)Math.Floor(y);
+            double fx = x - x0, fy = y - y0;
+            if (x0 < -1 || y0 < -1 || x0 >= w || y0 >= h) return 0.0;
+
+            double At(int px, int py) =>
+                px < 0 || py < 0 || px >= w || py >= h ? 0.0 : plane[py * w + px];
+
+            return At(x0, y0) * (1 - fx) * (1 - fy)
+                 + At(x0 + 1, y0) * fx * (1 - fy)
+                 + At(x0, y0 + 1) * (1 - fx) * fy
+                 + At(x0 + 1, y0 + 1) * fx * fy;
+        }
+
+        /// <summary>
+        /// How many positions along the unguided drift an EXTENDED source has to be deposited at,
+        /// and how far that drift carries the field in pixels.
+        ///
+        /// MEASURED ACROSS THE WHOLE FIELD, NOT AT ITS CENTRE, and that is the point of the five
+        /// probes. The drift is not a translation: the sky rotates about the pole, so the frame
+        /// turns as it slides, and a corner travels further than the middle. Sampling the centre
+        /// alone would under-sample the corners of a wide field and lay the outer parts of a galaxy
+        /// down as a dotted line while the middle came out continuous.
+        ///
+        /// ONE PASS PER PIXEL OF DRIFT is the same rule StarFieldRenderer uses, and it is generous
+        /// here: a star is a delta function that needs dense sampling to read as a streak, while a
+        /// galaxy is already smooth on the scale of the seeing disc, so its trail closes up long
+        /// before the samples are a pixel apart.
+        ///
+        /// THE CAP IS A COST BOUND AND IT IS DECLARED. Each pass re-renders every galaxy and the
+        /// whole emission map, which is far more expensive than splatting a point source, so this
+        /// cannot take StarFieldRenderer's 512. A frame drifting further than the cap is already an
+        /// unusable streak end to end; what the cap changes is how finely that streak is sampled,
+        /// and `ExtendedDriftPasses` is reported with the capture so the answer is never silent.
+        /// </summary>
+        public static int ExtendedDriftPasses(GnomonicProjection projection,
+                                              double meridianRa, double endMeridianRa, double latDeg,
+                                              double raDeg, double decDeg, double fieldRadiusDeg,
+                                              out double driftPixels)
+        {
+            driftPixels = 0.0;
+
+            // Zero drift is the tracked case, and it must come out as exactly one pass at exactly
+            // the same meridian, so a tracked frame is unchanged by any of this.
+            if (endMeridianRa == meridianRa) return 1;
+
+            // The field centre and four points one radius out along each axis. Declination is
+            // clamped rather than wrapped: past the pole the probe is not in the field anyway.
+            double r = Math.Max(0.0, fieldRadiusDeg);
+            double cosDec = Math.Cos(decDeg * Math.PI / 180.0);
+            double raOffset = Math.Abs(cosDec) > 1e-6 ? r / cosDec : 0.0;
+            Span<(double ra, double dec)> probes = stackalloc (double, double)[]
+            {
+                (raDeg, decDeg),
+                (raDeg + raOffset, decDeg),
+                (raDeg - raOffset, decDeg),
+                (raDeg, Math.Min(89.9, decDeg + r)),
+                (raDeg, Math.Max(-89.9, decDeg - r)),
+            };
+
+            double worst = 0.0;
+            foreach ((double ra, double dec) in probes)
+            {
+                HorizontalCoordinates a = SkyCoordinates.EquatorialToHorizontal(ra, dec, meridianRa, latDeg);
+                HorizontalCoordinates b = SkyCoordinates.EquatorialToHorizontal(ra, dec, endMeridianRa, latDeg);
+                if (!projection.TryProject(SkyVector.FromHorizontal(a.AltitudeDeg, a.AzimuthDeg),
+                                           out double ax, out double ay)) continue;
+                if (!projection.TryProject(SkyVector.FromHorizontal(b.AltitudeDeg, b.AzimuthDeg),
+                                           out double bx, out double by)) continue;
+                double d = Math.Sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+                if (d > worst) worst = d;
+            }
+
+            driftPixels = worst;
+            if (!(worst > 0.0) || double.IsNaN(worst)) return 1;
+
+            int passes = (int)Math.Ceiling(worst) + 1;
+            return Math.Clamp(passes, 1, MaxExtendedDriftPasses);
+        }
+
+        /// <summary>
+        /// Cost bound on the extended-source trail. Far below StarFieldRenderer's 512 because each
+        /// pass here re-renders the galaxies and the emission map rather than splatting a point.
+        /// </summary>
+        public const int MaxExtendedDriftPasses = 96;
+
+        /// <summary>
+        /// The smear constant this exposure will carry, or zero where the detector cannot smear.
+        ///
+        /// THE GATE IS ARCHITECTURE, NOT A MISSING NUMBER, and it is enforced here rather than left
+        /// to whoever fills the spec in. An HgCdTe array reads every pixel where it sits, so there
+        /// is no path along which charge could cross another pixel and no mechanism for the effect
+        /// to exist; a frame-transfer time on such a device is a contradiction, not a
+        /// configuration. Applying it anyway would put a specific, visible, physically impossible
+        /// stripe on the frame, which is a worse failure than having no model at all, and it is
+        /// exactly the failure a simulator invites when it offers smear as a switch on any camera.
+        /// So the field is REFUSED there, and the refusal is reported rather than silent.
+        ///
+        /// See Core.ChargeTransferSmear for the mechanism, and VisualTelescopeSpec's own field for
+        /// why every instrument on this roster carries NaN and which one of them is unpublished
+        /// rather than impossible.
+        /// </summary>
+        public static double SmearConstantFor(VisualTelescopeSpec spec, double exposureSeconds, int rowsAlongTransfer)
+        {
+            if (spec == null) return 0.0;
+            if (spec.Technology != DetectorTechnology.Ccd) return 0.0;
+            return ChargeTransferSmear.Constant(spec.FrameTransferSeconds, exposureSeconds, rowsAlongTransfer);
         }
 
         /// <summary>
@@ -1029,7 +1626,11 @@ namespace ExoStudio.Simulation
                 IsCalibratedAdu = calibratedAdu,
                 FocalLengthMm = p.Spec.FocalLengthMeters * p.ZoomFactor * 1000.0,
                 Gain = 1f,
-                FilterName = p.Filter.ToString(),
+                // THE OBSERVER'S NAME FOR THE BAND, not the wheel position it is mounted in. A
+                // 750-1000 nm band mounted in the Luminance slot was writing FILTER = 'Luminance',
+                // which every reader takes to mean broad visible; the true span was two cards away
+                // in WAVELNTH and BANDWID and nobody reads those first.
+                FilterName = p.Spec.LabelFor(p.Filter),
                 ObjectName = objectName,
                 UtcTimestamp = SimulationClock.UtToUtc(p.ObservedUt),
                 TelescopeName = p.Spec.Name,
@@ -1049,6 +1650,8 @@ namespace ExoStudio.Simulation
                 DetectorTemperatureCelsius = p.DetectorTemperatureCelsius,
                 ApertureMeters = p.Spec.ApertureMeters,
                 Airmass = p.Meta.AirmassX,
+                PwvMm = p.PwvMm,
+                PwvSeriesId = p.PwvSeriesId,
                 SeeingFwhmArcsec = p.Meta.SeeingFwhmArcsec,
                 DiffractionFwhmArcsec = double.NaN,
                 // Known in orbit and not on the ground, because the orbital sky is computed as a
@@ -1146,7 +1749,7 @@ namespace ExoStudio.Simulation
                         electrons, response, reddening, eBv, areaCm2, exposure, transmission, bandNm))
                 {
                     drawn++;
-                    fromImages.Add(g.Name);
+                    fromImages?.Add(g.Name);
                     continue;
                 }
 
@@ -1449,9 +2052,22 @@ namespace ExoStudio.Simulation
 
         // ------------------------------------------------------------------ optics/detector helpers
 
-        private static ChromaticSubBand[] BuildSubBands(
+        /// <summary>
+        /// The twelve chromatic sub-bands and their differential-refraction offsets.
+        ///
+        /// <paramref name="zenithRight"/> and <paramref name="zenithUp"/> are the zenith direction
+        /// resolved into the image's own axes. Refraction lifts a source toward the zenith, so that
+        /// is the direction the dispersion runs in; it used to be assumed vertical because the
+        /// frame was built zenith up, and it is now passed because the frame is fixed on the sky
+        /// and the angle between the two changes through a night.
+        ///
+        /// Internal rather than private so the harness can ask the CAMERA where it put the blue
+        /// end, instead of asking Core the same question with the arguments written out by hand.
+        /// </summary>
+        public static ChromaticSubBand[] BuildSubBands(
             double centreMeters, double bandwidthAngstrom, double zenithDistanceDeg,
-            double plateScale, double siteAltitudeMeters)
+            double plateScale, double siteAltitudeMeters,
+            double zenithRight, double zenithUp)
         {
             // ICAO standard atmosphere at the site's altitude, the harness's own inputs.
             double tC = 15.0 - 0.0065 * siteAltitudeMeters;
@@ -1464,13 +2080,25 @@ namespace ExoStudio.Simulation
             for (int i = 0; i < bands.Length; i++)
             {
                 double lambda = lo + (i + 0.5) * (hi - lo) / bands.Length;
+
+                // SUB-BAND FIRST, PASSBAND CENTRE SECOND, and the order is the physics rather than
+                // a convention. The helper is "positive when the FIRST is lifted more, which for
+                // shorter wavelengths it is" (Core/AtmosphericRefraction), so a blue sub-band asked
+                // for as (blue, centre) comes back positive and is laid down on the ZENITH side of
+                // the band centre, which is where refraction actually puts it. The arguments were
+                // the other way round here, which returned R(centre) - R(blue) < 0 and placed the
+                // blue end of every passband AWAY from the zenith - the dispersion running 180
+                // degrees from the direction it runs in the sky. Core's own SplitPassband, which
+                // serves the orbital path, has always passed them in this order.
                 double offset = AtmosphericRefraction.DifferentialRefractionArcsec(
-                    centreMeters * 1e6, lambda * 1e6, zenithDistanceDeg, tC, pMb, waterMb) / plateScale;
+                    lambda * 1e6, centreMeters * 1e6, zenithDistanceDeg, tC, pMb, waterMb) / plateScale;
+                if (double.IsNaN(offset)) offset = 0.0;
                 bands[i] = new ChromaticSubBand
                 {
                     WavelengthMeters = lambda,
                     Weight = 1.0,
-                    OffsetY = double.IsNaN(offset) ? 0.0 : offset,
+                    OffsetX = offset * zenithRight,
+                    OffsetY = offset * zenithUp,
                 };
             }
             return bands;
@@ -1591,18 +2219,64 @@ namespace ExoStudio.Simulation
 
         // The camera's filter helpers, transplanted: small switches over the spec's own fields.
 
-        public static SystemResponse BuildSystemResponse(VisualTelescopeSpec spec, CameraFilter filter, double airmass)
+        public static SystemResponse BuildSystemResponse(VisualTelescopeSpec spec, CameraFilter filter, double airmass) =>
+            BuildSystemResponse(spec, filter, airmass, spec.SiteAltitudeMeters);
+
+        /// <summary>
+        /// The four-argument form exists because the extinction's air column belongs to the SITE
+        /// the frame is taken from, not to the spec's home mountain; see AtmosphereAltitudeMeters.
+        /// A reduction must pass the altitude the frame was prepared with (PreparedExposure
+        /// records it) or its analytic widths describe a different atmosphere than the pixels.
+        /// </summary>
+        public static SystemResponse BuildSystemResponse(VisualTelescopeSpec spec, CameraFilter filter, double airmass,
+                                                         double siteAltitudeMeters)
+            => BuildSystemResponse(spec, filter, airmass, siteAltitudeMeters, null);
+
+        /// <summary>
+        /// The five-argument form carries the WATER-VAPOUR TRANSMISSION, and it enters as a
+        /// spectral curve rather than a scalar because that is what it is.
+        ///
+        /// The passband integral is already per wavelength - source spectrum, reddening, filter,
+        /// optics, quantum efficiency and Rayleigh-plus-aerosol extinction are all evaluated at
+        /// each node of the quadrature and collapsed into one effective width at the end. Water
+        /// absorption is a forest of narrow lines, so it belongs in that integrand and nowhere
+        /// else: a band-averaged factor would be wrong for exactly the reason Beer-Lambert is not
+        /// linear, and it would erase the colour dependence that is the whole point.
+        ///
+        /// So the filter curve and the water curve are MULTIPLIED into one product curve. That
+        /// preserves the file's own convention - a curve present means the filter's peak
+        /// transmission is already in the curve and must not be applied again - because where the
+        /// instrument publishes no measured filter curve, the top-hat this builds carries the peak
+        /// itself. Null leaves the response exactly as it was.
+        /// </summary>
+        public static SystemResponse BuildSystemResponse(VisualTelescopeSpec spec, CameraFilter filter, double airmass,
+                                                         double siteAltitudeMeters, SpectralCurve pwvCurve) =>
+            BuildSystemResponse(spec, filter, airmass, siteAltitudeMeters, pwvCurve, out _);
+
+        /// <summary>
+        /// The same, reporting WHY the water curve could not be applied when it could not. Callers
+        /// that record a PWV in the frame's header must use this form and refuse: a frame that
+        /// silently kept its dry transmission while stamping PWV and PWVSRC is a frame lying about
+        /// its own provenance, and that is exactly what VLT FORS2 did on every filter.
+        /// </summary>
+        public static SystemResponse BuildSystemResponse(VisualTelescopeSpec spec, CameraFilter filter, double airmass,
+                                                         double siteAltitudeMeters, SpectralCurve pwvCurve,
+                                                         out string waterUnapplied)
         {
-            SpectralCurve filterCurve = filter switch
-            {
-                CameraFilter.Red => spec.RedFilterCurve,
-                CameraFilter.Green => spec.GreenFilterCurve,
-                CameraFilter.Blue => spec.BlueFilterCurve,
-                _ => null,
-            };
+            waterUnapplied = null;
+            SpectralCurve filterCurve = FilterTransmissionCurve(spec, filter);
             double transmission = filterCurve != null
                 ? spec.OpticsTransmission
                 : FilterPeakTransmission(spec, filter) * spec.OpticsTransmission;
+
+            if (pwvCurve != null)
+            {
+                double centre = FilterCentralWavelengthMeters(spec, filter);
+                double widthM = FilterBandwidthAngstrom(spec, filter) * 1e-10;
+                filterCurve = MultiplyIntoFilterCurve(filterCurve, pwvCurve, spec, filter, centre, widthM,
+                                                      out bool peakFolded, out waterUnapplied);
+                if (peakFolded) transmission = spec.OpticsTransmission;
+            }
 
             return new SystemResponse(
                 FilterCentralWavelengthMeters(spec, filter),
@@ -1612,7 +2286,211 @@ namespace ExoStudio.Simulation
                 spec.QuantumEfficiencyCurve,
                 spec.QuantumEfficiency,
                 airmass,
-                spec.SiteAltitudeMeters);
+                siteAltitudeMeters);
+        }
+
+        /// <summary>
+        /// The filter's own transmission times the water's, on a grid dense enough to resolve the
+        /// water lines and spanning the whole passband.
+        ///
+        /// BOTH OF THOSE MATTER. The water bands near 720, 820 and 940 nm are narrow, so a coarse
+        /// grid would average them away before the integral ever saw them; and `SystemResponse`
+        /// integrates only over the curve's own support, so a curve that stopped short of the
+        /// filter would silently truncate the passband instead of transmitting through it.
+        ///
+        /// Where the instrument publishes a measured filter curve, that curve's peak is already in
+        /// it and the caller must not apply the peak again - the flag says which case this is.
+        /// </summary>
+        private static SpectralCurve MultiplyIntoFilterCurve(
+            SpectralCurve filterCurve, SpectralCurve pwvCurve, VisualTelescopeSpec spec,
+            CameraFilter filter, double centreMeters, double widthMeters, out bool peakFolded,
+            out string unappliedReason)
+        {
+            unappliedReason = null;
+            // EXACTLY THE SUPPORT THE PASSBAND ALREADY HAD, which is the whole subtlety here.
+            // SystemResponse integrates over the filter curve's own span when there is one, and
+            // over centre +/- HALF the nominal width when there is not. Handing it a curve that
+            // spans anything else silently redefines the passband: a first version of this used the
+            // 1.5x margin the chromatic sub-bands use, which widened Luminance from 685 to 751 nm,
+            // walked the band into the 820 nm water feature, and made the BLUER filter look more
+            // water-sensitive than the redder one - the opposite of the physics, and caught by the
+            // check that asserts exactly that ordering.
+            double loNm, hiNm;
+            if (filterCurve != null)
+            {
+                loNm = filterCurve.MinWavelengthMeters * 1e9;
+                hiNm = filterCurve.MaxWavelengthMeters * 1e9;
+            }
+            else
+            {
+                loNm = (centreMeters - 0.5 * widthMeters) * 1e9;
+                hiNm = (centreMeters + 0.5 * widthMeters) * 1e9;
+            }
+
+            // WHERE THE PASSBAND RUNS PAST THE TABLE THE TERM CANNOT BE APPLIED, and this used to
+            // return the untouched curve and say nothing - so a VLT FORS2 frame came back
+            // bit-identical to a dry one while its header carried PWV = 20.000 and a PWVSRC. That
+            // is the same lie the orbital path told before it was made to refuse: a water-vapour
+            // provenance card on photons the term never touched. It now reports the reason and the
+            // caller refuses the capture.
+            double tableLoNm = pwvCurve.MinWavelengthMeters * 1e9, tableHiNm = pwvCurve.MaxWavelengthMeters * 1e9;
+            if (loNm < tableLoNm || hiNm > tableHiNm)
+            {
+                peakFolded = false;
+                unappliedReason =
+                    $"The {filter} passband runs {loNm:0.#} to {hiNm:0.#} nm and the water-vapour "
+                  + $"table covers {tableLoNm:0.#} to {tableHiNm:0.#} nm, so the term cannot be "
+                  + "applied to this filter at all. Rebuild the table over a wider range with "
+                  + "tools/fetch_pwv_grid.py, pick a filter inside it, or omit the water series.";
+                return filterCurve;
+            }
+            if (!(hiNm > loNm))
+            {
+                peakFolded = false;
+                unappliedReason = $"The {filter} passband has no width to integrate over.";
+                return filterCurve;
+            }
+
+            const double StepNm = 0.05;
+            int n = Math.Max(16, (int)Math.Ceiling((hiNm - loNm) / StepNm) + 1);
+            var lam = new double[n];
+            var val = new double[n];
+
+            double peak = FilterPeakTransmission(spec, filter);
+            peakFolded = filterCurve == null;
+
+            for (int i = 0; i < n; i++)
+            {
+                double nm = loNm + (hiNm - loNm) * i / (n - 1);
+                double m = nm * 1e-9;
+                double f = filterCurve != null ? filterCurve.At(m) : peak;
+                lam[i] = nm;
+                val[i] = Math.Clamp(f * pwvCurve.At(m), 0.0, 1.0);
+            }
+            return new SpectralCurve(lam, val);
+        }
+
+        /// <summary>The instrument's own measured curve for this filter, or null where it publishes none.</summary>
+        public static SpectralCurve FilterTransmissionCurve(VisualTelescopeSpec spec, CameraFilter filter) =>
+            filter switch
+            {
+                CameraFilter.Red => spec.RedFilterCurve,
+                CameraFilter.Green => spec.GreenFilterCurve,
+                CameraFilter.Blue => spec.BlueFilterCurve,
+                _ => null,
+            };
+
+        /// <summary>
+        /// The wavelength span a passband is actually integrated over, nanometres - the filter's own
+        /// measured support where there is one, and centre +/- half the nominal width where there is
+        /// not. Public because it is the span the water term is applied across, and a panel that
+        /// shows the water without showing the band it was integrated over is showing half a number.
+        /// </summary>
+        /// <summary>
+        /// The instant an UNBOOKED capture will actually be taken at: the highest the field gets
+        /// during astronomical night in the next 25 hours.
+        ///
+        /// PUBLISHED SO THE INTERFACE STOPS GUESSING IT. The capture panel needs this instant to
+        /// price the water column and the air column the frame will really see, and it was using
+        /// the FORECAST's best cell instead - which grades thirty nights and routinely lands weeks
+        /// away. Measured on one field: the forecast's best cell sat 26 nights out at airmass 1.54
+        /// while the frame was taken that same night at 1.83, so the panel under-quoted the water
+        /// loss by 18 % while captioning it "the moment the server will schedule". Two searches
+        /// cannot both be the schedule; this is the one the frame uses.
+        /// </summary>
+        public static void ScheduleUnbooked(double fromUt, double raDeg, double decDeg,
+                                            ObservingSites.Site site, ImagingObserverContext siteCtx,
+                                            out double bestUt, out double bestAltitudeDeg)
+        {
+            bestUt = double.NaN;
+            bestAltitudeDeg = double.NegativeInfinity;
+            for (double t = fromUt; t <= fromUt + 25.0 * 3600.0; t += 300.0)
+            {
+                double mer = SkyCoordinates.ComputeLocalMeridianRaDeg(
+                    t, ObservingSites.EarthSiderealDaySeconds, ObservingSites.GmstAtJ2000Deg,
+                    site.LongitudeDeg);
+                double sunAltAtT = SkyCoordinates.EquatorialToHorizontal(
+                    ImagingObservingConditions.ComputeSunRaDeg(t, siteCtx), 0.0,
+                    mer, site.LatitudeDeg).AltitudeDeg;
+                if (sunAltAtT >= ImagingObservingConditions.TwilightSunAltitudeDeg) continue;
+                SkyCoordinates.PrecessFromJ2000(raDeg, decDeg,
+                    t * SkyCoordinates.JulianCenturiesPerSecond,
+                    out double raAtT, out double decAtT);
+                double alt = SkyCoordinates.EquatorialToHorizontal(
+                    raAtT, decAtT, mer, site.LatitudeDeg).AltitudeDeg;
+                if (alt > bestAltitudeDeg) { bestAltitudeDeg = alt; bestUt = t; }
+            }
+        }
+
+        /// <summary>
+        /// Turn a requested band NAME into something the rest of this pipeline can use.
+        ///
+        /// THE ONE PLACE THE LIMIT USED TO LIVE. Every endpoint parsed the name straight into
+        /// CameraFilter, a fixed enum of ten amateur wheel positions, so an instrument could never
+        /// offer an eleventh band and an observer's own bands - g' r' i' z' I+z' Y YJ J Hs - had to
+        /// be mounted in slots whose names then said something false about them. Nothing physical
+        /// makes ten the right number.
+        ///
+        /// HOW THE LIMIT IS REMOVED WITHOUT REWRITING THE PIPELINE. A named band is MATERIALISED
+        /// into one slot of a shallow copy of the spec, for the duration of one request. The copy
+        /// is what the exposure is built from; the roster's own spec is never touched, which
+        /// Verify already asserts for the site path and asserts here too. The Red slot is the one
+        /// used because it is the only one with somewhere to put a measured curve, and the band's
+        /// name is recorded in FilterLabels so the FITS header, the API and the interface all say
+        /// what the observer called it rather than "Red".
+        ///
+        /// Roster instruments carry no Bands and take the enum path unchanged.
+        /// </summary>
+        public static bool TryResolveBand(VisualTelescopeSpec spec, string requested,
+                                          out VisualTelescopeSpec resolved, out CameraFilter slot,
+                                          out string error)
+        {
+            resolved = spec; slot = CameraFilter.Luminance; error = null;
+            string name = (requested ?? "Luminance").Trim();
+
+            VisualTelescopeSpec.Band band = spec?.FindBand(name);
+            if (band != null)
+            {
+                resolved = spec.ShallowCopy();
+                slot = CameraFilter.Red;
+                resolved.RedCentralWavelengthNm = band.CentralWavelengthNm;
+                resolved.RedBandwidthAngstrom = band.BandwidthAngstrom;
+                resolved.RedFilterPeakTransmission = band.PeakTransmission > 0.0 ? band.PeakTransmission : 1.0;
+                resolved.RedFilterCurve = band.Curve;
+                resolved.AvailableFilters = new[] { CameraFilter.Red };
+                resolved.FilterLabels = new Dictionary<CameraFilter, string> { [CameraFilter.Red] = band.Name };
+                return true;
+            }
+
+            if (Enum.TryParse(name, true, out CameraFilter parsed))
+            {
+                // A band list is AUTHORITATIVE when it exists. An instrument that declares its own
+                // bands does not also silently answer to the enum's, because "Green" on a DUET arm
+                // would then integrate a passband nobody defined.
+                if (spec?.Bands != null && spec.Bands.Count > 0)
+                {
+                    error = $"'{name}' is not a band on this instrument. It carries: "
+                          + string.Join(", ", spec.BandNames()) + ".";
+                    return false;
+                }
+                slot = parsed;
+                return true;
+            }
+
+            error = $"'{name}' is not a band on this instrument. It carries: "
+                  + string.Join(", ", spec?.BandNames() ?? Enum.GetNames(typeof(CameraFilter)))
+                  + ".";
+            return false;
+        }
+
+        public static (double FromNm, double ToNm) PassbandSpanNm(VisualTelescopeSpec spec, CameraFilter filter)
+        {
+            SpectralCurve curve = FilterTransmissionCurve(spec, filter);
+            if (curve != null)
+                return (curve.MinWavelengthMeters * 1e9, curve.MaxWavelengthMeters * 1e9);
+            double centre = FilterCentralWavelengthMeters(spec, filter);
+            double width = FilterBandwidthAngstrom(spec, filter) * 1e-10;
+            return ((centre - 0.5 * width) * 1e9, (centre + 0.5 * width) * 1e9);
         }
 
         public static double FilterCentralWavelengthMeters(VisualTelescopeSpec spec, CameraFilter filter)
@@ -1655,7 +2533,7 @@ namespace ExoStudio.Simulation
             }
         }
 
-        private static double FilterPeakTransmission(VisualTelescopeSpec spec, CameraFilter filter)
+        public static double FilterPeakTransmission(VisualTelescopeSpec spec, CameraFilter filter)
         {
             double t;
             switch (filter)
@@ -1683,9 +2561,10 @@ namespace ExoStudio.Simulation
     public sealed class DeepSkyData
     {
         /// <summary>
-        /// The all-sky catalogue on its own, which is what the sky chart draws and clicks into.
-        /// The chart is a picture of the whole sky, so it is the wrong place for a deep patch
-        /// over one field; frames go through <see cref="Fields"/> instead.
+        /// The catalogue the sky chart draws and clicks into, which is the shallower of the two:
+        /// the chart streams its file in full on every render, and the deep all-sky catalogue is
+        /// tens of gigabytes. Frames go through <see cref="Fields"/> instead, which reads one
+        /// cone out of the deepest file installed. See StarFieldCatalogs.
         /// </summary>
         public RenderedStarCatalog Stars { get; private set; }
 
@@ -1693,7 +2572,7 @@ namespace ExoStudio.Simulation
         public string StarCatalogPath { get; private set; }
 
         /// <summary>
-        /// Every installed star catalogue and the rule that picks between them for one field.
+        /// Every installed star catalogue and the rule that picks the one a frame is drawn from.
         /// Never null: with nothing installed it simply selects nothing, which is the honestly
         /// empty sky the camera already handles.
         /// </summary>
@@ -1703,6 +2582,12 @@ namespace ExoStudio.Simulation
         public EmissionPatchSet EmissionPatches { get; private set; }
         public GalaxyCatalog Galaxies { get; private set; }
         public GalaxyImageSet GalaxyImages { get; private set; }
+
+        /// <summary>
+        /// The water-vapour transmission grid, or null when it is not installed - in which case the
+        /// term is DECLARED ABSENT rather than approximated, exactly as the sky maps are.
+        /// </summary>
+        public PwvTransmission Pwv { get; private set; }
 
         public readonly List<string> Report = new();
 
@@ -1733,6 +2618,21 @@ namespace ExoStudio.Simulation
                 }
             }
 
+            {
+                PwvTransmission grid = PwvTransmission.TryLoad(dirs, out string pwvNote);
+                if (grid != null)
+                {
+                    Pwv = grid;
+                    Report.Add($"water-vapour transmission: {grid.Path}. {grid.Provenance}");
+                }
+                else
+                {
+                    Report.Add(pwvNote ?? $"water-vapour transmission: not installed "
+                             + $"({PwvTransmission.FileName}); the term is absent from every frame. "
+                             + "Build it with tools/fetch_pwv_grid.py.");
+                }
+            }
+
             Load("GaiaStarCatalog.starcat", "Gaia star field", p =>
             {
                 var c = new RenderedStarCatalog();
@@ -1747,9 +2647,16 @@ namespace ExoStudio.Simulation
                 if (fault != null) Report.Add($"WARNING, Gaia star field: {fault}");
             });
 
-            // Deep patches over individual fields, if any are installed. Loaded after the all-sky
-            // file so the manifest's 'allsky' line has something to attach its depth to.
-            Fields.LoadPatches(dirs);
+            // The deep all-sky catalogue, if it is installed: the whole of Gaia at the depth an
+            // instrument actually reaches, built by tools/build_allsky_catalog.py. Frames are
+            // drawn from it and the chart is not, for the reasons in StarFieldCatalogs. Loaded
+            // after the chart's file, which is what its star sample is checked against.
+            string deepStars = Find("GaiaAllSky.starcat");
+            if (deepStars == null)
+                Report.Add("deep all sky Gaia star field: not installed (GaiaAllSky.starcat); "
+                         + "frames are drawn from the chart's catalogue instead.");
+            else
+                Fields.LoadDeepAllSky(deepStars);
             Report.AddRange(Fields.Report);
             Load("DustMap.dustmap", "SFD dust map", p => { var m = new DustMap(); m.Load(p); Dust = m; });
             Load("HalphaMap.emission", "H-alpha emission map", p => { var m = new EmissionMap(); m.Load(p); Emission = m; });

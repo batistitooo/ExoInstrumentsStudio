@@ -74,6 +74,26 @@ namespace ExoInstruments.Core
         private const int MaxAutoPeriodSteps = 3000;      // caps the O(steps * bins^2/4) search cost
         private const int MinAutoPeriodSteps = 200;
 
+        /// <summary>
+        /// How many different transit events the in-box samples come from: the number of distinct
+        /// cycle indices floor((t - t_box)/P) among samples whose phase falls inside the box.
+        /// </summary>
+        private static int DistinctEpochs(List<FluxSample> samples, double periodSec,
+                                          double boxStartPhase, double boxWidthPhase)
+        {
+            var seen = new HashSet<long>();
+            for (int i = 0; i < samples.Count; i++)
+            {
+                double cycles = samples[i].Ut / periodSec;
+                double phase = cycles % 1.0;
+                if (phase < 0) phase += 1.0;
+                double rel = phase - boxStartPhase;
+                if (rel < 0) rel += 1.0;
+                if (rel < boxWidthPhase) seen.Add((long)Math.Floor(cycles - rel));
+            }
+            return seen.Count;
+        }
+
         public static DetectionResult Detect(
             List<FluxSample> samples,
             double minPeriodDays = 0.3,
@@ -113,6 +133,7 @@ namespace ExoInstruments.Core
 
             double bestSnr = 0.0, bestPeriodDays = 0.0, bestDepth = 0.0, bestPhase = 0.0, bestDurationDays = 0.0;
             int bestNIn = 0;
+            int bestEpochs = 0;
 
             int arraySize = phaseBins > 0 ? phaseBins : MaxPhaseBins;
             var binSum = new double[arraySize];
@@ -165,35 +186,64 @@ namespace ExoInstruments.Core
 
                         if (nIn < MinInTransitPoints) continue;
                         int nOut = samples.Count - nIn;
-                        if (nOut < MinInTransitPoints) continue;
+                        // THE REFERENCE MUST BE THE MAJORITY STATE. A transit is the minority
+                        // state of the star: at a 15 % duty and even sampling the out-of-transit
+                        // sample outnumbers the box six to one. A box that holds most of the points
+                        // is not a transit, it is the observing window folded onto itself: through
+                        // a diurnal window folded at 1.00 or 0.50 d every night lands in one phase
+                        // band, a box a few bins wide swallows 228 of 240 samples, and the twelve
+                        // points left at the band's edges become the "out-of-transit" reference.
+                        if (nOut < nIn) continue;
 
                         double meanIn = sumIn / nIn;
                         double meanOut = (totalSum - sumIn) / nOut;
                         double depth = meanOut - meanIn;
                         if (depth <= 0) continue;
 
-                        double sigma = stdFlux / Math.Sqrt(nIn);
+                        // The depth is a DIFFERENCE OF TWO MEANS and carries both their errors,
+                        // sigma^2 (1/nIn + 1/nOut). Dividing by stdFlux/sqrt(nIn) alone treated the
+                        // reference as exact; with 228 points in the box and 12 outside it, the
+                        // reference's scatter was 4.4 times the box's and the S/N came out 4.5
+                        // times too high, which is how three 500 to 1495 ppm planets were
+                        // "recovered" from 216 samples and none of them from 4320. For a genuine
+                        // transit nOut >> nIn and the correction is a few percent.
+                        double sigma = stdFlux * Math.Sqrt(1.0 / nIn + 1.0 / nOut);
                         double snr = depth / sigma;
 
                         if (snr > bestSnr)
                         {
+                            // AT LEAST TWO DISTINCT TRANSITS, checked only for a would-be best so it
+                            // costs nothing in the hot loop, and REPORTED so a yield map can be
+                            // audited. This was first tried as the cure for the window-function
+                            // detections above and it was not one: through a diurnal window folded at
+                            // one day the box holds every night, so the in-box points come from
+                            // dozens of epochs and the count passes. The cure was the majority rule
+                            // and the two-mean sigma above; this guard stays for the case it does
+                            // catch, a single deep event masquerading as a periodic one.
+                            int epochs = DistinctEpochs(samples, periodSec, (double)start / binsForPeriod,
+                                                        (double)width / binsForPeriod);
+                            if (epochs < 2) continue;
+
                             bestSnr = snr;
                             bestPeriodDays = periodSec / 86400.0;
                             bestDepth = depth;
                             bestPhase = (double)start / binsForPeriod;
                             bestDurationDays = ((double)width / binsForPeriod) * bestPeriodDays;
                             bestNIn = nIn;
+                            bestEpochs = epochs;
                         }
                     }
                 }
             }
 
             double baselineDays = (samples[samples.Count - 1].Ut - samples[0].Ut) / 86400.0;
-            double depthUncertaintyPpm = bestNIn > 0 ? (stdFlux / Math.Sqrt(bestNIn)) * 1_000_000.0 : 0.0;
+            double depthUncertaintyPpm = bestNIn > 0
+                ? stdFlux * Math.Sqrt(1.0 / bestNIn + 1.0 / (samples.Count - bestNIn)) * 1_000_000.0 : 0.0;
 
             return new DetectionResult
             {
                 Detected = bestSnr >= snrThreshold,
+                DistinctEpochs = bestEpochs,
                 InsufficientData = false,
                 BestPeriodDays = bestPeriodDays,
                 BestDepthPpm = bestDepth * 1_000_000.0,

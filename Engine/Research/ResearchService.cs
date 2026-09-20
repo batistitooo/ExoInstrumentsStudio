@@ -70,8 +70,19 @@ namespace ExoStudio.Research
 
         public sealed class Request
         {
-            public double RaDeg { get; set; }
-            public double DecDeg { get; set; }
+            /// <summary>
+            /// The star's position, or NaN when none was given.
+            ///
+            /// NOT ZERO. These defaulted to 0 before, and 0, 0 is a point on the sky: a search
+            /// sent without coordinates queried the archive at the vernal point on the equator,
+            /// cross matched nothing because the service tested for the pair being exactly zero,
+            /// saved RA 0, Dec 0 as the target, and the prepared submission then named that as
+            /// where the star is. A position that was not given is now not a number, so every
+            /// reader has to say what it does without one instead of quietly using the origin.
+            /// The record writes it as null; see HasPosition.
+            /// </summary>
+            public double RaDeg { get; set; } = double.NaN;
+            public double DecDeg { get; set; } = double.NaN;
             public string Label { get; set; }
             public double MinPeriodDays { get; set; } = 0.5;
             public double MaxPeriodDays { get; set; } = 12.0;
@@ -106,6 +117,9 @@ namespace ExoStudio.Research
             /// discovery is realistically still waiting.
             /// </summary>
             public bool SingleTransits { get; set; } = true;
+
+            /// <summary>Whether a position was given at all. Both coordinates, or none.</summary>
+            public bool HasPosition => !double.IsNaN(RaDeg) && !double.IsNaN(DecDeg);
         }
 
         public async Task<object> RunAsync(Request request)
@@ -122,6 +136,19 @@ namespace ExoStudio.Research
             // constructed and checked, which costs about a second; without one there is no choice
             // but to ask the observation catalogue what is at this position, which costs minutes.
             bool constructed = request.Tic > 0;
+            if (!constructed && !request.HasPosition)
+            {
+                // The route refuses this before it gets here; a caller inside the process gets
+                // the same answer rather than a positional query at NaN, which the archive
+                // would answer with an empty list dressed up as "no light curve here".
+                return new
+                {
+                    ok = false,
+                    stage = "request",
+                    message = "a right ascension and declination, or a TIC number, are needed "
+                            + "before anything can be looked up. Nothing was searched.",
+                };
+            }
             List<MastClient.LightCurveProduct> products = constructed
                 ? await hlsp.FindAsync(request.Tic)
                 : await mast.FindLightCurvesAsync(request.RaDeg, request.DecDeg);
@@ -145,18 +172,9 @@ namespace ExoStudio.Research
                 : $"the archive lists {mast.LastObservationCount} observation(s) at this position; "
                 + $"opened the first that carried a light curve [{listing}]");
 
-            // ONE SECTOR, OR ALL OF THEM. Asking for a named sector, or coming in by position
-            // rather than by catalogue number, still opens a single file. The fast route opens
-            // every sector the star has and joins them, because that is the difference between
-            // one chance in seventeen of an isolated transit being in the data and seventeen.
-            List<MastClient.LightCurveProduct> opening;
-            if (request.Sector > 0)
-                opening = new List<MastClient.LightCurveProduct>
-                    { products.FirstOrDefault(p => p.Sector == request.Sector) ?? products[0] };
-            else if (!constructed)
-                opening = new List<MastClient.LightCurveProduct> { products[0] };
-            else
-                opening = (request.MaxSectors > 0 ? products.Take(request.MaxSectors) : products).ToList();
+            List<MastClient.LightCurveProduct> opening =
+                ChooseSectors(products, request, constructed, out SectorRefusal noSuchSector);
+            if (noSuchSector != null) return noSuchSector;
 
             MastClient.LightCurveProduct chosen = opening[0];
             log.Add($"using {(chosen.IsMissionProduct ? "the mission product" : chosen.Provider)}, "
@@ -269,8 +287,26 @@ namespace ExoStudio.Research
                     log.Add($"single dip at day {e.CentreTimeDays - flat.TimeDays[0]:0.##}, "
                           + $"{e.DepthPpm:0} ppm over {e.DurationHours:0.#} h, SNR {e.Snr:0.#}");
 
-                string emptyId = Save(request, chosen, raw, flat, found, null, null, log, alone,
-                                      isolatedCurveForEmpty, opening.Select(p => p.Sector));
+                // CROSS MATCHED WHEN THERE IS SOMETHING TO MATCH. A run that found only isolated
+                // events used to save no register check at all, so its record could not say
+                // whether the one dip sits on a star with a published planet, and readiness had
+                // nothing to refuse on. The register is held in memory, so this costs nothing
+                // that shows in the log.
+                KnownObjects.Report emptyRegistry = null;
+                if (alone.Count > 0 && request.HasPosition)
+                {
+                    emptyRegistry = await RegistryAtAsync(request.RaDeg, request.DecDeg, 0);
+                    foreach (KnownObjects.Match m in emptyRegistry.Matches)
+                        log.Add($"already known: {m.Name} in {m.Register}, {m.SeparationArcsec:0.#} arcsec away");
+                    foreach (string u in emptyRegistry.Unavailable) log.Add("could not check " + u);
+                    log.Add($"cross matched against the registers held in memory [{Took()}]");
+                }
+                else if (alone.Count > 0)
+                    log.Add("no position given, so nothing was cross matched: this run cannot tell you "
+                          + "whether what it found is already known.");
+
+                string emptyId = Save(request, chosen, raw, flat, found, null, emptyRegistry, log, steps,
+                                      alone, isolatedCurveForEmpty, opening.Select(p => p.Sector));
                 return new
                 {
                     ok = true, detected = false, id = emptyId, log,
@@ -284,6 +320,16 @@ namespace ExoStudio.Research
                 // a stretch of curve that could not contain it.
                     isolatedSeries = Series(isolatedCurveForEmpty ?? flat),
                     singleTransits = alone.Select(Describe),
+                    known = emptyRegistry == null ? null : new
+                    {
+                        anything = emptyRegistry.AnythingKnown,
+                        matches = emptyRegistry.Matches.Select(m => new
+                        {
+                            register = m.Register, name = m.Name, periodDays = m.PeriodDays,
+                            separationArcsec = m.SeparationArcsec, periodRatio = m.PeriodRatio, note = m.Note,
+                        }),
+                        unavailable = emptyRegistry.Unavailable,
+                    },
                     message = alone.Count > 0
                         ? "No repeating transit, but an isolated dip is present. That is the interesting "
                         + "case rather than the disappointing one: a single event is what a long period "
@@ -310,19 +356,31 @@ namespace ExoStudio.Research
 
             TransitSearchPipeline.Vetting vetting = TransitSearchPipeline.Vet(flat, found);
             log.Add($"single transit search [{Took()}]");
-            KnownObjects.Report registry = await RegistryAtAsync(
-                request.RaDeg, request.DecDeg, found.BestPeriodDays);
-            log.Add($"cross matched against the registers held in memory [{Took()}]");
+
+            // A TIC number reaches here without a position, and a cross match at NaN would come
+            // back empty and be read as clear. Saved as null instead, which readiness refuses.
+            KnownObjects.Report registry = null;
+            if (request.HasPosition)
+            {
+                registry = await RegistryAtAsync(request.RaDeg, request.DecDeg, found.BestPeriodDays);
+                log.Add($"cross matched against the registers held in memory [{Took()}]");
+            }
+            else
+                log.Add("no position given, so nothing was cross matched: this run cannot tell you "
+                      + "whether what it found is already known.");
 
             log.Add($"candidate at {found.BestPeriodDays:0.#####} d, {found.BestDepthPpm:0} ppm, "
                   + $"SNR {found.Snr:0.#}");
             foreach (string c in vetting.Concerns) log.Add("vetting: " + c);
-            foreach (KnownObjects.Match m in registry.Matches)
-                log.Add($"already known: {m.Name} in {m.Register}, {m.SeparationArcsec:0.#} arcsec away"
-                      + (m.PeriodDays > 0 ? $", period {m.PeriodDays:0.#####} d (ratio {m.PeriodRatio:0.###})" : ""));
-            foreach (string u in registry.Unavailable) log.Add("could not check " + u);
+            if (registry != null)
+            {
+                foreach (KnownObjects.Match m in registry.Matches)
+                    log.Add($"already known: {m.Name} in {m.Register}, {m.SeparationArcsec:0.#} arcsec away"
+                          + (m.PeriodDays > 0 ? $", period {m.PeriodDays:0.#####} d (ratio {m.PeriodRatio:0.###})" : ""));
+                foreach (string u in registry.Unavailable) log.Add("could not check " + u);
+            }
 
-            string id = Save(request, chosen, raw, flat, found, vetting, registry, log, singles,
+            string id = Save(request, chosen, raw, flat, found, vetting, registry, log, steps, singles,
                              isolatedCurve, opening.Select(p => p.Sector));
 
             return new
@@ -609,6 +667,7 @@ namespace ExoStudio.Research
             redNoiseFactor = e.RedNoiseFactor,
             brighteningSnr = e.BrighteningSnr,
             centroidShiftPixels = e.CentroidShiftPixels,
+            centroidScatterPixels = e.CentroidScatterPixels,
             concerns = e.Concerns,
             passed = e.Concerns.Count == 0,
         };
@@ -640,15 +699,12 @@ namespace ExoStudio.Research
         private string Save(Request request, MastClient.LightCurveProduct product,
                             TransitSearchPipeline.LightCurve raw, TransitSearchPipeline.LightCurve flat,
                             DetectionResult found, TransitSearchPipeline.Vetting vetting,
-                            KnownObjects.Report registry, List<string> log,
+                            KnownObjects.Report registry, List<string> log, int periodSteps,
                             List<SingleTransitSearch.Event> singles = null,
                             TransitSearchPipeline.LightCurve isolated = null,
                             IEnumerable<int> sectors = null)
         {
-            string id = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)
-                      + "-" + Math.Abs(HashCode.Combine(request.RaDeg, request.DecDeg)).ToString("x8");
-
-            var record = new
+            object Record(string id) => new
             {
                 id,
                 recordedUtc = DateTime.UtcNow.ToString("o"),
@@ -666,6 +722,9 @@ namespace ExoStudio.Research
                 {
                     request.MinPeriodDays, request.MaxPeriodDays,
                     request.DetrendWindowDays, request.SnrThreshold,
+                    // The grid is a parameter of the result as much as the period range is: the
+                    // same file folded on 3000 trials and on 25,000 does not find the same box.
+                    PeriodSteps = periodSteps,
                     detrend = "running median",
                     detector = "Core/TransitDetector, box least squares, Kovacs et al. 2002",
                 },
@@ -693,10 +752,11 @@ namespace ExoStudio.Research
                 vetting,
                 singleTransits = singles,
                 known = registry?.Matches,
+                // Which registers did NOT answer, kept beside the matches. An empty match list
+                // from a register that was unreachable looks exactly like a clear one otherwise.
+                knownUnavailable = registry?.Unavailable,
                 log,
             };
-
-            string path = Path.Combine(resultsDir, id + ".json");
 
             // INCLUDE FIELDS. Vetting and DetectionResult expose their numbers as public fields,
             // and System.Text.Json ignores fields unless told otherwise, so without this the
@@ -705,8 +765,132 @@ namespace ExoStudio.Research
             // most important columns is worse than one that fails to write.
             var options = new JsonSerializerOptions { WriteIndented = true, IncludeFields = true };
             options.Converters.Add(new NanAsNullConverter());
-            File.WriteAllText(path, JsonSerializer.Serialize(record, options));
-            return id;
+
+            // THE ID IS UNIQUE BY CONSTRUCTION, NOT BY THE CLOCK MOVING. It used to be the time
+            // to the second plus a hash of the position, and a sweep runs four stars at once
+            // while a person can click twice: two runs of one star inside one second produced one
+            // id, and the second File.WriteAllText silently replaced the first record. The time
+            // is kept because a directory listing sorted by name is a timeline; the number after
+            // it is what makes the id unique inside this process, and opening the file with
+            // CreateNew is what makes it unique against another engine sharing the directory,
+            // because that fails instead of overwriting.
+            string stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+            string position = PositionToken(request.RaDeg, request.DecDeg);
+            lock (recordLock)
+            {
+                while (true)
+                {
+                    string id = $"{stamp}-{position}-{++runSequence:x4}";
+                    string path = RecordPath(id);
+                    string json = JsonSerializer.Serialize(Record(id), options);
+                    try
+                    {
+                        using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                        using var writer = new StreamWriter(stream, new UTF8Encoding(false));
+                        writer.Write(json);
+                        return id;
+                    }
+                    catch (IOException) when (File.Exists(path))
+                    {
+                        // Taken by another process in the same second. The next number is free.
+                    }
+                }
+            }
+        }
+
+        private readonly object recordLock = new();
+        private long runSequence;
+
+        private string RecordPath(string id)
+            => Path.Combine(resultsDir, Path.GetFileName(id ?? string.Empty) + ".json");
+
+        /// <summary>
+        /// A short stable token for a position, so the records of one star share a fragment of
+        /// their names and can be picked out of a directory by eye.
+        ///
+        /// HashCode.Combine was used before, and it is seeded afresh in every process, so the
+        /// same star got a different token after every restart: it never identified a position
+        /// across two runs of the engine, it only looked as if it did. FNV-1a over the coordinates
+        /// rounded to a milliarcsecond is the same everywhere.
+        /// </summary>
+        internal static string PositionToken(double raDeg, double decDeg)
+        {
+            // No position is not a position: rounding NaN to a long is whatever the platform
+            // makes of it, and a file with no coordinates should not share a name with a star.
+            if (double.IsNaN(raDeg) || double.IsNaN(decDeg)) return "nowhere";
+            uint h = 2166136261;
+            foreach (long v in new[] { (long)Math.Round(raDeg * 3.6e6), (long)Math.Round(decDeg * 3.6e6) })
+                for (int i = 0; i < 8; i++) { h ^= (byte)(v >> (8 * i)); h *= 16777619; }
+            return h.ToString("x8");
+        }
+
+        /// <summary>
+        /// The answer to a request for a sector the star was not observed in: nothing searched,
+        /// and the sectors that exist so the caller can ask again.
+        ///
+        /// A CLASS RATHER THAN AN ANONYMOUS OBJECT so the route can tell it apart from a run and
+        /// answer 400 with it. As an anonymous object it went out as 200 with ok false, the same
+        /// shape as a star the archive never observed, and a client reading the status code saw
+        /// a search that succeeded. The property names are fixed on the wire because the route
+        /// serialises in camel case and the harness does not.
+        /// </summary>
+        public sealed class SectorRefusal
+        {
+            [System.Text.Json.Serialization.JsonPropertyName("ok")]
+            public bool Ok => false;
+            [System.Text.Json.Serialization.JsonPropertyName("stage")]
+            public string Stage => "archive";
+            [System.Text.Json.Serialization.JsonPropertyName("error")]
+            public string Error => Message;
+            [System.Text.Json.Serialization.JsonPropertyName("message")]
+            public string Message { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("requestedSector")]
+            public int RequestedSector { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("sectors")]
+            public int[] Sectors { get; set; }
+        }
+
+        /// <summary>
+        /// Which of the archive's products to open, or why none of them can be.
+        ///
+        /// ONE SECTOR, OR ALL OF THEM. Asking for a named sector, or coming in by position rather
+        /// than by catalogue number, still opens a single file. The fast route opens every sector
+        /// the star has and joins them, because that is the difference between one chance in
+        /// seventeen of an isolated transit being in the data and seventeen.
+        ///
+        /// A SECTOR THAT DOES NOT EXIST IS REFUSED, NOT REPLACED. This used to fall back to the
+        /// first product when the requested sector was absent, so asking for sector 40 of a star
+        /// observed in 3, 7 and 11 quietly searched sector 3, recorded it as the run, and the
+        /// record's data block was the only place the substitution could be seen. The curve route
+        /// already answered "has no sector N; it has ..." to the same request; now both do, with
+        /// the list of what exists so the caller can ask again.
+        /// </summary>
+        internal static List<MastClient.LightCurveProduct> ChooseSectors(
+            List<MastClient.LightCurveProduct> products, Request request, bool constructed,
+            out SectorRefusal refusal)
+        {
+            refusal = null;
+            if (request.Sector > 0)
+            {
+                MastClient.LightCurveProduct named = products.FirstOrDefault(p => p.Sector == request.Sector);
+                if (named == null)
+                {
+                    int[] have = products.Select(p => p.Sector).Distinct().OrderBy(x => x).ToArray();
+                    refusal = new SectorRefusal
+                    {
+                        Message = (request.Tic > 0 ? $"TIC {request.Tic}" : "this position")
+                                + $" has no sector {request.Sector}; it has {string.Join(", ", have)}. "
+                                + "Nothing was searched: searching a different sector than the one "
+                                + "asked for and recording it as this run is worse than stopping.",
+                        RequestedSector = request.Sector,
+                        Sectors = have,
+                    };
+                    return null;
+                }
+                return new List<MastClient.LightCurveProduct> { named };
+            }
+            if (!constructed) return new List<MastClient.LightCurveProduct> { products[0] };
+            return (request.MaxSectors > 0 ? products.Take(request.MaxSectors) : products).ToList();
         }
 
 
@@ -718,13 +902,39 @@ namespace ExoStudio.Research
         /// anything is that somebody looked. So the verdict is stored as its own part of the
         /// record, with who made it and when, and nothing can be submitted without one.
         /// </summary>
-        public bool Review(string id, string verdict, string note, string reviewer)
-        {
-            string path = Path.Combine(resultsDir, Path.GetFileName(id) + ".json");
-            if (!File.Exists(path)) return false;
+        public enum ReviewProblem { None, UnknownRun, BadVerdict }
 
-            var allowed = new[] { "real", "unsure", "noise", "systematic", "eclipsing-binary" };
-            if (!allowed.Contains(verdict)) return false;
+        /// <summary>
+        /// What Review did, or why it did not. Two different failures used to come back as one
+        /// bare false, so the route answered 400 with one message for a run that does not exist
+        /// and for a verdict that is not a verdict, and the caller could tell neither which had
+        /// happened nor whether to retry.
+        /// </summary>
+        public sealed class ReviewOutcome
+        {
+            public ReviewProblem Problem;
+            public string Message;
+            public bool Ok => Problem == ReviewProblem.None;
+        }
+
+        public static readonly string[] Verdicts = { "real", "unsure", "noise", "systematic", "eclipsing-binary" };
+
+        public ReviewOutcome TryReview(string id, string verdict, string note, string reviewer)
+        {
+            string path = RecordPath(id);
+            if (!File.Exists(path))
+                return new ReviewOutcome
+                {
+                    Problem = ReviewProblem.UnknownRun,
+                    Message = $"no run is recorded under '{id}'",
+                };
+
+            if (!Verdicts.Contains(verdict))
+                return new ReviewOutcome
+                {
+                    Problem = ReviewProblem.BadVerdict,
+                    Message = $"'{verdict}' is not a verdict; one of {string.Join(", ", Verdicts)} is needed",
+                };
 
             using JsonDocument d = JsonDocument.Parse(File.ReadAllText(path));
             var root = new Dictionary<string, object>();
@@ -742,8 +952,16 @@ namespace ExoStudio.Research
             };
             File.WriteAllText(path, JsonSerializer.Serialize(root,
                 new JsonSerializerOptions { WriteIndented = true, IncludeFields = true }));
-            return true;
+            return new ReviewOutcome { Problem = ReviewProblem.None, Message = $"recorded '{verdict}' on {id}" };
         }
+
+        /// <summary>
+        /// The same, without the reason. Kept only so the route compiles until it reads
+        /// TryReview (handoff_research_round1: the review route); it is the bare false that made
+        /// an unknown run and a bad verdict one message, and nothing new should call it.
+        /// </summary>
+        public bool Review(string id, string verdict, string note, string reviewer)
+            => TryReview(id, verdict, note, reviewer).Ok;
 
         /// <summary>Whether a run is fit to submit, and the CTOI file if it is.</summary>
         public (CtoiSubmission.Readiness readiness, string file) Ctoi(string id, string submitter)
@@ -773,14 +991,27 @@ namespace ExoStudio.Research
         {
             var clock = System.Diagnostics.Stopwatch.StartNew();
             var log = new List<string>();
+            double mark = 0;
+            string Took() { double t = clock.Elapsed.TotalSeconds - mark; mark = clock.Elapsed.TotalSeconds; return $"{t:0.0} s"; }
             log.Add($"reading {Path.GetFileName(path)} from disk; no archive query");
 
+            // THE SAME SEARCH AS THE ARCHIVE ROUTE, CALL FOR CALL. This path used to fold on the
+            // detector's own 3000 step grid and run the isolated search on the fold's detrended
+            // curve with no stellar radius, while RunAsync sized the grid to the baseline and read
+            // the unprocessed flux flattened on five days. The same file therefore gave different
+            // candidates depending on which button was pressed, and the record could not say
+            // which search it was. Every call below is the one RunAsync makes for a single file.
             TransitSearchPipeline.LightCurve raw = TransitSearchPipeline.Load(path);
             log.Add($"{raw.Count:N0} usable cadences over {raw.BaselineDays:0.0} days at "
                   + $"{raw.CadenceMinutes:0.#} minutes, scatter {raw.ScatterPpm:0} ppm");
+            var unprocessed = new List<TransitSearchPipeline.LightCurve>();
+            try { unprocessed.Add(TransitSearchPipeline.Load(path, preferUnprocessed: true)); }
+            catch { /* the processed copy is still searchable */ }
 
             TransitSearchPipeline.LightCurve flat =
                 TransitSearchPipeline.Detrend(raw, request.DetrendWindowDays);
+            log.Add($"detrended on a {request.DetrendWindowDays:0.##} day running median; "
+                  + $"scatter {flat.ScatterPpm:0} ppm afterwards [{Took()}]");
             // Binned for the fold only; the isolated event search below still reads every cadence.
             double binMinutes = TransitSearchPipeline.BinMinutesFor(request.MinPeriodDays);
             TransitSearchPipeline.LightCurve folded = TransitSearchPipeline.Bin(flat, binMinutes);
@@ -790,11 +1021,16 @@ namespace ExoStudio.Research
                       + "still reads every cadence");
 
             List<FluxSample> samples = TransitSearchPipeline.ToSamples(folded);
+            int steps = PeriodSteps(raw.BaselineDays, request.MinPeriodDays, request.MaxPeriodDays);
             DetectionResult found = TransitDetector.Detect(
                 samples, request.MinPeriodDays, request.MaxPeriodDays,
-                snrThreshold: request.SnrThreshold);
+                periodSteps: steps, snrThreshold: request.SnrThreshold);
+            log.Add($"box least squares over {request.MinPeriodDays:0.#} to {request.MaxPeriodDays:0.#} days, "
+                  + $"{steps:N0} trial periods for a {raw.BaselineDays:0.#} day baseline [{Took()}]");
+
+            TransitSearchPipeline.LightCurve isolated = IsolatedSearchCurve(unprocessed, flat, log, Took);
             List<SingleTransitSearch.Event> singles = request.SingleTransits
-                ? SingleTransitSearch.Find(flat)
+                ? SingleTransitSearch.Find(isolated, stellarRadiusSolar: request.StellarRadiusSolar)
                 : new List<SingleTransitSearch.Event>();
 
             TransitSearchPipeline.Vetting vetting =
@@ -804,7 +1040,7 @@ namespace ExoStudio.Research
             // when MAST does not. When it does not either, that is reported rather than hidden:
             // a candidate nobody could check against the registers is not a candidate yet.
             KnownObjects.Report registry = null;
-            if (request.RaDeg != 0 || request.DecDeg != 0)
+            if (request.HasPosition)
             {
                 registry = await RegistryAtAsync(request.RaDeg, request.DecDeg,
                                                    found.Detected ? found.BestPeriodDays : 0);
@@ -827,7 +1063,7 @@ namespace ExoStudio.Research
                 Sector = raw.Sector,
                 Provider = "local file",
             };
-            string id = Save(request, product, raw, flat, found, vetting, registry, log, singles);
+            string id = Save(request, product, raw, flat, found, vetting, registry, log, steps, singles, isolated);
 
             return new
             {
@@ -837,9 +1073,9 @@ namespace ExoStudio.Research
                 log,
                 lightCurve = Describe(raw, flat),
                 series = Series(flat),
-                // One file, so the isolated search reads the same curve as the fold and there is
-                // no second version to offer.
-                isolatedSeries = Series(flat),
+                // The curve the isolated events were found in, which is the unprocessed flux on a
+                // five day median and not the fold's curve; see IsolatedSearchCurve.
+                isolatedSeries = Series(isolated ?? flat),
                 singleTransits = singles.Select(Describe),
                 candidate = found.Detected ? new
                 {
@@ -882,9 +1118,18 @@ namespace ExoStudio.Research
         public IEnumerable<object> CachedCurves(string cacheDir)
         {
             if (!Directory.Exists(cacheDir)) yield break;
-            foreach (string f in Directory.GetFiles(cacheDir, "*.fits").OrderBy(f => f))
+            foreach (string f in OwnFiles(cacheDir, "*.fits").OrderBy(f => f))
                 yield return new { file = Path.GetFileName(f), path = f, bytes = new FileInfo(f).Length };
         }
+
+        /// <summary>
+        /// The files in a directory, without the ._ files macOS writes beside each one on a drive that
+        /// cannot store extended attributes - exFAT, the format a drive shared with Windows has to use.
+        /// A ._run.json is binary: JsonDocument.Parse throws on it, and nothing between it and the
+        /// caller catches, so one of them takes the whole listing down.
+        /// </summary>
+        private static IEnumerable<string> OwnFiles(string dir, string pattern) =>
+            Directory.GetFiles(dir, pattern).Where(p => !Path.GetFileName(p).StartsWith("._", StringComparison.Ordinal));
 
         // ------------------------------------------------------------------ sweeps
         //
@@ -956,6 +1201,43 @@ namespace ExoStudio.Research
         }
 
         private readonly Dictionary<string, Sweep> sweeps = new();
+        private long sweepSequence;
+
+        /// <summary>
+        /// An identifier no other sweep holds, claimed on disk before it is handed out.
+        ///
+        /// A SECOND ON THE CLOCK IS NOT AN IDENTITY. The id used to be the start time to the
+        /// second, so two sweeps started within one second, which two clicks or two tabs manage
+        /// easily, were one id: the dictionary kept whichever registered last, the file on disk
+        /// belonged to whichever persisted last, and the page polling the first sweep read the
+        /// second's progress. The time is kept for the eye; the number after it is what makes the
+        /// id unique inside this process, and the empty file created here is what makes it unique
+        /// against another engine sharing the directory. Called under the sweeps lock.
+        /// </summary>
+        private string ClaimSweepId()
+        {
+            string stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+            try { Directory.CreateDirectory(Path.Combine(resultsDir, "sweeps")); } catch { }
+            while (true)
+            {
+                string id = $"{stamp}-{++sweepSequence:x4}";
+                if (sweeps.ContainsKey(id)) continue;
+                string path = SweepPath(id);
+                try
+                {
+                    using (new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+                    return id;
+                }
+                catch (IOException)
+                {
+                    // Held by another process: the next number is free. Any other reason the
+                    // file could not be made is the case PersistSweep already tolerates, a sweep
+                    // that cannot be written is still a sweep worth running.
+                    if (File.Exists(path)) continue;
+                    return id;
+                }
+            }
+        }
 
         /// <summary>
         /// Sweeps kept on disk as well as in memory.
@@ -1030,11 +1312,14 @@ namespace ExoStudio.Research
         {
             var sweep = new Sweep
             {
-                Id = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture),
                 RaDeg = ra, DecDeg = dec, RadiusDeg = radius,
                 MinSectors = minSectors, Limit = limit,
             };
-            lock (sweeps) sweeps[sweep.Id] = sweep;
+            lock (sweeps)
+            {
+                sweep.Id = ClaimSweepId();
+                sweeps[sweep.Id] = sweep;
+            }
             PersistSweep(sweep);
 
             _ = Task.Run(async () =>
@@ -1284,7 +1569,7 @@ namespace ExoStudio.Research
             return covered;
         }
 
-        private static int PeriodSteps(double baselineDays, double minPeriodDays, double maxPeriodDays)
+        internal static int PeriodSteps(double baselineDays, double minPeriodDays, double maxPeriodDays)
         {
             if (baselineDays <= 0 || minPeriodDays <= 0 || maxPeriodDays <= minPeriodDays) return 0;
             const double duty = 0.02;          // a transit is a couple of percent of an orbit
@@ -1380,8 +1665,7 @@ namespace ExoStudio.Research
 
         public IEnumerable<object> List()
         {
-            foreach (string path in Directory.GetFiles(resultsDir, "*.json")
-                                             .OrderByDescending(p => p))
+            foreach (string path in OwnFiles(resultsDir, "*.json").OrderByDescending(p => p))
             {
                 string text;
                 try { text = File.ReadAllText(path); } catch { continue; }
@@ -1446,7 +1730,7 @@ namespace ExoStudio.Research
         public (int deleted, int kept) Clear(bool everything)
         {
             int deleted = 0, kept = 0;
-            foreach (string path in Directory.GetFiles(resultsDir, "*.json"))
+            foreach (string path in OwnFiles(resultsDir, "*.json"))
             {
                 if (!everything && !NothingCameOfIt(path)) { kept++; continue; }
                 try { File.Delete(path); deleted++; } catch { kept++; }
@@ -1468,7 +1752,7 @@ namespace ExoStudio.Research
         {
             int trimmed = 0;
             long freed = 0;
-            foreach (string path in Directory.GetFiles(resultsDir, "*.json"))
+            foreach (string path in OwnFiles(resultsDir, "*.json"))
             {
                 string text;
                 try { text = File.ReadAllText(path); } catch { continue; }
@@ -1480,10 +1764,15 @@ namespace ExoStudio.Research
                     if (!NothingCameOfIt(d.RootElement)) continue;
                     foreach (JsonProperty p in d.RootElement.EnumerateObject())
                     {
-                        if (p.Name == "series")
+                        // BOTH CURVES. A record carries the fold's curve and the isolated search's
+                        // curve, each about a third of its bytes, and trimming only the first freed
+                        // half of what this was reached for while the listing then said the run
+                        // had no curve. The reopened page draws whichever it is given, so a trim
+                        // that leaves one behind is not a trim.
+                        if (p.Name == "series" || p.Name == "isolatedSeries")
                         {
-                            hadCurve = p.Value.ValueKind == JsonValueKind.Array
-                                       && p.Value.GetArrayLength() > 0;
+                            hadCurve |= p.Value.ValueKind == JsonValueKind.Array
+                                        && p.Value.GetArrayLength() > 0;
                             continue;
                         }
                         root[p.Name] = JsonSerializer.Deserialize<object>(p.Value.GetRawText());
@@ -1535,8 +1824,10 @@ namespace ExoStudio.Research
                && det.ValueKind == JsonValueKind.True;
 
         private static bool HasCurve(JsonElement r)
-            => r.TryGetProperty("series", out JsonElement s)
-               && s.ValueKind == JsonValueKind.Array && s.GetArrayLength() > 0;
+            => (r.TryGetProperty("series", out JsonElement s)
+                && s.ValueKind == JsonValueKind.Array && s.GetArrayLength() > 0)
+               || (r.TryGetProperty("isolatedSeries", out JsonElement iso)
+                   && iso.ValueKind == JsonValueKind.Array && iso.GetArrayLength() > 0);
 
         /// <summary>
         /// Every run as one table, which is the form the dataset is actually useful in: one row
@@ -1551,7 +1842,7 @@ namespace ExoStudio.Research
                           "detected,period_days,depth_ppm,duration_hours,snr," +
                           "odd_even_sigma,secondary_sigma,secondary_ratio,duration_ratio,concerns,known_matches");
 
-            foreach (string path in Directory.GetFiles(resultsDir, "*.json").OrderBy(p => p))
+            foreach (string path in OwnFiles(resultsDir, "*.json").OrderBy(p => p))
             {
                 string text;
                 try { text = File.ReadAllText(path); } catch { continue; }

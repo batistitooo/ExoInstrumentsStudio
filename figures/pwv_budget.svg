@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 540" width="800" height="540" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<title>water against noise against transit depth</title>
+<rect width="800" height="540" fill="#ffffff"/>
+<text x="68.0" y="32.0" font-size="15" fill="#16181d" text-anchor="start" font-weight="600">Is water the thing that limits you?</text>
+<text x="68.0" y="50.0" font-size="11" fill="#6b7280" text-anchor="start" font-weight="400">1 m at Paranal, V=18.8 ultracool target against a V=12 comparison, 60 s, airmass 1.2, binned to 30 min.</text>
+<line x1="68.0" y1="110.3" x2="668.0" y2="110.3" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="114.3" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">g'</text>
+<line x1="108.0" y1="110.3" x2="596.6" y2="110.3" stroke="#c7ccd1" stroke-width="9"/>
+<circle cx="596.6" cy="110.3" r="4.5" fill="#6b7280"/>
+<line x1="108.0" y1="110.8" x2="224.3" y2="110.8" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="224.3" cy="110.3" r="4.5" fill="#0b3d91"/>
+<text x="233.3" y="114.3" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">8</text>
+<line x1="68.0" y1="147.0" x2="668.0" y2="147.0" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="151.0" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">r'</text>
+<line x1="108.0" y1="147.0" x2="529.9" y2="147.0" stroke="#c7ccd1" stroke-width="9"/>
+<circle cx="529.9" cy="147.0" r="4.5" fill="#6b7280"/>
+<line x1="108.0" y1="147.5" x2="323.9" y2="147.5" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="323.9" cy="147.0" r="4.5" fill="#0b3d91"/>
+<text x="332.9" y="151.0" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">53</text>
+<line x1="68.0" y1="183.7" x2="668.0" y2="183.7" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="187.7" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">i'</text>
+<line x1="108.0" y1="183.7" x2="501.7" y2="183.7" stroke="#c7ccd1" stroke-width="9"/>
+<circle cx="501.7" cy="183.7" r="4.5" fill="#6b7280"/>
+<line x1="108.0" y1="184.2" x2="296.4" y2="184.2" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="296.4" cy="183.7" r="4.5" fill="#0b3d91"/>
+<text x="305.4" y="187.7" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">32</text>
+<line x1="68.0" y1="220.3" x2="668.0" y2="220.3" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="224.3" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">z'</text>
+<line x1="108.0" y1="220.3" x2="488.8" y2="220.3" stroke="#c7ccd1" stroke-width="9"/>
+<circle cx="488.8" cy="220.3" r="4.5" fill="#6b7280"/>
+<line x1="108.0" y1="220.8" x2="468.3" y2="220.8" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="468.3" cy="220.3" r="4.5" fill="#0b3d91"/>
+<text x="477.3" y="224.3" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">760</text>
+<line x1="68.0" y1="257.0" x2="668.0" y2="257.0" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="261.0" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">I+z'</text>
+<line x1="108.0" y1="257.0" x2="476.8" y2="257.0" stroke="#c7ccd1" stroke-width="9"/>
+<circle cx="476.8" cy="257.0" r="4.5" fill="#6b7280"/>
+<line x1="108.0" y1="257.5" x2="513.1" y2="257.5" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="513.1" cy="257.0" r="4.5" fill="#0b3d91"/>
+<text x="522.1" y="261.0" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">1,731</text>
+<line x1="68.0" y1="293.7" x2="668.0" y2="293.7" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="297.7" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">Y</text>
+<line x1="108.0" y1="294.2" x2="385.6" y2="294.2" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="385.6" cy="293.7" r="4.5" fill="#0b3d91"/>
+<text x="394.6" y="297.7" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">166</text>
+<text x="433.6" y="297.7" font-size="9.5" fill="#6b7280" text-anchor="start" font-weight="400" font-style="italic">no NIR detector on the roster - floor unmeasured</text>
+<line x1="68.0" y1="330.3" x2="668.0" y2="330.3" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="334.3" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">YJ</text>
+<line x1="108.0" y1="330.8" x2="407.5" y2="330.8" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="407.5" cy="330.3" r="4.5" fill="#0b3d91"/>
+<text x="416.5" y="334.3" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">248</text>
+<text x="455.5" y="334.3" font-size="9.5" fill="#6b7280" text-anchor="start" font-weight="400" font-style="italic">no NIR detector on the roster - floor unmeasured</text>
+<line x1="68.0" y1="367.0" x2="668.0" y2="367.0" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="371.0" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">J</text>
+<line x1="108.0" y1="367.5" x2="357.2" y2="367.5" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="357.2" cy="367.0" r="4.5" fill="#0b3d91"/>
+<text x="366.2" y="371.0" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">98</text>
+<text x="405.2" y="371.0" font-size="9.5" fill="#6b7280" text-anchor="start" font-weight="400" font-style="italic">no NIR detector on the roster - floor unmeasured</text>
+<line x1="68.0" y1="403.7" x2="668.0" y2="403.7" stroke="#f7f8f9" stroke-width="31.53333333333333"/>
+<text x="62.0" y="407.7" font-size="12" fill="#16181d" text-anchor="end" font-weight="600">Hs</text>
+<line x1="108.0" y1="404.2" x2="359.7" y2="404.2" stroke="#0b3d91" stroke-width="3.4"/>
+<circle cx="359.7" cy="403.7" r="4.5" fill="#0b3d91"/>
+<text x="368.7" y="407.7" font-size="9.5" fill="#0b3d91" text-anchor="start" font-weight="600">103</text>
+<text x="407.7" y="407.7" font-size="9.5" fill="#6b7280" text-anchor="start" font-weight="400" font-style="italic">no NIR detector on the roster - floor unmeasured</text>
+<line x1="542.0" y1="84.0" x2="542.0" y2="422.0" stroke="#d62728" stroke-width="1.3" stroke-dasharray="4 4"/>
+<text x="542.0" y="80.0" font-size="9.5" fill="#d62728" text-anchor="end" font-weight="400">shallowest real transit</text>
+<line x1="588.3" y1="70.0" x2="588.3" y2="422.0" stroke="#d62728" stroke-width="1.3" stroke-dasharray="4 4"/>
+<text x="588.3" y="66.0" font-size="9.5" fill="#d62728" text-anchor="middle" font-weight="400">TRAPPIST-1 b</text>
+<line x1="629.7" y1="84.0" x2="629.7" y2="422.0" stroke="#d62728" stroke-width="1.3" stroke-dasharray="4 4"/>
+<text x="629.7" y="80.0" font-size="9.5" fill="#d62728" text-anchor="start" font-weight="400">deepest</text>
+<text x="108.0" y="440.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">1</text>
+<line x1="108.0" y1="422.0" x2="108.0" y2="427.0" stroke="#6b7280" stroke-width="1"/>
+<text x="233.1" y="440.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">10</text>
+<line x1="233.1" y1="422.0" x2="233.1" y2="427.0" stroke="#6b7280" stroke-width="1"/>
+<text x="358.2" y="440.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">100</text>
+<line x1="358.2" y1="422.0" x2="358.2" y2="427.0" stroke="#6b7280" stroke-width="1"/>
+<text x="483.2" y="440.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">1,000</text>
+<line x1="483.2" y1="422.0" x2="483.2" y2="427.0" stroke="#6b7280" stroke-width="1"/>
+<text x="608.3" y="440.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">10,000</text>
+<line x1="608.3" y1="422.0" x2="608.3" y2="427.0" stroke="#6b7280" stroke-width="1"/>
+<line x1="68.0" y1="422.0" x2="668.0" y2="422.0" stroke="#16181d" stroke-width="1.4"/>
+<text x="368.0" y="462.0" font-size="12" fill="#16181d" text-anchor="middle" font-weight="400">parts per million of flux  (log scale)</text>
+<text x="68.0" y="490.0" font-size="10.5" fill="#6b7280" text-anchor="start" font-weight="400">blue: water residual.   grey: the photon floor in a 30-minute bin.   red: real transit depths.</text>
+<text x="68.0" y="506.0" font-size="10.5" fill="#16181d" text-anchor="start" font-weight="600">Water is under the noise everywhere except I+z', and under every real transit depth in all nine bands.</text>
+</svg>

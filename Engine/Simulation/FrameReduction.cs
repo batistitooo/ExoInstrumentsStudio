@@ -59,6 +59,18 @@ namespace ExoStudio.Simulation
             public double Snr;
             public bool Saturated;
             public double X, Y;
+
+            /// <summary>
+            /// The injected star's own identity and colour, carried through so a sequence of
+            /// frames can be joined into per-star light curves by sky position rather than by
+            /// pixel, and grouped by colour. NaN where the catalogue holds no measured B-V.
+            /// </summary>
+            public double ColourBv;
+            public double RaDeg, DecDeg;
+
+            /// <summary>Measured aperture flux in electrons, and the total the forward model injected.</summary>
+            public double FluxElectrons;
+            public double TrueElectrons;
         }
 
         public sealed class Result
@@ -206,12 +218,43 @@ namespace ExoStudio.Simulation
                 minSeparationPx: Math.Max(2, (int)Math.Round(fwhmPx)));
             r.SourcesFound = peaks.Count;
 
+            // THE LEVEL A PIXEL IN THIS FRAME ACTUALLY STOPS AT, WHICH IS NOT THE FULL WELL.
+            //
+            // The saturation gate compares the electrons this reduction RECOVERED against the
+            // number below, and a recovered value cannot exceed what the converter can hand back:
+            // Digitise clips at MaxAdu, so the largest thing that ever reaches the gate is
+            // (MaxAdu - BiasAdu) * ElectronsPerAdu. Handed the full well instead, the gate asked
+            // for a value the frame cannot contain and THE FLAG WAS SIMPLY DEAD. The ASI294 on the
+            // RC20, the RedCat and the CDK stops at 66,359 e- against a 66,400 e- well - 40 e-
+            // short at binning 1, and sixteen times short at binning 4, where the well scales by
+            // bin^2 and the converter does not. FORS2 stops at 81,905 e- against a 150,000 e-
+            // well. Only SPHERE and the two WFC3 channels reach their wells, and only at binning 1.
+            //
+            // Left as the well, a star whose core is a flat plateau at the ceiling was reported
+            // unsaturated and entered the zero point, the colour term, the flux recovery ratio and
+            // the residual scatter - which the comment on the saturation exclusion below says must
+            // not happen - and the "no star bright, unsaturated and clear of the edge" refusal,
+            // which exists because an 8.2 m at 60 s saturates every star worth measuring an
+            // aperture correction with, could never fire.
+            //
+            // FLOORED, AND HALF A COUNT BELOW THE TOP COUNT. The frame is quantised, so the well
+            // branch is floored exactly as Digitise floors it or the threshold lands above the
+            // largest count a well-clipped pixel can produce; and the half count is what survives
+            // the float the electrons array is made of, where an exact comparison loses by a
+            // thousandth of an electron and flags nothing at all.
+            double wellCeilingAdu = DetectorLinearity.Measured(
+                prep.FullWellElectrons, prep.FullWellElectrons,
+                prep.Spec.LinearityDeviationAtFullWell) / prep.ElectronsPerAdu + prep.BiasAdu;
+            double saturationElectrons =
+                (Math.Floor(Math.Min(prep.MaxAdu, wellCeilingAdu)) - 0.5 - prep.BiasAdu)
+                * prep.ElectronsPerAdu;
+
             var measured = new List<AperturePhotometry.Source>(peaks.Count);
             foreach ((int px, int py) in peaks)
             {
                 AperturePhotometry.Source s = AperturePhotometry.Measure(
                     electrons, w, h, px, py, apertureRadiusPx, inner, outer,
-                    prep.Spec.ReadNoiseElectrons, prep.FullWellElectrons);
+                    prep.Spec.ReadNoiseElectrons, saturationElectrons);
                 if (s.Flux > 0.0) measured.Add(s);
             }
 
@@ -237,14 +280,25 @@ namespace ExoStudio.Simulation
             var sigmas = new List<double>();
             var pairs = new List<(AperturePhotometry.Source S, DeepSkyCamera.InjectedStar T, double D)>();
 
+            // THE HALF PIXEL BETWEEN THE TWO CONVENTIONS, spent here rather than assumed away.
+            // A truth entry carries the projection's own CONTINUOUS coordinate, in which array
+            // index i spans [i, i+1) and is therefore centred at i+0.5 - StarFieldRenderer.Splat
+            // subtracts the half before it floors, and FitsWcs adds it back for the same reason.
+            // A centroid from AperturePhotometry is a flux-weighted mean of integer INDICES, so it
+            // returns i for a source centred on pixel i. Differenced raw, every separation carried
+            // a fixed -0.5 px per axis, which is 0.71 px of the match budget spent before any real
+            // astrometric error - a third of it at the 2 px per FWHM boundary below, where which
+            // sources match would then depend on sub-pixel phase.
+            const double TruthToCentroidPx = -0.5;
+
             foreach (AperturePhotometry.Source s in measured)
             {
                 int best = -1; double bestD = double.MaxValue;
                 for (int i = 0; i < truth.Count; i++)
                 {
                     if (takenTruth[i]) continue;
-                    double d = Math.Sqrt((s.X - truth[i].X) * (s.X - truth[i].X)
-                                       + (s.Y - truth[i].Y) * (s.Y - truth[i].Y));
+                    double tx = truth[i].X + TruthToCentroidPx, ty = truth[i].Y + TruthToCentroidPx;
+                    double d = Math.Sqrt((s.X - tx) * (s.X - tx) + (s.Y - ty) * (s.Y - ty));
                     if (d < bestD) { bestD = d; best = i; }
                 }
                 if (best < 0 || bestD > matchRadius) continue;
@@ -308,7 +362,7 @@ namespace ExoStudio.Simulation
 
             double enclosed = MeasureApertureCorrection(
                 electrons, w, h, pairs, apertureRadiusPx, fwhmPx,
-                prep.Spec.ReadNoiseElectrons, prep.FullWellElectrons, brightSnrFloor,
+                prep.Spec.ReadNoiseElectrons, saturationElectrons, brightSnrFloor,
                 out int growthStars);
             r.CurveOfGrowthStars = growthStars;
 
@@ -346,7 +400,7 @@ namespace ExoStudio.Simulation
             // Measured here from the field's own stars rather than assumed for a nominal colour,
             // which is also what a real calibration does.
             SystemResponse response = DeepSkyCamera.BuildSystemResponse(
-                prep.Spec, prep.Filter, prep.Meta.AirmassX);
+                prep.Spec, prep.Filter, prep.Meta.AirmassX, prep.AtmosphereAltitudeMeters);
             var colourTerms = new List<double>();
             foreach ((AperturePhotometry.Source s, DeepSkyCamera.InjectedStar t, double _) in pairs)
             {
@@ -417,6 +471,11 @@ namespace ExoStudio.Simulation
                     Saturated = s.Saturated,
                     X = s.X,
                     Y = s.Y,
+                    ColourBv = t.ColourBv,
+                    RaDeg = t.RaDeg,
+                    DecDeg = t.DecDeg,
+                    FluxElectrons = s.Flux,
+                    TrueElectrons = t.Electrons,
                 };
                 r.Matches.Add(m);
 
@@ -448,6 +507,22 @@ namespace ExoStudio.Simulation
             // and the zero point came out eleven magnitudes off. A frame can be unreducible; that
             // is a fact about the frame, and the endpoint's job is to name it.
             r.Reliable = true;
+
+            // A TRAILED FRAME IS NOT REDUCIBLE HERE, and it is worth refusing rather than scoring.
+            // Prepare projects each truth entry at the trail's START meridian while DepositStars
+            // draws the light along the whole arc to the END one, so on an untracked exposure every
+            // centroid sits hundreds of pixels from its own truth entry and cannot match it. What
+            // survives the 1-FWHM radius is coincidence: a fragment of one star's trail landing
+            // near an UNRELATED star's start position, now exported with that star's catalogue
+            // position, colour and injected electrons. Finite, plausible, and the wrong object.
+            if (prep.Trailed)
+            {
+                r.Reliable = false;
+                r.Notes.Add("UNRELIABLE: the mount was not tracking, so the stars are trails while the "
+                          + "injected truth sits at the start of each one. Matches here are coincidental "
+                          + "and the identity reported with them (position, colour, injected electrons) "
+                          + "may belong to a different star. Photometry needs a tracked frame.");
+            }
             if (r.CurveOfGrowthStars == 0)
             {
                 r.Reliable = false;
@@ -477,6 +552,30 @@ namespace ExoStudio.Simulation
                           + "aperture both mean very little. Bin less, or use a longer focal length.");
             }
 
+            // A CLAMPED APERTURE MAKES THE ERROR BARS WRONG, not just the aperture small, and the
+            // two boundaries do not coincide: the Nyquist veto above bites below 2.00 px per FWHM
+            // while the 1.5 px floor on the radius bites below 2.21, leaving a band where the
+            // frame passed every other rule and its uncertainties were still not to be believed.
+            //
+            // The reason is the CENTROID, not the weights. AperturePhotometry's error bar is
+            // derived for an aperture on a FIXED centre; the centre is measured from the same noisy
+            // pixels, and at a radius this tight the enclosed fraction swings with the sub-pixel
+            // phase the centroid lands on. Measured through the shipped code at 2.2 px per FWHM: a
+            // 100,000 e- star repeats with a scatter of 853 e- against a reported 272 - the error
+            // bar is 3.1 times too small - and 806 e- of that survives on a NOISELESS frame, so it
+            // is geometry rather than photons. At the 9.1 px per FWHM this reduction normally runs
+            // at, the same measurement gives 0.995 and 0.02 %: the exact areas do their job, and
+            // this is the regime where they cannot.
+            if (apertureRadiusPx > CcdEquation.OptimalApertureRadiusInFwhm * fwhmPx + 1e-9)
+            {
+                r.Reliable = false;
+                r.Notes.Add($"UNRELIABLE: at {r.FwhmPx:F2} px per FWHM the photometric aperture hits its "
+                          + $"{apertureRadiusPx:F1} px floor rather than tracking the profile, and on an "
+                          + "aperture that tight the centroid's own sub-pixel jitter moves the enclosed "
+                          + "fraction by more than the reported uncertainty covers - measured at 3x too "
+                          + "small. The magnitudes may be usable; the error bars are not.");
+            }
+
             return r;
         }
 
@@ -496,7 +595,7 @@ namespace ExoStudio.Simulation
             float[] electrons, int w, int h,
             List<(AperturePhotometry.Source S, DeepSkyCamera.InjectedStar T, double D)> pairs,
             double apertureRadiusPx, double fwhmPx,
-            double readNoise, double fullWell, double snrFloor, out int used)
+            double readNoise, double saturationElectrons, double snrFloor, out int used)
         {
             used = 0;
             double wideRadius = 4.0 * fwhmPx;
@@ -516,7 +615,7 @@ namespace ExoStudio.Simulation
                     electrons, w, h, s.X, s.Y, wideRadius,
                     wideRadius * CcdEquation.SkyAnnulusInnerRadiusInAperture,
                     wideRadius * CcdEquation.SkyAnnulusOuterRadiusInAperture,
-                    readNoise, fullWell);
+                    readNoise, saturationElectrons);
                 if (wide.Saturated || !(wide.Flux > 0.0)) continue;
 
                 double ratio = s.Flux / wide.Flux;

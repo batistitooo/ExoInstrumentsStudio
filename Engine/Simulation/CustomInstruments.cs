@@ -59,6 +59,15 @@ namespace ExoStudio.Simulation
         {
             /// <summary>Which position this is: Luminance, Red, Green, Blue, HAlpha, OIII, SII, NII, OII, OI.</summary>
             public string Position { get; set; }
+
+            /// <summary>
+            /// What YOU call this band. The position is a slot in a fixed ten-name enum built for
+            /// an amateur filter wheel; an observer's own bands - g', z', I+z', Y, J - are not in
+            /// it and have to be mounted in whichever slot is free. Give the label and it is what
+            /// the FITS header, the API and the interface all show, so nothing downstream claims
+            /// the band is something it is not. Omitted, the position's own name is used.
+            /// </summary>
+            public string Label { get; set; }
             public double? CentralWavelengthNm { get; set; }
             public double? BandwidthAngstrom { get; set; }
 
@@ -70,9 +79,10 @@ namespace ExoStudio.Simulation
             /// a curve, SystemResponse integrates the real passband shape, and the peak
             /// transmission is not applied on top of it because the curve already carries it.
             ///
-            /// Only the Red, Green and Blue positions carry a curve in this pipeline; that is a
-            /// limit of VisualTelescopeSpec, which has three curve fields and not ten. A curve on
-            /// any other position is refused rather than silently ignored.
+            /// ANY band may carry one. This used to be refused on all but the Red, Green and Blue
+            /// positions, because VisualTelescopeSpec had three curve fields and there was nowhere
+            /// to put a fourth; a band carries its own curve now, so a nine-band instrument can
+            /// supply nine measured passbands and address them by name.
             /// </summary>
             public List<CurvePoint> TransmissionCurve { get; set; }
         }
@@ -127,6 +137,17 @@ namespace ExoStudio.Simulation
 
             /// <summary>Electrons per ADU at unity gain. Omitted derives it from the full well and the converter depth.</summary>
             public double? ElectronsPerAduAtUnityGain { get; set; }
+
+            /// <summary>
+            /// Seconds to clock the whole image area out through itself, for a detector that is
+            /// STILL LIT while that happens: a frame-transfer CCD, or any CCD read without a
+            /// shutter. Omitted means the instrument does not smear, which is the ordinary case.
+            ///
+            /// Supply this only for a detector that really has no shutter over its image area. It
+            /// is the one number the effect needs, and giving it makes every frame carry the stripe
+            /// and every reduction able to take it back off. See Core.ChargeTransferSmear.
+            /// </summary>
+            public double? FrameTransferSeconds { get; set; }
 
             // --- where it stands ---------------------------------------------------
             /// <summary>An existing site id, or null when Site below describes a new one.</summary>
@@ -207,6 +228,15 @@ namespace ExoStudio.Simulation
 
             /// <summary>Quantities computed from the request rather than supplied, each with the relation used.</summary>
             public List<string> Derived = new();
+
+            /// <summary>
+            /// The request this was built from, kept verbatim so it can be written to disk and read
+            /// back. THE REQUEST IS THE STORED SHAPE, deliberately: a second schema for persistence
+            /// would be a second thing to keep in step with the builder, and the two would drift the
+            /// first time a field was added to one of them.
+            /// </summary>
+            public Request Source;
+            public DetectorRequest DetectorSource;
         }
 
         // ------------------------------------------------------------------ the store
@@ -218,7 +248,219 @@ namespace ExoStudio.Simulation
         public static Built ById(string id) =>
             id != null && built.TryGetValue(id, out Built b) ? b : null;
 
-        public static bool Remove(string id) => id != null && built.TryRemove(id, out _);
+        public static bool Remove(string id)
+        {
+            if (id == null || !built.TryRemove(id, out _)) return false;
+            Persist();
+            return true;
+        }
+
+        // ------------------------------------------------------------------ the store, on disk
+        //
+        // WHY THIS HAD TO EXIST. Everything above held instruments in memory and nothing wrote them
+        // anywhere, so a restart lost them. That is not a small inconvenience for the one feature
+        // this program has that is a TOOL rather than a demonstration: an observer who has described
+        // their own nine-band instrument, with a measured curve on each band, had to POST the whole
+        // thing again every time the server came up.
+        //
+        // A DEFINITION IS NEVER LOST BECAUSE THIS BUILD COULD NOT READ IT. A stored entry that no
+        // longer parses is refused with its reason and skipped, the way PwvTransmission.TryLoad
+        // refuses a grid it cannot read - but its raw JSON is KEPT and written back out on the next
+        // save. The alternative, dropping it, means one incompatible change to the request shape
+        // silently deletes an observer's work on the next write; the reason it is kept is the same
+        // reason the refusal exists at all.
+
+        private static readonly object storeGate = new();
+        private static string storePath;
+        /// <summary>Set while OpenStore is rebuilding, so loading the file does not rewrite it once per entry.</summary>
+        private static bool loading;
+        private static readonly List<string> loadRefusals = new();
+        private static readonly List<System.Text.Json.JsonElement> unreadable = new();
+
+        /// <summary>Where the definitions live, and what was found there. Served with the instrument list.</summary>
+        public static string StorePath { get { lock (storeGate) return storePath; } }
+        public static IReadOnlyList<string> LoadRefusals { get { lock (storeGate) return loadRefusals.ToArray(); } }
+
+        private static readonly System.Text.Json.JsonSerializerOptions StoreJson = new()
+        {
+            PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true,
+            WriteIndented = true,
+            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+        };
+
+        private sealed class StoredEntry
+        {
+            /// <summary>"imaging" or "detector": the two builders take different request shapes.</summary>
+            public string Kind { get; set; }
+            public string Id { get; set; }
+            public string SavedUtc { get; set; }
+            public Request Imaging { get; set; }
+            public DetectorRequest Detector { get; set; }
+        }
+
+        private sealed class StoreFile
+        {
+            public int Version { get; set; } = 1;
+            public List<StoredEntry> Instruments { get; set; } = new();
+        }
+
+        /// <summary>
+        /// Points the store at a file and rebuilds whatever is in it.
+        ///
+        /// Called once at startup. Every definition goes back through Build, not through a
+        /// deserialiser that reconstructs a spec directly: a stored instrument is therefore subject
+        /// to exactly the refusals a freshly posted one is, and it carries the same assumptions and
+        /// derived lists. An instrument that would be refused today is refused today, rather than
+        /// living on because it was accepted by an older build.
+        /// </summary>
+        public static void OpenStore(string path)
+        {
+            lock (storeGate)
+            {
+                storePath = path;
+                loadRefusals.Clear();
+                unreadable.Clear();
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
+
+                StoreFile file;
+                try
+                {
+                    file = System.Text.Json.JsonSerializer.Deserialize<StoreFile>(
+                        File.ReadAllText(path), StoreJson);
+                }
+                catch (Exception e)
+                {
+                    loadRefusals.Add($"{path} is not a readable instrument store ({e.Message}), so no "
+                                   + "saved instrument was loaded. The file is left exactly as it is; "
+                                   + "move it aside to start a new one.");
+                    // The whole file is unreadable, so nothing may be written back over it: a save
+                    // would replace an unreadable file with a valid empty one and destroy the lot.
+                    storePath = null;
+                    return;
+                }
+
+                if (file?.Instruments == null) return;
+
+                // The raw elements, so an entry this build cannot rebuild can still be written back.
+                System.Text.Json.JsonElement[] raw;
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+                    raw = doc.RootElement.TryGetProperty("instruments", out System.Text.Json.JsonElement arr)
+                          && arr.ValueKind == System.Text.Json.JsonValueKind.Array
+                        ? arr.EnumerateArray().Select(e => e.Clone()).ToArray()
+                        : Array.Empty<System.Text.Json.JsonElement>();
+                }
+                catch { raw = Array.Empty<System.Text.Json.JsonElement>(); }
+
+                loading = true;
+                try
+                {
+                for (int i = 0; i < file.Instruments.Count; i++)
+                {
+                    StoredEntry entry = file.Instruments[i];
+                    string label = entry?.Id ?? entry?.Imaging?.Name ?? entry?.Detector?.Name ?? $"entry {i + 1}";
+                    Built rebuilt = null;
+                    string error = null;
+
+                    try
+                    {
+                        if (string.Equals(entry?.Kind, "detector", StringComparison.OrdinalIgnoreCase))
+                            rebuilt = entry.Detector == null
+                                ? null : BuildDetector(entry.Detector, out error);
+                        else
+                            rebuilt = entry?.Imaging == null ? null : Build(entry.Imaging, out error);
+                        error ??= rebuilt == null ? "the entry carries no request to rebuild from" : null;
+                    }
+                    catch (Exception e) { error = e.Message; }
+
+                    if (rebuilt == null)
+                    {
+                        loadRefusals.Add($"'{label}' was not loaded: {error} It is kept in {Path.GetFileName(path)} "
+                                       + "and written back unchanged, so nothing is lost - fix it there, or delete it.");
+                        if (i < raw.Length) unreadable.Add(raw[i]);
+                    }
+                }
+                }
+                finally { loading = false; }
+            }
+        }
+
+        /// <summary>Writes every definition back, plus any entry this build could not read.</summary>
+        private static void Persist()
+        {
+            lock (storeGate)
+            {
+                if (string.IsNullOrWhiteSpace(storePath)) return;
+                try
+                {
+                    var file = new StoreFile();
+                    foreach (Built b in built.Values.OrderBy(b => b.Id, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (b.Source != null)
+                            file.Instruments.Add(new StoredEntry
+                            {
+                                Kind = "imaging", Id = b.Id,
+                                SavedUtc = DateTime.UtcNow.ToString("o"), Imaging = b.Source,
+                            });
+                        else if (b.DetectorSource != null)
+                            file.Instruments.Add(new StoredEntry
+                            {
+                                Kind = "detector", Id = b.Id,
+                                SavedUtc = DateTime.UtcNow.ToString("o"), Detector = b.DetectorSource,
+                            });
+                    }
+
+                    string json = System.Text.Json.JsonSerializer.Serialize(file, StoreJson);
+
+                    // The entries this build refused are spliced back in as raw JSON rather than
+                    // re-serialised, because re-serialising through a shape that could not read them
+                    // is exactly how they would be corrupted.
+                    if (unreadable.Count > 0)
+                    {
+                        using var doc = System.Text.Json.JsonDocument.Parse(json);
+                        var sb = new System.Text.StringBuilder();
+                        using (var stream = new MemoryStream())
+                        {
+                            using (var w = new System.Text.Json.Utf8JsonWriter(
+                                       stream, new System.Text.Json.JsonWriterOptions { Indented = true }))
+                            {
+                                w.WriteStartObject();
+                                w.WriteNumber("version", 1);
+                                w.WritePropertyName("instruments");
+                                w.WriteStartArray();
+                                foreach (System.Text.Json.JsonElement e in
+                                         doc.RootElement.GetProperty("instruments").EnumerateArray())
+                                    e.WriteTo(w);
+                                foreach (System.Text.Json.JsonElement e in unreadable) e.WriteTo(w);
+                                w.WriteEndArray();
+                                w.WriteEndObject();
+                            }
+                            json = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+                        }
+                        sb.Clear();
+                    }
+
+                    string dir = Path.GetDirectoryName(storePath);
+                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                    // Written beside and moved into place, so an interrupted write cannot leave a
+                    // half-file where the instruments were.
+                    string tmp = storePath + ".tmp";
+                    File.WriteAllText(tmp, json);
+                    File.Move(tmp, storePath, overwrite: true);
+                }
+                catch (Exception e)
+                {
+                    // A store that cannot be written is reported rather than thrown: losing the
+                    // ability to save is not a reason to refuse the instrument that is already built
+                    // and usable in this process.
+                    loadRefusals.Add($"The instrument store at {storePath} could not be written ({e.Message}). "
+                                   + "Instruments defined in this session will not survive a restart.");
+                }
+            }
+        }
 
         /// <summary>Every site an instrument may stand on: the five real ones plus any an observer defined.</summary>
         public static IEnumerable<ObservingSites.Site> AllSites() =>
@@ -293,40 +535,63 @@ namespace ExoStudio.Simulation
             }
 
             var positions = new List<CameraFilter>();
+            var names = new List<string>();
             var narrowband = new List<NarrowbandFilterSpec>();
             var spec = new VisualTelescopeSpec();
 
             foreach (FilterRequest f in filters)
             {
-                if (!Enum.TryParse(f.Position ?? "", true, out CameraFilter position))
+                // A NAME IS ENOUGH. `position` used to be required and had to be one of ten enum
+                // values, which is why an instrument could not carry g' or I+z' at all. Now the
+                // band is named by the observer and the position is optional: give one and the
+                // legacy slot is filled too, omit it and the band stands on its own.
+                string bandName = !string.IsNullOrWhiteSpace(f.Label) ? f.Label.Trim()
+                                : !string.IsNullOrWhiteSpace(f.Position) ? f.Position.Trim()
+                                : null;
+                if (bandName == null)
                 {
-                    error = $"'{f.Position}' is not a filter position. Use one of: "
-                          + string.Join(", ", Enum.GetNames(typeof(CameraFilter))) + ".";
+                    error = "Every filter needs a name: give `label` (anything you like, such as "
+                          + "\"I+z'\") or `position` (one of "
+                          + string.Join(", ", Enum.GetNames(typeof(CameraFilter))) + ").";
+                    return null;
+                }
+                if (names.Contains(bandName, StringComparer.OrdinalIgnoreCase))
+                {
+                    error = $"Two filters are both called '{bandName}'. A band is addressed by its "
+                          + "name, so two with the same one would be indistinguishable.";
+                    return null;
+                }
+                names.Add(bandName);
+                bool hasPosition = Enum.TryParse(f.Position ?? "", true, out CameraFilter position);
+                if (!hasPosition && !string.IsNullOrWhiteSpace(f.Position))
+                {
+                    error = $"'{f.Position}' is not a filter position. Either use one of: "
+                          + string.Join(", ", Enum.GetNames(typeof(CameraFilter)))
+                          + ", or drop `position` and name the band with `label` alone.";
                     return null;
                 }
                 if (!(f.CentralWavelengthNm > 0.0) || !(f.BandwidthAngstrom > 0.0))
                 {
-                    error = $"The {position} filter needs a central wavelength and a bandwidth; "
+                    error = $"The {bandName} filter needs a central wavelength and a bandwidth; "
                           + "without both there is no passband to integrate the photometry over.";
                     return null;
                 }
 
-                positions.Add(position);
+                if (hasPosition) positions.Add(position);
+
+                // THE OBSERVER'S OWN NAME FOR THE BAND. Recorded against the slot it is mounted in,
+                // so the FITS header, the API and the interface all say I+z' where the pipeline
+                // internally says Luminance. Without it a 750-1000 nm band ships a frame claiming
+                // to be broad visible, which is a label that lies and the kind this codebase
+                // refuses everywhere else.
 
                 SpectralCurve curve = ParseCurve(f.TransmissionCurve, $"{position} transmission", 0.0, 1.0, ref error);
                 if (error != null) return null;
 
-                if (curve != null && position is not (CameraFilter.Red or CameraFilter.Green or CameraFilter.Blue))
-                {
-                    // Refused rather than ignored. VisualTelescopeSpec carries three curve fields,
-                    // for R, G and B, and there is nowhere to put a fourth; accepting the points
-                    // and quietly integrating a top-hat instead would be the worst outcome, since
-                    // the caller would believe their measured passband was in the answer.
-                    error = $"A transmission curve can only be carried for the Red, Green and Blue positions "
-                          + $"in this pipeline, and one was given for {position}. Give its central wavelength, "
-                          + "bandwidth and peak transmission instead, which is integrated as a top-hat.";
-                    return null;
-                }
+                // A CURVE ON ANY BAND. This used to be refused on anything but Red, Green and
+                // Blue, because VisualTelescopeSpec carried three curve fields and there was
+                // nowhere to put a fourth. A band carries its own, so the limit is gone and a
+                // nine-band instrument can supply nine measured passbands.
 
                 double peak = f.PeakTransmission ?? 1.0;
                 if (curve != null)
@@ -344,8 +609,27 @@ namespace ExoStudio.Simulation
                     b.Assumptions.Add($"{position}: peak transmission not given, so the filter's own loss is unmodelled (the catalogue's own convention for an unpublished figure).");
                 }
 
-                ApplyFilter(spec, narrowband, position, f.CentralWavelengthNm.Value,
-                            f.BandwidthAngstrom.Value, peak, curve);
+                // THE BAND ITSELF, registered by name. This is what the pipeline resolves against
+                // now; the legacy slot below is filled only so a request that names a position
+                // still behaves the way it always did.
+                spec.Bands ??= new List<VisualTelescopeSpec.Band>();
+                spec.Bands.Add(new VisualTelescopeSpec.Band
+                {
+                    Name = bandName,
+                    CentralWavelengthNm = f.CentralWavelengthNm.Value,
+                    BandwidthAngstrom = f.BandwidthAngstrom.Value,
+                    PeakTransmission = peak,
+                    Curve = curve,
+                });
+                if (hasPosition && bandName != position.ToString())
+                {
+                    spec.FilterLabels ??= new Dictionary<CameraFilter, string>();
+                    spec.FilterLabels[position] = bandName;
+                }
+
+                if (hasPosition)
+                    ApplyFilter(spec, narrowband, position, f.CentralWavelengthNm.Value,
+                                f.BandwidthAngstrom.Value, peak, curve);
             }
 
             // --- the detector chain --------------------------------------------------
@@ -442,6 +726,29 @@ namespace ExoStudio.Simulation
             spec.AdcBits = adcBits;
             spec.ElectronsPerAduAtUnityGain = epa;
 
+            // CHARGE-TRANSFER SMEAR, which is the one detector effect here that an observer has to
+            // ASK for rather than one that follows from the numbers. Every other field describes a
+            // property the device has whether or not anyone mentions it; this one describes an
+            // ARCHITECTURE, and the overwhelmingly common case - a shutter, or a CMOS sensor - has
+            // no such effect at all. Defaulting it on would put a stripe on every custom frame.
+            if (r.FrameTransferSeconds.HasValue && r.FrameTransferSeconds.Value > 0.0)
+            {
+                spec.FrameTransferSeconds = r.FrameTransferSeconds.Value;
+                b.Derived.Add($"Read out while still exposed, transferring the frame in "
+                            + $"{spec.FrameTransferSeconds:G4} s. A {h}-row array smears one row's light into "
+                            + $"every row after it at {ChargeTransferSmear.Constant(spec.FrameTransferSeconds, 1.0, h):G3} "
+                            + "per second of exposure, so a 1 s frame carries a ramp reaching "
+                            + $"{ChargeTransferSmear.WorstCaseFractionOfUniformField(ChargeTransferSmear.Constant(spec.FrameTransferSeconds, 1.0, h), h) * 100:F2} % "
+                            + "at the readout edge and a 600 s frame six hundred times less. The reduction "
+                            + "removes it exactly, after the bias and before the flat.");
+            }
+            else
+            {
+                b.Assumptions.Add("No frame-transfer time given, so the detector is taken to be shuttered or "
+                                + "read in place and no charge-transfer smear is applied. This is the right "
+                                + "default: a CMOS sensor and a shuttered CCD both genuinely have none.");
+            }
+
             spec.SiteAltitudeMeters = site.AltitudeMeters;
             spec.ZenithSeeingFwhmArcsec = r.ZenithSeeingFwhmArcsec
                                        ?? r.Site?.ZenithSeeingFwhmArcsec
@@ -477,7 +784,11 @@ namespace ExoStudio.Simulation
                 UnlockedByDefault = true,
             };
 
+            // The request as it arrived, so the instrument can be written to disk and rebuilt
+            // through this same method on the next start. See OpenStore.
+            b.Source = r;
             built[b.Id] = b;
+            if (!loading) Persist();
             return b;
         }
 
@@ -570,7 +881,9 @@ namespace ExoStudio.Simulation
                 UnlockedByDefault = true,
             };
 
+            b.DetectorSource = r;
             built[b.Id] = b;
+            if (!loading) Persist();
             return b;
         }
 
@@ -598,6 +911,15 @@ namespace ExoStudio.Simulation
                 if (double.IsNaN(ambient))
                     b.Assumptions.Add("No ambient temperature given for the site, so the cooler has nothing to "
                                     + "work against and its setpoint cannot be adjusted.");
+
+                // Altitude is not a label either: it is the air column every atmospheric term is
+                // evaluated through, and Rayleigh extinction scales as exp(-h/8000 m). Defaulting
+                // it to sea level is a real choice about the sky, so it is declared rather than
+                // taken silently.
+                if (siteRequest.AltitudeMeters == null)
+                    b.Assumptions.Add("No altitude given for the site, so it is taken at sea level: extinction, "
+                                    + "scintillation and differential refraction are all computed through a "
+                                    + "full atmosphere, which is the pessimistic end of the range.");
 
                 return new ObservingSites.Site
                 {

@@ -814,3 +814,168 @@ table.signals tr.miss td { color: var(--ink-faint); }
    moves, and given a fixed height so the panel does not reflow when it empties. */
 .rsReadout { font-family: ui-monospace, Menlo, monospace; font-size: .74rem;
              min-height: 1.1em; margin: .15rem 0 0; letter-spacing: .01em; }
+
+/* The per-star table can be hundreds of rows; it scrolls inside its own box rather than
+   stretching the panel, and the header stays put so the columns keep their meaning. */
+.startablewrap { max-height: 320px; overflow: auto; margin-top: 8px; }
+.startablewrap thead th { position: sticky; top: 0; background: var(--bg-panel); z-index: 1; }
+.startablewrap table { font-size: 11px; }
+
+/* The sequence's own preview, sized like the capture frame rather than at its native pixels. */
+#seqPreview { display: block; width: 100%; border-radius: var(--r); margin-top: 8px; }
+
+/* The verdict row already exists for the research mode; the sequence reuses it and only needs
+   its own spacing above the first chart. */
+#seqPanel canvas { margin-top: 14px; }
+
+/* The water-vapour record is pasted, so it gets a real text area rather than an input. */
+#pwvSeries { width: 100%; font-family: var(--mono); font-size: 11px; background: var(--bg-sunken);
+             color: var(--ink); border: 1px solid var(--line); border-radius: var(--r);
+             padding: 6px 8px; resize: vertical; }
+#pwvMode { width: 100%; }
+
+/* ------------------------------------------------------- light curve mode
+   The fourth mode measures across time rather than within one frame, so its panels are a
+   sequence of steps rather than a dashboard. Nothing here introduces a new colour: amber is
+   still the live/reference ink, cyan still the measurement, and the greens and reds keep the
+   meanings the verdict boxes already gave them. */
+
+/* The five steps, as an ordered list that says where you are without pretending to be a wizard. */
+.lcchain { list-style: none; margin: 0; padding: 0; counter-reset: lcstep; }
+.lcchain li {
+  display: grid; grid-template-columns: 22px 1fr; gap: 9px;
+  align-items: baseline; padding: 5px 0; counter-increment: lcstep;
+  border-left: 1px solid var(--line-soft); margin-left: 9px; padding-left: 13px;
+}
+.lcchain li::before {
+  content: counter(lcstep);
+  font-family: var(--mono); font-size: 10px; color: var(--ink-faint);
+  border: 1px solid var(--line); border-radius: 50%;
+  width: 18px; height: 18px; line-height: 16px; text-align: center;
+  margin-left: -23px; background: var(--bg-panel);
+}
+.lcchain li b { font-weight: 600; font-size: 12.5px; color: var(--ink-dim); }
+.lcchain li span { grid-column: 2; font-size: 11px; color: var(--ink-faint); }
+.lcchain li.done b { color: var(--green); }
+.lcchain li.done::before { border-color: rgba(126,231,135,.45); color: var(--green); }
+.lcchain li.now b { color: var(--amber); }
+.lcchain li.now::before { border-color: rgba(255,180,84,.55); color: var(--amber); }
+
+/* Two plots side by side where the pair IS the point: absorbed against differential. */
+.lcpair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 1100px) { .lcpair { grid-template-columns: 1fr; } }
+
+/* A control strip inside a result panel, for the readings that are re-taken on the same run. */
+.lcdepthbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 0 4px; border-bottom: 1px solid var(--line-soft); margin-bottom: 10px;
+}
+.lcdepthbar select {
+  background: var(--bg-sunken); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 5px; padding: 5px 8px; font-size: 12px; font-family: var(--mono);
+}
+.lcdepthbar .lbl { margin: 0; }
+.lcdepthbar .capcheck { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-dim); }
+
+/* Sortable headers. A column an eye can order is worth more than one it cannot, and the star
+   list exists precisely so somebody can find the reddest bright unsaturated star in a field. */
+table.signals th[data-sort] { cursor: pointer; user-select: none; }
+table.signals th[data-sort]:hover { color: var(--ink-dim); }
+table.signals th[data-sort].sorted-asc::after  { content: ' ▲'; color: var(--amber); font-size: 8px; }
+table.signals th[data-sort].sorted-desc::after { content: ' ▼'; color: var(--amber); font-size: 8px; }
+
+/* The colour matrix: a grid where the diagonal means something, so it is marked rather than
+   left as an empty cell somebody would read as a failure. */
+table.signals.lcgrid th:first-child, table.signals.lcgrid td:first-child {
+  width: auto; color: var(--ink-faint); text-align: left; white-space: nowrap;
+}
+table.signals.lcgrid td.cell-tight { color: var(--red); }
+table.signals.lcgrid td.cell-loose { color: var(--green); }
+table.signals.lcgrid td.cell-none  { color: var(--cyan); }
+
+/* A row the reader has acted on, so a chosen transit host stays visible after the click. */
+table.signals tr.picked td { background: rgba(255,180,84,.09); color: var(--ink); }
+table.signals td .rowbtn {
+  font-family: var(--sans); font-size: 10.5px; padding: 3px 8px; border-radius: 4px;
+  background: transparent; color: var(--ink-faint);
+  border: 1px solid var(--line); cursor: pointer;
+}
+table.signals td .rowbtn:hover { color: var(--amber); border-color: rgba(255,180,84,.4); }
+
+/* The export links read as buttons because that is what they do. */
+#lcExportCsv, #lcExportJson {
+  text-decoration: none; display: inline-block;
+  padding: 6px 12px; border-radius: 5px; font-size: 12px;
+  border: 1px solid var(--line); color: var(--ink-dim); background: transparent;
+}
+#lcExportCsv:hover, #lcExportJson:hover { background: var(--bg-hover); color: var(--ink); border-color: #2a3441; }
+#lcExportCsv[aria-disabled="true"], #lcExportJson[aria-disabled="true"] { opacity: .35; pointer-events: none; }
+
+/* The band textareas are code, so they are set as code. */
+#lcBands, #ciBands { width: 100%; resize: vertical; }
+#lcBands, #ciBands, #pwvSeries {
+  background: var(--bg-sunken); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 5px; padding: 8px; font-family: var(--mono); font-size: 11.5px;
+}
+#lcInstFold summary, #starFold summary { cursor: pointer; }
+#lcInstFold[open] summary { margin-bottom: 8px; }
+
+/* ------------------------------------------------- the hoverable explanation
+   THE PANEL SAYS WHAT IS NECESSARY AND HIDES THE REST BEHIND A MARK. A control whose caption runs
+   to five lines is a control nobody reads, and this interface had earned several. What stays on
+   screen is the number and the one clause that changes a decision; the reasoning, the provenance
+   and the failure it was written after live in here. */
+.q {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-left: 5px; vertical-align: 1px;
+  border: 1px solid var(--line); border-radius: 50%;
+  font-family: var(--sans); font-size: 9px; font-weight: 600; line-height: 1;
+  color: var(--ink-faint); background: var(--bg-sunken);
+  cursor: help; position: relative; flex: none; user-select: none;
+}
+.q:hover, .q:focus-visible { color: var(--amber); border-color: rgba(255,180,84,.45); outline: none; }
+
+.q::after {
+  content: attr(data-tip);
+  position: absolute; bottom: calc(100% + 7px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: 340px; padding: 9px 11px;
+  background: #0b0f15; border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: 0 8px 26px rgba(0,0,0,.6);
+  color: var(--ink-dim); font-size: 11.5px; font-weight: 400; line-height: 1.5;
+  text-align: left; white-space: pre-wrap;
+  opacity: 0; pointer-events: none; transition: opacity .12s ease .25s;
+  z-index: 40;
+}
+.q:hover::after, .q:focus-visible::after { opacity: 1; }
+
+/* Near the edges of the setup column the balloon would run off screen, so it anchors to its own
+   side instead of to its centre. */
+.setup .q::after { left: 0; transform: none; max-width: 290px; }
+.chart-head .q::after, .startablewrap .q::after { left: auto; right: 0; transform: none; }
+
+/* A label with a mark after it should not push its control out of line. */
+.lbl .q, .vlbl .q, th .q { vertical-align: 0; }
+
+/* The one frame kept out of a run, sized like the capture frame rather than at native pixels. */
+#lcFramePreview { display: block; width: 100%; border-radius: var(--r); margin-top: 10px; }
+#lcCurveAxis { margin-bottom: 6px; }
+table.signals tr.refused td { color: var(--ink-faint); }
+table.signals td.reason { text-align: left; color: var(--amber); font-family: var(--sans); font-size: 11px; }
+
+
+/* A REQUIREMENT ROW THAT CONTAINS NO DETECTOR. Past a quantum-efficiency curve's range the response
+   is held at its endpoint, and a constant multiplier cancels out of a loss ratio, so the row is a
+   top-hat on the sky. It has to look different from a row that carries the instrument. */
+tr.nodetector td { opacity: .62; }
+.warnmark {
+  font-size: .72em; letter-spacing: .04em; text-transform: uppercase;
+  padding: .05em .4em; margin-left: .4em; border-radius: 3px;
+  color: rgba(255,180,84,.95); border: 1px solid rgba(255,180,84,.3);
+  background: rgba(255,180,84,.08); white-space: nowrap;
+}
+
+
+/* A PANEL WHOSE NUMBERS OUTLIVED THEIR REQUEST. Kept rather than cleared, so a typo does not
+   destroy a good result, but it must not look like an answer to the question just asked. */
+.stale { opacity: .45; filter: saturate(.5); }
+.hint.warn { color: rgba(255,180,84,.9); }

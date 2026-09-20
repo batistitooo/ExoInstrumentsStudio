@@ -133,5 +133,20 @@ namespace ExoInstruments.Core
         {
             return ReferencePrecision * Math.Pow(10.0, PrecisionExponent * (apparentMagnitude - ReferenceMagnitude));
         }
+
+        /// <summary>
+        /// A field-for-field copy, for a caller that must vary ONE property of a roster instrument
+        /// without mutating the shared spec every other caller sees.
+        ///
+        /// The case it exists for: `SiteAltitudeMeters` is the altitude of the one observatory this
+        /// instrument belongs to, and a program that lets the same instrument be used from another
+        /// site has to re-seat it there before the atmospheric terms are computed, or every
+        /// extinction and scintillation figure describes the wrong mountain. Mutating the roster
+        /// entry would leak that site into every later run.
+        ///
+        /// Shallow, deliberately: the reference members are immutable published data (curves,
+        /// detector specs) that a re-seated copy shares rather than duplicates.
+        /// </summary>
+        public InstrumentSpec ShallowCopy() => (InstrumentSpec)MemberwiseClone();
     }
 }

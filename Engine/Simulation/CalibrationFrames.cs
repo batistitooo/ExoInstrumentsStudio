@@ -55,6 +55,14 @@ namespace ExoStudio.Simulation
         /// </summary>
         public const double FlatLevelFractionOfFullWell = 0.5;
 
+        /// <summary>
+        /// Calibration's own PCG32 streams, one pair per kind, disjoint from the 1-10 the imaging
+        /// pipeline claims (Core/Pcg32) so a master can never replay an exposure's own draws.
+        /// The stride of 2 leaves each kind a shot and a read stream of its own.
+        /// </summary>
+        private const ulong StreamCalibShot = 32UL;
+        private const ulong StreamCalibRead = 33UL;
+
         public sealed class Result
         {
             public Kind FrameKind;
@@ -66,6 +74,12 @@ namespace ExoStudio.Simulation
             /// <summary>Mean and spatial scatter of the stack, in ADU. The two numbers that say whether the master is worth using.</summary>
             public double MeanAdu;
             public double RmsAdu;
+
+            /// <summary>The charge-transfer smear constant this frame was built with, zero on a detector that cannot smear.</summary>
+            public double SmearConstant;
+
+            /// <summary>The seed the stack's noise was drawn from, reported whether supplied or drawn, as RANDSEED is.</summary>
+            public ulong Seed;
 
             public List<string> Notes = new();
         }
@@ -94,6 +108,7 @@ namespace ExoStudio.Simulation
                 H = p.H,
                 Count = count,
                 ExposureSeconds = kind == Kind.Bias ? 0.0 : Math.Max(0.0, exposureSeconds),
+                Seed = seed,
             };
 
             // The dark charge of THIS frame's duration, scaled from the science exposure's. A dark
@@ -131,25 +146,53 @@ namespace ExoStudio.Simulation
                           + $"against a {p.FullWellElectrons:F0} e- well), so the flat is aimed at half the "
                           + "converter's range. This is what an observer watching the histogram does.");
 
+            // The mean light plane of this frame, built once because it is identical in every frame
+            // of the sequence: only the noise differs between them. Light through the array's photo
+            // response AND the focal plane's illumination, exactly as Digitise applies them and in
+            // the same order. This is the whole point of a flat: both are multiplicative on the
+            // light, so a frame taken through the same optics carries both and dividing by it
+            // removes both. If the flat did not carry the illumination, dividing by it would leave
+            // the vignetting in the science frame while claiming to have calibrated it.
+            var lightPlane = new float[n];
+            for (int i = 0; i < n; i++)
+                lightPlane[i] = (float)(flatElectrons
+                              * SensorNonUniformity.PhotoResponse(p.PhotoResponseMap, i)
+                              * DeepSkyCamera.Illumination(p.IlluminationMap, i));
+
+            // A FLAT ON A SHUTTERLESS DETECTOR CARRIES SMEAR TOO, and it is worse here than it
+            // looks. Smearing a UNIFORM field does not produce a faint stripe under a bright star;
+            // it produces a clean linear RAMP across the whole frame, deepest at the readout edge.
+            // A master flat built from such frames therefore has a gradient in it that was never
+            // the array's photo response, and dividing by that master puts the gradient into every
+            // science frame it ever calibrates, inverted, where it reads as a real sky gradient.
+            //
+            // No special case is needed for the other two kinds and none is written: a bias is a
+            // zero-second exposure so the constant is zero, and a dark has no light plane to smear.
+            // The physics produces the right answer for all three from one line.
+            double smearConstant = DeepSkyCamera.SmearConstantFor(p.Spec, r.ExposureSeconds, p.H);
+            ChargeTransferSmear.Add(lightPlane, p.W, p.H, smearConstant, ChargeTransferSmear.ReadoutAxis.Columns);
+
             for (int frame = 0; frame < count; frame++)
             {
                 // A distinct seed per frame, so the sequence really is independent realisations of
                 // the temporal noise. Sharing one would average a single draw n times and report a
                 // read noise sqrt(n) too low, which is the flattering version of this measurement.
-                var rngShot = new Pcg32(seed + (ulong)frame * 7919UL, Pcg32.StreamShotNoise);
-                var rngRead = new Pcg32(seed + (ulong)frame * 7919UL, Pcg32.StreamReadNoise);
+                //
+                // AND ITS OWN STREAM PER KIND, which is not tidiness. Digitise draws the light from
+                // Pcg32(seed, StreamShotNoise/StreamReadNoise); frame 0 here used the identical
+                // constructor, so a bias built with the SAME seed as the light carried that light's
+                // exact read-noise realisation, and subtracting it cancelled real noise instead of
+                // the pedestal - 1/16 of it at the default count, deterministically, with the
+                // photometric scatter coming out better than the physics and nothing saying so.
+                // Reproducing a whole session under one seed has to stay safe, so calibration draws
+                // from streams no exposure uses, and each kind from its own so that a dark minus a
+                // bias is a difference of two realisations rather than of one with itself.
+                var rngShot = new Pcg32(seed + (ulong)frame * 7919UL, StreamCalibShot + 2UL * (ulong)kind);
+                var rngRead = new Pcg32(seed + (ulong)frame * 7919UL, StreamCalibRead + 2UL * (ulong)kind);
 
                 for (int i = 0; i < n; i++)
                 {
-                    // Light through the array's photo response AND the focal plane's illumination,
-                    // exactly as Digitise applies them and in the same order. This is the whole
-                    // point of a flat: both are multiplicative on the light, so a frame taken
-                    // through the same optics carries both and dividing by it removes both. If the
-                    // flat did not carry the illumination, dividing by it would leave the
-                    // vignetting in the science frame while claiming to have calibrated it.
-                    double light = flatElectrons
-                                 * SensorNonUniformity.PhotoResponse(p.PhotoResponseMap, i)
-                                 * DeepSkyCamera.Illumination(p.IlluminationMap, i);
+                    double light = lightPlane[i];
                     double e = light + darkElectrons > 0.0
                         ? NoiseSampler.Poisson(rngShot, light + darkElectrons)
                         : 0.0;
@@ -206,13 +249,24 @@ namespace ExoStudio.Simulation
                 r.Notes.Add("This detector publishes no offset fixed-pattern figure, so the bias is one "
                           + "constant plus read noise and subtracting it is the same as subtracting a number.");
 
+            if (smearConstant > 0.0)
+            {
+                r.SmearConstant = smearConstant;
+                double depth = ChargeTransferSmear.WorstCaseFractionOfUniformField(smearConstant, p.H);
+                r.Notes.Add($"This detector is read out while still exposed, so this frame carries a "
+                          + $"charge-transfer smear ramp reaching {depth * 100:F2} % of the illumination at "
+                          + "the readout edge. That ramp is NOT the array's photo response: dividing a "
+                          + "science frame by a master built from these would print the gradient into it "
+                          + "inverted. Desmear before building the master, or shorten the transfer.");
+            }
+
             return r;
         }
 
         /// <summary>
         /// The reduction an observer actually performs:
         ///
-        ///     science = (light - bias - dark) / (flat normalised to its own mean)
+        ///     science = desmear(light - bias - dark) / (flat normalised to its own mean)
         ///
         /// The flat is bias- and dark-subtracted first and then divided by its mean, so the division
         /// removes the array's pattern without moving the frame's level. Every argument is in ADU
@@ -220,9 +274,28 @@ namespace ExoStudio.Simulation
         /// needs no change of units.
         ///
         /// A null master is simply skipped, which is what an observer who took no flat has.
+        ///
+        /// WHY THE DESMEAR SITS EXACTLY THERE, between the subtractions and the division, and not
+        /// anywhere else. Both neighbours are load-bearing:
+        ///
+        ///   * AFTER THE BIAS. The smear model is a statement about LIGHT, and its inverse sums
+        ///     rows. A pedestal sitting in every pixel would be summed by that recurrence into a
+        ///     ramp no detector produced, so desmearing a frame that still carries its bias
+        ///     manufactures a gradient out of a constant. This is the arithmetic behind the
+        ///     ordinary observing-floor remark that you cannot desmear before you have subtracted
+        ///     the bias, and it is why a simulator whose bias is a single flat number can appear to
+        ///     get away with the wrong order: the error it makes is invisible until the bias has
+        ///     structure.
+        ///   * BEFORE THE FLAT. The smear charge was collected in the pixels the packet TRANSITED,
+        ///     so it carries their response, not its destination's. Dividing first would scale the
+        ///     stripe by the wrong pixel's flat and leave a residue the desmear can no longer see.
+        ///     Kepler and TESS both order their pipelines this way for the same reason.
+        ///
+        /// A zero constant skips the step entirely, which is every detector that cannot smear.
         /// </summary>
         public static float[] Calibrate(float[] light, float[] bias, float[] dark, float[] flat,
-                                        double biasLevelAdu)
+                                        double biasLevelAdu,
+                                        double smearConstant = 0.0, int width = 0, int height = 0)
         {
             if (light == null) return null;
             var outAdu = new float[light.Length];
@@ -230,31 +303,52 @@ namespace ExoStudio.Simulation
             // The flat's own normalisation, computed once over the pixels that carry signal.
             double flatMean = 0.0;
             int flatCount = 0;
+            // THE SAME LENGTH GUARDS PASS TWO APPLIES, applied here too. This loop was entered on the
+            // flat's length alone and then indexed bias[i] and dark[i] unguarded, so a master built
+            // at another binning threw IndexOutOfRangeException out of the endpoint as an HTTP 500
+            // with an empty body - every id involved minted by this API. Pass two below already
+            // knew the rule; the code knew it in one place and not the other.
+            bool biasFits = bias != null && bias.Length == light.Length;
+            bool darkFits = dark != null && dark.Length == light.Length;
             if (flat != null && flat.Length == light.Length)
             {
                 for (int i = 0; i < flat.Length; i++)
                 {
-                    double f = flat[i] - (bias != null ? bias[i] : biasLevelAdu)
-                                       - (dark != null ? dark[i] - (bias != null ? bias[i] : biasLevelAdu) : 0.0);
+                    double pedestal = biasFits ? bias[i] : biasLevelAdu;
+                    double f = flat[i] - pedestal - (darkFits ? dark[i] - pedestal : 0.0);
                     if (f > 0.0) { flatMean += f; flatCount++; }
                 }
                 flatMean = flatCount > 0 ? flatMean / flatCount : 0.0;
             }
 
+            // PASS ONE, THE SUBTRACTIONS. Bias first: it is in every frame including the dark, so
+            // subtracting the dark without removing its bias would take the pedestal out twice.
+            // The frame leaves this pass pedestal-free, which is the state the desmear requires.
             for (int i = 0; i < light.Length; i++)
             {
-                double v = light[i];
-
-                // Bias first: it is in every frame including the dark, so subtracting the dark
-                // without removing its bias would take the pedestal out twice.
                 double pedestal = bias != null && bias.Length == light.Length ? bias[i] : biasLevelAdu;
-                v -= pedestal;
+                double v = light[i] - pedestal;
 
                 if (dark != null && dark.Length == light.Length)
                     v -= dark[i] - pedestal;
 
+                outAdu[i] = (float)v;
+            }
+
+            // THE DESMEAR, between the subtractions and the division. Both of those neighbours are
+            // load-bearing and the summary above says why each one is.
+            if (smearConstant > 0.0 && width > 0 && height > 0 && width * height <= outAdu.Length)
+                ChargeTransferSmear.Remove(outAdu, width, height, smearConstant,
+                                           ChargeTransferSmear.ReadoutAxis.Columns);
+
+            // PASS TWO, THE DIVISION.
+            for (int i = 0; i < light.Length; i++)
+            {
+                double v = outAdu[i];
+
                 if (flat != null && flat.Length == light.Length && flatMean > 0.0)
                 {
+                    double pedestal = bias != null && bias.Length == light.Length ? bias[i] : biasLevelAdu;
                     double f = flat[i] - pedestal
                              - (dark != null && dark.Length == light.Length ? dark[i] - pedestal : 0.0);
                     double gain = f / flatMean;

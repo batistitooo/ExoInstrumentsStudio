@@ -9,9 +9,11 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   boot: null,
-  mode: 'astro',     // astro | exo. The landing mode is astrophotography; see setMode.
+  mode: 'astro',     // astro | exo | lc | research. The landing mode is astrophotography; see setMode.
   modeSeq: 0,        // bumped on every mode change; the receipt a late await checks. See ofThisMode.
   capture: null,     // the stored frame the calibration panel is working against
+  sequence: null,    // the running or finished photometric sequence; see runSequence
+  seqStream: null,   // its EventSource, closed by stopSequenceStream and by every mode change
   masters: {},       // {Bias|Dark|Flat: {id, ...}} chosen for the next reduction
   target: null,      // selected catalogue entry
   campaign: null,    // live campaign snapshot
@@ -30,6 +32,27 @@ const state = {
   sky: null,         // /api/sky payload
   skySel: null,      // selected host on the chart
   skyHover: null,    // hovered host
+
+  // --- light curve mode --------------------------------------------------------
+  lcStars: null,     // the probe frame's matched stars, as photometry returned them
+  lcStarSort: { key: 'snr', dir: -1 },
+  lcStarFilter: 'usable',
+  lcHost: null,      // the star chosen as the transit host: {raDeg, decDeg, colourBv, ...}
+  lcReq: null,       // the last /api/pwv/requirement answer
+  lcLoss: null,      // the last /api/pwv/loss-curve answer
+  lcTransfer: null,  // the last /api/pwv/transit-bias answer
+  lcDepth: null,     // the last fitted depth
+  lcReqSort: null,   // {key, dir} once a requirement-table header has been clicked; null is the server's order
+  // WHICH INSTRUMENT EACH FAMILY OF ANSWERS WAS MEASURED THROUGH, as {key, label}. Changing the
+  // instrument used to leave the analytic panels and the star list on the page untouched, so a
+  // reader who moved from a RedCat to the RC20 read five panels of RedCat numbers under an RC20
+  // heading. These are compared against the selection in refreshLcInstrumentStaleness.
+  lcProbedWith: null,       // the star list
+  lcPredictedWith: null,    // the band, the loss curve, the requirement and the colour matrix
+  lcTransferredWith: null,  // the transfer function
+  lcStaleReason: null,      // 'request' after a refused prediction, so an instrument change and its undoing do not erase it
+  lcRuns: [],        // finished sequences this session, for the paired comparison
+  lcCurves: {},      // uploaded instrument curves, by band name
 };
 
 /* ------------------------------------------------------------------ format */
@@ -117,7 +140,7 @@ async function boot() {
  *     cannot be selected, and they hide the few thousand that can.
  */
 function setMode(mode, opts = {}) {
-  if (mode !== 'astro' && mode !== 'exo' && mode !== 'research') mode = 'astro';
+  if (!['astro', 'exo', 'lc', 'research'].includes(mode)) mode = 'astro';
   if (!opts.initial && mode === state.mode) return;
   state.mode = mode;
   state.modeSeq++;
@@ -132,12 +155,19 @@ function setMode(mode, opts = {}) {
   // The instrument list holds only this mode's instruments. Leaving the other mode's in and
   // hiding them would let a stale selection survive a mode change, which is how you end up
   // photographing with a spectrograph.
+  // THE LIGHT-CURVE MODE TAKES ASTROGRAPHS, and only the ground ones: an airmass ladder has no
+  // meaning above the atmosphere, and the server refuses a sequence on an orbital instrument for
+  // exactly that reason. Offering one here would be offering a control the server rejects.
   const inst = $('instrument');
-  inst.innerHTML = mode === 'astro'
-    ? state.telescopes.map((t) => `<option value="visual:${t.name}">${t.displayName}</option>`).join('')
+  const wantsAstrograph = mode === 'astro' || mode === 'lc';
+  const offered = mode === 'lc'
+    ? state.telescopes.filter((t) => !t.isSpaceBased)
+    : state.telescopes;
+  inst.innerHTML = wantsAstrograph
+    ? offered.map((t) => `<option value="visual:${t.name}">${t.displayName}</option>`).join('')
     : state.boot.instruments.map((i) => `<option value="${i.name}">${i.displayName}</option>`).join('');
-  inst.value = mode === 'astro'
-    ? `visual:${(state.telescopes.find((t) => !t.isSpaceBased) || state.telescopes[0]).name}`
+  inst.value = wantsAstrograph
+    ? `visual:${(offered.find((t) => !t.isSpaceBased) || offered[0]).name}`
     : (state.boot.instruments.find((i) => i.name === 'HARPS') || state.boot.instruments[0]).name;
 
   // Anything the other mode put on the page goes, rather than lingering under the new one.
@@ -153,6 +183,7 @@ function setMode(mode, opts = {}) {
   for (const id of ['clockbar', 'skyPanel', 'seriesPanel', 'foldPanel', 'resultPanel', 'orbitPanel']) {
     $(id).hidden = true;
   }
+  for (const id of LC_PANELS) $(id).hidden = true;
 
   // RESEARCH USES THE SAME TWO COLUMNS as the other modes: what to look at on the left, what came
   // back on the right. It takes no instrument, site or clock, because the observation already
@@ -178,23 +209,50 @@ function setMode(mode, opts = {}) {
     $('forecastPanel').hidden = true;
     $('siteBlock').hidden = true;
     $('captureSetup').hidden = true;
+    $('seqSetup').hidden = true;
+    $('waterBlock').hidden = true;
+    $('seqPanel').hidden = true;
+    for (const id of LC_BLOCKS) $(id).hidden = true;
     loadResearchRuns();
     return;
   }
   // Coming back out of research: the simulator's blocks return, and hidden state is recomputed
   // by onInstrumentChange below rather than remembered here.
   for (const el of document.querySelectorAll('.panel.setup > section.block')) {
-    if (!el.id.startsWith('rs') && !['targetCard', 'spacecraftBlock', 'captureSetup'].includes(el.id)) {
+    if (!el.id.startsWith('rs') && !el.id.startsWith('lc')
+        && !['targetCard', 'spacecraftBlock', 'captureSetup', 'seqSetup', 'waterBlock'].includes(el.id)) {
       el.hidden = false;
     }
   }
   $('siteBlock').hidden = false;
 
+  // THE LIGHT-CURVE MODE'S OWN SETUP. The target search and its card belong to the other two:
+  // this mode points at a FIELD and picks its star out of a reduced frame, because a transit has
+  // to go into a star that exists and the catalogue cannot say which of them this instrument can
+  // actually measure. See the star list.
+  const lc = mode === 'lc';
+  for (const id of LC_BLOCKS) $(id).hidden = !lc;
+  if (lc) {
+    $('search').closest('section.block').hidden = true;
+    $('targetCard').hidden = true;
+    fillLcBands();
+    seedLcBandList();
+    fillLcSites();
+    renderLcChain();
+    refreshLcRunPickers();
+  }
+
   onInstrumentChange();
   applyGaiaVisibility();
   drawSkyStatic();
   drawSkyOverlay();
-  if (!opts.initial) openingTarget();
+  // NO OPENING TARGET IN THE LIGHT-CURVE MODE. It points at a field and picks its host out of a
+  // reduced frame, because the catalogue cannot say which of a field's stars THIS instrument can
+  // actually measure in every frame - which is the condition the whole run depends on. Running the
+  // opening search here put a planet-host card at the top of a column that has no use for one, and
+  // openingTarget() un-hides that card after setMode has hidden it.
+  if (!opts.initial && mode !== 'lc') openingTarget();
+  if (lc) { $('targetCard').hidden = true; $('search').closest('section.block').hidden = true; }
 }
 
 /**
@@ -285,6 +343,13 @@ function showPanelsFor(isAstrograph) {
   for (const id of ['clockbar', 'skyPanel', 'seriesPanel', 'foldPanel', 'resultPanel']) {
     if (isAstrograph) $(id).hidden = true;
   }
+  // The sequence is an astrograph instrument's measurement and means nothing without one. Its
+  // results panel goes too: a floor measured on one telescope is not a statement about another.
+  if (!isAstrograph) {
+    $('seqPanel').hidden = true;
+    stopSequenceStream();
+    state.sequence = null;
+  }
   // Leaving astrograph mode drops the frame itself, not just its panel: the next capture
   // starts from nothing rather than replacing a picture of a different telescope. The masters
   // go with it, since each was checked against that exposure and describes no other.
@@ -299,8 +364,17 @@ function showPanelsFor(isAstrograph) {
 
 function onInstrumentChange() {
   const scope = selectedScope();
+  const lc = state.mode === 'lc';
   state.captureMode = !!scope;
-  $('captureSetup').hidden = !scope;
+  // THE SEQUENCE MOVED. It used to sit under the astrophotography mode, which was the wrong
+  // home for it: that mode answers "what does this field look like through this instrument",
+  // and a sequence answers "how stable is this ratio over three hours". Different question,
+  // different mode. The single capture stays where it was.
+  $('captureSetup').hidden = !scope || lc;
+  $('seqSetup').hidden = !scope || scope.isSpaceBased || !lc;
+  // One water control, shown wherever a request can carry a column: the single capture in
+  // astrophotography, the sequence here. There is only one of it, so the two cannot drift.
+  $('waterBlock').hidden = !scope || scope.isSpaceBased || state.mode === 'exo' || state.mode === 'research';
   $('observe').hidden = !!scope;
   showPanelsFor(!!scope);
 
@@ -320,8 +394,44 @@ function onInstrumentChange() {
     $('siteBlock').hidden = !!scope.isSpaceBased;
     $('trackWrap').hidden = !!scope.isSpaceBased;
     $('spacecraftBlock').hidden = !scope.isSpaceBased;
+    // Same rule for the water: in orbit there is no column, so the control goes rather than
+    // sitting there set to 10 mm over a frame that will be refused for asking.
+    drawPwvCurve();
 
-    $('capFilter').innerHTML = scope.filters.map((f) => `<option>${f}</option>`).join('');
+    // THE SLOT IS THE VALUE, THE LABEL IS THE TEXT. CameraFilter is a fixed ten-name enum built
+    // for an amateur wheel, so an observer's own band has to be mounted in whichever slot is free
+    // and the slot's name then says something false about it. Every request still sends the slot;
+    // only what the reader sees changes. Built with DOM nodes rather than an HTML string because a
+    // label is user-supplied text and interpolating it would run whatever it contained.
+    {
+      const sel = $('capFilter');
+      const was = sel.value;
+      sel.textContent = '';
+      // `bands` is authoritative when the server sends it: an instrument names its own, however
+      // many, and every endpoint resolves a request against that list. `filters` is the older
+      // ten-name enum vocabulary and is the fallback for anything that predates bands.
+      const names = (scope.bands && scope.bands.length)
+        ? scope.bands.map((b) => b.name)
+        : scope.filters;
+      for (const n of names) {
+        const opt = document.createElement('option');
+        opt.value = n;
+        opt.textContent = (scope.filterLabels && scope.filterLabels[n]) || n;
+        const b = scope.bands && scope.bands.find((x) => x.name === n);
+        if (b && b.centralWavelengthNm) {
+          const half = (b.bandwidthAngstrom || 0) / 20;
+          opt.title = `${(b.centralWavelengthNm - half).toFixed(0)}-`
+                    + `${(b.centralWavelengthNm + half).toFixed(0)} nm`
+                    + (b.measuredCurve ? ', measured curve' : ', top-hat');
+        }
+        sel.appendChild(opt);
+      }
+      if (was && names.includes(was)) sel.value = was;
+    }
+    fillLcBands();
+    // The light-curve answers already on the page were measured through SOME instrument, and it
+    // may not be this one any more. See refreshLcInstrumentStaleness.
+    if (lc) refreshLcInstrumentStaleness(scope);
     setupCooler(scope);
     setupZoom(scope);
     $('targetChips').hidden = true;
@@ -417,12 +527,14 @@ async function search(q) {
    mag:<9, alt:>30). Clicking a row aims the telescope. */
 async function pointingSearch(q) {
   const mine = modeReceipt();
-  const qs = new URLSearchParams({ q: q || 'type:nebula', site: $('site').value, limit: 60 });
+  const asked = q || 'type:nebula';
+  const qs = new URLSearchParams({ q: asked, site: $('site').value, limit: 60 });
   const r = await fetch(`/api/pointing-search?${qs}`);
   if (!r.ok) return;
   const d = await r.json();
   if (!ofThisMode(mine)) return;
   const ul = $('results');
+  const notUnderstood = pointingFiltersNotUnderstood(asked, d.unrecognised);
 
   ul.innerHTML = d.rows.map((t, i) => `
     <li data-i="${i}">
@@ -432,7 +544,10 @@ async function pointingSearch(q) {
     </li>`).join('');
 
   $('resultCount').textContent =
-    `${d.total} of ${fmt.int(d.indexed)} pointable targets · try type:nebula, in:Ori, mag:<9, alt:>30`;
+    `${d.total} of ${fmt.int(d.indexed)} pointable targets` +
+    (notUnderstood.length
+      ? ` · NOT understood and left out: ${notUnderstood.join(', ')}. The search ran wider than asked.`
+      : ' · try type:nebula, in:Ori, mag:<9, alt:>30');
 
   [...ul.children].forEach((li) => {
     li.onclick = () => {
@@ -459,6 +574,32 @@ async function pointingSearch(q) {
       $('targetCard').hidden = false;
     };
   });
+}
+
+/* THE FILTERS THAT MEAN NOTHING, NAMED. Core/TargetQuery.Parse keeps every "key:value" token it
+   cannot apply in its Unrecognised list and leaves it out of the query, which quietly widens the
+   search: "typ:nebula" listed the whole index as if nothing had been asked, and the count line
+   read like a success. /api/pointing-search does not forward that list yet, so this reads it the
+   day it does (`served`) and until then judges what it can on its own, by the same rule Core uses:
+   a key Core has no case for, or a magnitude or altitude whose value is not a number, or an
+   altitude asked to be lower. A VALUE only Core's tables can judge, type:nebulla or in:Orx, still
+   passes here unremarked; that is the server's to report, not the page's to guess. */
+const POINTING_FILTER_KEYS = ['type', 'kind', 'in', 'constellation', 'con',
+                              'mag', 'magnitude', 'v', 'alt', 'altitude'];
+function pointingFiltersNotUnderstood(q, served) {
+  if (Array.isArray(served)) return served;
+  const bad = [];
+  for (const raw of String(q || '').split(/[ \t,]+/).filter(Boolean)) {
+    const colon = raw.indexOf(':');
+    if (colon <= 0 || colon === raw.length - 1) continue;
+    const key = raw.slice(0, colon).toLowerCase(), value = raw.slice(colon + 1);
+    if (!POINTING_FILTER_KEYS.includes(key)) { bad.push(raw); continue; }
+    if (['mag', 'magnitude', 'v', 'alt', 'altitude'].includes(key)) {
+      const number = Number(value.replace(/^[<>]=?/, ''));
+      if (!Number.isFinite(number) || (key.startsWith('alt') && value[0] === '<')) bad.push(raw);
+    }
+  }
+  return bad;
 }
 
 document.querySelectorAll('#targetChips .chip').forEach((chip) => {
@@ -1051,6 +1192,12 @@ function updateZoomOut(scope) {
     `field ${(fov * 60).toFixed(1)}′ across · range ${(scope.minFovDeg * 60).toFixed(1)}′ to ${(scope.maxFovDeg * 60).toFixed(1)}′`;
 }
 
+// What the selected filter is CALLED, for anything a human reads. The value stays the slot.
+function filterLabelNow() {
+  const sel = $('capFilter');
+  return sel.selectedOptions.length ? sel.selectedOptions[0].textContent : sel.value;
+}
+
 function currentObjectName() {
   if (state.capObject) return state.capObject;
   const ra = parseFloat($('capRa').value), dec = parseFloat($('capDec').value);
@@ -1058,6 +1205,92 @@ function currentObjectName() {
 }
 
 ['capRa', 'capDec'].forEach((id) => $(id).addEventListener('change', scheduleForecast));
+
+// ---------------------------------------------------------------- the FITS bundle
+// The same request the single Capture sends, repeated N times per filter on the server and
+// returned as one ZIP. Built here from the SAME controls, so the bundle cannot quietly differ
+// from the frame the reader just looked at.
+function bundleFilterList() {
+  const mode = $('bunFilters').value;
+  if (mode === 'rgb') return ['Red', 'Green', 'Blue'];
+  if (mode === 'all') return [...$('capFilter').options].map((o) => o.value);
+  return [$('capFilter').value];
+}
+function bundleCost() {
+  const n = parseInt($('bunCount').value, 10) || 0;
+  const f = bundleFilterList().length;
+  const total = n * f;
+  $('bunCost').textContent = total > 64
+    ? `${f} filter(s) × ${n} = ${total} frames; the server bundles at most 64 at once.`
+    : `${f} filter(s) × ${n} = ${total} frames, roughly ${Math.round(total * 12 / 60)} min at native resolution. Seeds run base + i·7919.`;
+}
+for (const id of ['bunCount', 'bunFilters', 'capFilter']) $(id).addEventListener('input', bundleCost);
+bundleCost();
+
+$('bundle').onclick = async () => {
+  const scope = selectedScope();
+  if (!scope) return;
+  const btn = $('bundle');
+  const filters = bundleFilterList();
+  const count = parseInt($('bunCount').value, 10) || 1;
+  if (filters.length * count > 64) {
+    $('bundleError').hidden = false;
+    $('bundleError').textContent = `${filters.length * count} frames is over the 64 this build bundles at once.`;
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Exposing…';
+  $('bundleError').hidden = true; $('bunLink').innerHTML = '';
+  $('bunStatus').hidden = false;
+  $('bunStatus').textContent = `${filters.length * count} frames on the server; the download starts when the last one is written.`;
+  try {
+    const r = await fetch('/api/captures/bundle', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        count,
+        filters,
+        capture: {
+          telescope: scope.name,
+          site: $('site').value,
+          raDeg: parseFloat($('capRa').value),
+          decDeg: parseFloat($('capDec').value),
+          filter: $('capFilter').value,
+          exposureSeconds: parseFloat($('capExp').value),
+          binning: parseInt($('capBin').value, 10),
+          tracking: $('capTrack').checked,
+          objectName: currentObjectName(),
+          detectorTemperatureCelsius: $('coolRow').hidden ? undefined : $('capTemp').valueAsNumber,
+          zoomFactor: $('zoomRow').hidden ? undefined : $('capZoom').valueAsNumber,
+          atUtc: (scope.isSpaceBased ? undefined : state.fcStartIso) || undefined,
+          seed: $('capSeed').value.trim() === '' ? undefined : Number($('capSeed').value),
+          pwv: pwvRequestBody(),
+        },
+      }),
+    });
+    if (!r.ok) {
+      let msg = 'The bundle was refused.';
+      try { msg = (await r.json()).error || msg; } catch (e) { /* not JSON */ }
+      $('bundleError').hidden = false; $('bundleError').textContent = msg;
+      $('bunStatus').hidden = true;
+      return;
+    }
+    const blob = await r.blob();
+    const disp = r.headers.get('content-disposition') || '';
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)/i.exec(disp);
+    const name = m ? decodeURIComponent(m[1]) : 'frames.zip';
+    const url = URL.createObjectURL(blob);
+    $('bunLink').innerHTML =
+      `<a href="${url}" download="${name}">Download ${name}</a> <span class="dim">${(blob.size / 1e6).toFixed(1)} MB · ${filters.length * count} FITS + manifest.json · stack in Siril, PixInsight, Astro Pixel Processor</span>`;
+    $('bunStatus').hidden = true;
+    // Also click it, so the reader does not have to find the link after a long wait.
+    $('bunLink').querySelector('a').click();
+  } catch (e) {
+    $('bundleError').hidden = false; $('bundleError').textContent = String(e);
+    $('bunStatus').hidden = true;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Capture and download the bundle';
+  }
+};
 
 $('capture').onclick = async () => {
   const mine = modeReceipt();
@@ -1089,6 +1322,9 @@ $('capture').onclick = async () => {
         // telescope: that slot was chosen off a GROUND site's night, and up there it
         // means nothing but would be honoured as a hard booking and probably refused.
         atUtc: (scope.isSpaceBased ? undefined : state.fcStartIso) || undefined,
+        // Empty means "draw one and tell me", which is what the server does and reports back.
+        seed: $('capSeed').value.trim() === '' ? undefined : Number($('capSeed').value),
+        pwv: pwvRequestBody(),
       }),
     });
     const data = await r.json();
@@ -1116,13 +1352,17 @@ $('capture').onclick = async () => {
     $('reduceOut').textContent = '';
     $('calError').hidden = true;
     $('captureTitle').textContent =
-      `${scope.displayName}, ${currentObjectName()}, ${$('capFilter').value}, ${$('capExp').value} s`;
+      `${scope.displayName}, ${currentObjectName()}, ${filterLabelNow()}, ${$('capExp').value} s`;
     $('captureNote').textContent =
       `${data.width}×${data.height} px · ${fmt.num(data.fovArcmin[0], 1)}′×${fmt.num(data.fovArcmin[1], 1)}′ · ` +
       `${fmt.num(data.plateScaleArcsec, 2)}″/px`;
 
     const bits = [
       data.observedUtc ? `${state.fcStartIso ? 'booked' : 'scheduled'} ${data.observedUtc}` : null,
+      // The exact instant as a number, because the panel's own stamp is to the minute and a
+      // sequence, a re-capture or a cross-check needs the second.
+      data.observedUt !== null && data.observedUt !== undefined
+        ? `ut ${fmt.num(data.observedUt, 1)} s` : null,
       `${fmt.int(data.starsDrawn)} Gaia stars`,
       data.galaxiesDrawn ? `${data.galaxiesDrawn} galaxies${data.galaxiesFromImages.length ? ' (' + data.galaxiesFromImages.join(', ') + ' from measured maps)' : ''}` : null,
       data.emissionLines ? `emission: ${data.emissionLines}` : null,
@@ -1153,9 +1393,24 @@ $('capture').onclick = async () => {
       data.saturatedFraction > 0 ? `${(data.saturatedFraction * 100).toFixed(2)}% saturated` : null,
       data.detectorTemperatureC !== null && data.detectorTemperatureC !== undefined
         ? `sensor ${fmt.num(data.detectorTemperatureC, 0)} °C, dark ${fmt.num(data.darkElectronsPerPixel, 1)} e⁻/px` : null,
+
+      // The seed, because the frame is reproducible from it (it is the header's RANDSEED):
+      // posting the same request with this seed repeats the noise draw bit for bit.
+      data.seed !== null && data.seed !== undefined ? `seed ${data.seed}` : null,
+      // The water this frame was actually taken through, and which series it came from. Absent is
+      // not zero, so nothing is printed when the term was not modelled.
+      data.pwvMm !== null && data.pwvMm !== undefined
+        ? `water ${fmt.num(data.pwvMm, 2)} mm (${data.pwvSeriesId})` : null,
       `${fmt.int(data.computeMs)} ms`,
     ].filter(Boolean);
     $('captureMeta').textContent = bits.join(' · ');
+
+    // The seed that was USED, put where it can be reused: a drawn seed is only reproducible if
+    // the observer can see it and send it back.
+    if (data.seed !== null && data.seed !== undefined) {
+      $('capSeed').value = data.seed;
+      $('capSeedOut').textContent = String(data.seed);
+    }
 
     $('captureLinks').innerHTML = data.fitsUrl
       ? `<a href="${data.fitsUrl}" download>Download FITS</a> <span class="dim">16-bit, WCS and MAGZERO in the header; stack in Siril</span>`
@@ -1273,6 +1528,7 @@ async function loadForecast() {
   paintRamp();
   $('fcBest').hidden = !f.bestUtc;
   drawForecast();
+  drawPwvCurve();
 }
 
 function siteName() {
@@ -1407,6 +1663,9 @@ function armStart(ut) {
   $('fcStartChip').textContent =
     `${selectedScope() ? 'shoots' : 'starts'} ${d.toISOString().slice(0, 16).replace('T', ' ')}Z (click to clear)`;
   drawForecast();
+  // Booking a slot changes the air column the frame will be exposed through, and the water plot
+  // is drawn at that airmass rather than at one of its own choosing.
+  drawPwvCurve();
 }
 
 $('forecast').addEventListener('click', (e) => {
@@ -1441,6 +1700,9 @@ $('fcStartChip').onclick = () => {
   state.fcStartIso = null;
   $('fcStartChip').hidden = true;
   drawForecast();
+  // Clearing the booking hands the epoch back to the server, which will schedule the forecast's
+  // best moment - a different airmass, so a different water transmission.
+  drawPwvCurve();
 };
 
 /* -------------------------------------------------------------------- misc */
@@ -1453,6 +1715,13 @@ window.addEventListener('resize', () => {
   resizeTimer = setTimeout(() => {
     redrawChart();
     drawForecast();
+    drawSequence();
+    // THE LIGHT-CURVE CANVASES TOO. Every one of them sizes its backing store from clientWidth,
+    // so a column that changes width leaves the last drawing stretched across the new one: the
+    // axis labels smear and the plot is a scaled picture of an older layout. Hiding a panel is
+    // enough to trigger it, because the scrollbar goes with it.
+    redrawLcCanvases();
+    redrawPwvCurve();
     if (state.campaign) {
       drawSeries();
       const best = state.campaign.analysis?.signals.find((s) => s.detected);
@@ -1800,6 +2069,11 @@ function drawSkyStatic() {
   // thousand that can. See setMode.
   if (state.mode !== 'exo' && !gaiaWanted()) {
     for (const [ra, dec, v] of sky.stars) {
+      // A star the catalogue has no magnitude for arrives as null: the server writes null for
+      // any non-finite number now, where it used to write the string "NaN". Drawn anyway, the
+      // arithmetic below reads null as 0 and paints it as a magnitude 0 star, the brightest
+      // thing on the chart, in a place the eye then looks for and finds nothing. Skipped.
+      if (!Number.isFinite(v)) continue;
       const p = skyXY(ra, dec, geo);
       const r = Math.max(0.4, 1.9 - 0.21 * v);
       g.globalAlpha = Math.max(0.16, Math.min(0.95, 1.05 - 0.125 * v));
@@ -2250,7 +2524,7 @@ function classForBlock(reason) {
    that decides essentially everything: the subject occupies a few tens of ADU on top of a sky
    pedestal, out of a converter counting to tens of thousands. The page has always chosen those
    levels from the frame; a viewer opened with defaults has not. Switching between the three here
-   costs one request and no recomputation of the frame — the stored ADU are rendered again. */
+   costs one request and no recomputation of the frame: the stored ADU are rendered again. */
 
 state.stretch = 'asinh';
 
@@ -2270,7 +2544,7 @@ async function applyStretch() {
     $('stretchNote').textContent =
       `black ${fmt.num(d.blackAdu, 1)} ADU · white ${fmt.num(d.whiteAdu, 1)} ADU · ` +
       `${((d.whiteAdu - d.blackAdu) / d.maxAdu * 100).toFixed(2)} % of the converter's ` +
-      `${fmt.num(d.maxAdu, 0)} ADU range — ${d.note}`;
+      `${fmt.num(d.maxAdu, 0)} ADU range · ${d.note}`;
   } catch (e) {
     $('stretchNote').textContent = String(e);
   }
@@ -2337,7 +2611,7 @@ function renderMasters() {
     tr.innerHTML =
       `<td class="mkind">${kind}</td>` +
       `<td>${m.imported ? 'your file' : `${m.framesAveraged}× simulated`}</td>` +
-      `<td class="mono">${m.exposureSeconds ? fmt.num(m.exposureSeconds, 1) + ' s' : '—'}</td>` +
+      `<td class="mono">${m.exposureSeconds ? fmt.num(m.exposureSeconds, 1) + ' s' : 'n/a'}</td>` +
       `<td class="mono">${fmt.num(m.meanAdu, 1)}</td>` +
       `<td class="mono">${fmt.num(m.rmsAdu, 2)}</td>` +
       `<td><label><input type="checkbox" data-use="${kind}" ${m.use === false ? '' : 'checked'}></label></td>` +
@@ -2366,6 +2640,8 @@ for (const btn of document.querySelectorAll('#calibrationPanel .calbtn')) {
         body: JSON.stringify({
           kind,
           count: Math.max(1, Math.min(256, $('calCount').valueAsNumber || 16)),
+          // Empty draws one and reports it back, so a master is reproducible after the fact too.
+          seed: $('calSeed').value.trim() === '' ? undefined : Number($('calSeed').value),
         }),
       });
       const data = await r.json();
@@ -2402,7 +2678,7 @@ $('upFile').onchange = async () => {
     const data = await r.json();
     if (!r.ok) {
       calFail(data.error || 'That file was refused.');
-      $('upHint').textContent = 'refused — nothing was loaded';
+      $('upHint').textContent = 'refused, nothing was loaded';
       return;
     }
     state.masters[kind] = data;
@@ -2453,6 +2729,7 @@ $('reduce').onclick = async () => {
       num(d.fluxRecovery.magnitudes, 4) ? `flux recovery ${num(d.fluxRecovery.magnitudes, 4)} mag` : null,
     ].filter(Boolean);
     $('reduceOut').textContent = bits.join(' · ');
+    renderStarTable(d);
     renderCalNotes(d.notes);
   } catch (e) {
     calFail(String(e));
@@ -2471,7 +2748,7 @@ boot();
 // /api/research: the science is in Engine/Research, and the detector it reaches is
 // Core/TransitDetector, unchanged and blind.
 
-const rsFmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v) ? '—' : Number(v).toFixed(d));
+const rsFmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v) ? 'n/a' : Number(v).toFixed(d));
 
 let rsLast = null;
 
@@ -2643,8 +2920,37 @@ function rsPaintCurve(cv, points, opts = {}) {
  * having each do its own translation is how one of them ends up showing a blank chart.
  */
 async function rsOpenRun(id) {
-  const d = await (await fetch(`/api/research/runs/${id}`)).json();
+  let r, d;
+  try {
+    r = await fetch(`/api/research/runs/${encodeURIComponent(id)}`);
+    d = r.ok ? await r.json() : null;
+  } catch (e) {
+    renderResearch({ ok: false, message: `Run ${id} could not be opened: ${e}` });
+    return;
+  }
+  if (!r.ok) {
+    // A RECORD THAT IS GONE. The runs list and the sweep hits both link at a record by id, and
+    // the record can go away underneath them: cleared in another tab, deleted from the results
+    // directory by hand. The 404 comes back with no body, .json() threw on it, and the rejection
+    // reached nobody: the click did nothing at all and the run merely looked slow. The message
+    // now says what happened, and the list is asked again so it stops offering the run.
+    renderResearch({
+      ok: false,
+      message: r.status === 404
+        ? `Run ${id} is no longer on disk: its record was removed since this list was drawn. ` +
+          'The list has been refreshed.'
+        : `Run ${id} could not be opened: the server answered HTTP ${r.status}.`,
+    });
+    if (r.status === 404) loadResearchRuns();
+    return;
+  }
   const num = (v) => (typeof v === 'number' ? v : NaN);
+  // WHAT THE LOG SAYS ABOUT THE REGISTERS. The record does not keep the list of registers that
+  // could not be reached, but the run's log wrote one "could not check ..." line per register at
+  // the time, so those lines ARE the record of it.
+  const couldNotCheck = (d.log || [])
+    .filter((l) => typeof l === 'string' && l.startsWith('could not check '))
+    .map((l) => l.slice('could not check '.length));
   renderResearch({
     ok: true,
     detected: !!(d.result && d.result.detected),
@@ -2668,7 +2974,14 @@ async function rsOpenRun(id) {
     })),
     candidate: d.result && d.result.detected ? {
       periodDays: d.result.BestPeriodDays, depthPpm: d.result.BestDepthPpm,
-      depthUncertaintyPpm: 0, durationHours: d.result.BestDurationHours,
+      // NOT RECORDED, SO NOT INVENTED. The record keeps the detector's period, depth, duration,
+      // phase, signal to noise and point count, and not its depth uncertainty. This used to write
+      // 0 here, and the panel printed "± 0" under the depth of every reopened run: an error bar
+      // claiming a precision no measurement has. Null renders as "not recorded", and the value
+      // is read the day the record carries it.
+      depthUncertaintyPpm: typeof d.result.DepthUncertaintyPpm === 'number'
+        ? d.result.DepthUncertaintyPpm : null,
+      durationHours: d.result.BestDurationHours,
       phase: d.result.BestPhase01, snr: d.result.Snr,
       inTransitPoints: d.result.InTransitPointCount,
       radiusRatio: Math.sqrt(Math.max(0, d.result.BestDepthPpm) / 1e6),
@@ -2684,11 +2997,15 @@ async function rsOpenRun(id) {
     } : { concerns: [], passed: true },
     known: {
       anything: !!(d.known || []).length,
-      matches: (d.known || []).map((m) => ({
+      // Null when the run was saved with no register report at all (an empty result is), which
+      // renders as "not recorded" rather than as "nothing registered here".
+      matches: Array.isArray(d.known) ? d.known.map((m) => ({
         register: m.Register, name: m.Name, periodDays: m.PeriodDays,
         separationArcsec: m.SeparationArcsec, periodRatio: m.PeriodRatio, note: m.Note,
-      })),
-      unavailable: [],
+      })) : null,
+      // An empty list here used to stand for "every register answered", which the record never
+      // said. The log's own lines when it has them, otherwise null, which renders as not recorded.
+      unavailable: couldNotCheck.length ? couldNotCheck : null,
     },
     caveat: 'Reopened from the recorded run. A candidate, not a planet.',
   });
@@ -2927,7 +3244,7 @@ function renderResearch(d) {
     // Drawn as nothing and SAID, rather than left showing whichever run was open before it.
     rsDrawCurve($('rsCurve'), []);
     if (d.curveTrimmed) {
-      $('rsCurveNote').textContent += ' — the stored light curve was trimmed off this run.';
+      $('rsCurveNote').textContent += ' The stored light curve was trimmed off this run.';
     }
   }
 
@@ -2961,7 +3278,10 @@ function renderResearch(d) {
   $('rsResultPanel').hidden = false;
   let html = '<div class="rsBlock">' +
     rsRow('Period', rsFmt(c.periodDays, 5) + ' d') +
-    rsRow('Depth', rsFmt(c.depthPpm, 0) + ' ppm', '± ' + rsFmt(c.depthUncertaintyPpm, 0)) +
+    rsRow('Depth', rsFmt(c.depthPpm, 0) + ' ppm',
+          c.depthUncertaintyPpm === null || c.depthUncertaintyPpm === undefined
+            ? 'uncertainty not recorded with this run'
+            : '± ' + rsFmt(c.depthUncertaintyPpm, 0)) +
     rsRow('Duration', rsFmt(c.durationHours, 2) + ' h') +
     rsRow('Signal to noise', rsFmt(c.snr, 1)) +
     rsRow('Radius ratio', rsFmt(c.radiusRatio, 4), 'Rp/Rs, from the depth alone') +
@@ -2978,14 +3298,21 @@ function renderResearch(d) {
     '</div>';
 
   const k = d.known;
+  // Null in either field means the record does not say, and the page says so rather than
+  // printing the reassuring form of an answer it does not have.
   html += '<div class="rsBlock"><h3>Already known?</h3>' +
-    (k.matches.length
-      ? '<ul class="rsKnown">' + k.matches.map((m) =>
-          `<li><b>${m.name}</b> in ${m.register}, ${rsFmt(m.separationArcsec, 1)} arcsec away` +
-          (m.periodDays ? `, period ${rsFmt(m.periodDays, 5)} d (ratio ${rsFmt(m.periodRatio, 3)})` : '') +
-          `<br><span class="rsNote">${m.note}</span></li>`).join('') + '</ul>'
-      : '<p class="rsPass">Nothing registered within 30 arcsec of this position.</p>') +
-    (k.unavailable.length ? '<p class="rsNote">Could not check: ' + k.unavailable.join('; ') + '</p>' : '') +
+    (k.matches === null
+      ? '<p class="rsNote">No register report was recorded with this run.</p>'
+      : k.matches.length
+        ? '<ul class="rsKnown">' + k.matches.map((m) =>
+            `<li><b>${m.name}</b> in ${m.register}, ${rsFmt(m.separationArcsec, 1)} arcsec away` +
+            (m.periodDays ? `, period ${rsFmt(m.periodDays, 5)} d (ratio ${rsFmt(m.periodRatio, 3)})` : '') +
+            `<br><span class="rsNote">${m.note}</span></li>`).join('') + '</ul>'
+        : '<p class="rsPass">Nothing registered within 30 arcsec of this position.</p>') +
+    (k.unavailable === null
+      ? '<p class="rsNote">Whether every register answered is not recorded with this run; its log ' +
+        'carries no "could not check" line.</p>'
+      : k.unavailable.length ? '<p class="rsNote">Could not check: ' + k.unavailable.join('; ') + '</p>' : '') +
     '</div>';
 
   html += `<div class="rsCaveat">${d.caveat}</div>`;
@@ -3439,3 +3766,2542 @@ window.addEventListener('DOMContentLoaded', () => {
     rsSweepTimer = setInterval(poll, 3000);
   };
 });
+
+// ======================================================================================
+// PHOTOMETRIC SEQUENCES
+//
+// A transit is not a frame. It is a RATIO of one star to several others in the same exposure,
+// followed across hours, and how stable that ratio is decides whether a planet is detectable.
+// That number cannot be read off a single frame, which is why this panel exists and why it is
+// the only place in the interface that measures across time rather than within one picture.
+//
+// The run is long by nature - a hundred sub-exposures is tens of minutes - so it streams. The
+// server keeps no frames: it reduces each one and discards it, which is why there is a preview
+// image and not a gallery.
+// ======================================================================================
+
+function stopSequenceStream() {
+  if (state.seqStream) {
+    state.seqStream.close();
+    state.seqStream = null;
+  }
+}
+
+function seqCost() {
+  const frames = parseInt($('seqFrames').value, 10) || 0;
+  const bin = parseInt($('seqBin').value, 10) || 1;
+  // Measured on this pipeline: a frame costs about the same whatever its pixel count, because the
+  // work is the cone search, the PSF kernel and the emission integral rather than the pixels. The
+  // reduction adds roughly as much again at binning 1, less as the frames get smaller.
+  const perFrame = bin === 1 ? 22 : bin === 2 ? 16 : 11;
+  const seconds = frames * perFrame;
+  const mins = Math.round(seconds / 60);
+  $('seqCost').textContent =
+    `${frames} frames at binning ${bin} is roughly ${mins < 1 ? 'under a minute' : mins + ' minutes'} of `
+    + `compute. The run keeps going if you leave this panel; it stops if you press Stop.`;
+}
+
+for (const id of ['seqFrames', 'seqBin']) $(id).addEventListener('input', seqCost);
+seqCost();
+
+// AN INJECTED TRANSIT, which the endpoint has accepted since it existed and the page never sent.
+// A depth of zero injects nothing and is not an error - that is the server's own convention - so
+// the unchecked box simply returns null and the run is a plain sequence.
+function transientRequestBody() {
+  if (!$('seqTransit').checked) return undefined;
+  const ppt = parseFloat($('seqTrDepth').value);
+  if (!(ppt > 0)) return undefined;
+  const ra = $('seqTrRa').value.trim(), dec = $('seqTrDec').value.trim();
+  return {
+    depth: ppt / 1000,                       // the panel is in parts per thousand, the API in fraction
+    durationHours: parseFloat($('seqTrDur').value),
+    periodDays: parseFloat($('seqTrPer').value),
+    matchRadiusArcsec: parseFloat($('seqTrRad').value),
+    // Omitted means the frame centre, which is what the server already defaults to.
+    raDeg: ra === '' ? undefined : Number(ra),
+    decDeg: dec === '' ? undefined : Number(dec),
+  };
+}
+
+$('seqTransit').addEventListener('change', () => {
+  const on = $('seqTransit').checked;
+  $('seqTransitBox').hidden = !on;
+  $('seqTransitHint').hidden = !on;
+});
+
+$('seqStart').onclick = async () => {
+  const mine = modeReceipt();
+  const scope = selectedScope();
+  if (!scope) return;
+
+  const btn = $('seqStart');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  $('seqError').hidden = true;
+
+  try {
+    const seedRaw = $('seqSeed').value.trim();
+    const r = await fetch('/api/sequences', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        telescope: scope.name,
+        site: $('site').value,
+        raDeg: fieldRa(),
+        decDeg: fieldDec(),
+        filter: fieldBand(),
+        objectName: currentObjectName(),
+        exposureSeconds: parseFloat($('seqExp').value),
+        binning: parseInt($('seqBin').value, 10),
+        frames: parseInt($('seqFrames').value, 10),
+        airmassFrom: parseFloat($('seqXFrom').value),
+        airmassTo: parseFloat($('seqXTo').value),
+        comparisons: parseInt($('seqComps').value, 10),
+        calibrate: $('seqCal').checked,
+        seed: seedRaw === '' ? undefined : Number(seedRaw),
+        pwv: pwvRequestBody(),
+        transient: transientRequestBody(),
+      }),
+    });
+    const data = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) {
+      $('seqError').hidden = false;
+      $('seqError').textContent = data.error || 'The sequence could not be started.';
+      return;
+    }
+
+    state.sequence = data;
+    state.lcDepth = null;
+    lcExportLinks(null);
+    $('lcDepthPanel').hidden = true;
+    $('lcClosurePanel').hidden = true;
+    $('seqPanel').hidden = false;
+    $('seqStop').hidden = false;
+    renderSequence();
+    openSequenceStream(data.id, mine);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run the sequence';
+  }
+};
+
+$('seqStop').onclick = async () => {
+  if (!state.sequence) return;
+  await fetch(`/api/sequences/${state.sequence.id}/stop`, { method: 'POST' });
+  // The stream reports the state change itself; nothing to do here but wait for it.
+};
+
+function openSequenceStream(id, mine) {
+  stopSequenceStream();
+  const es = new EventSource(`/api/sequences/${id}/stream`);
+  state.seqStream = es;
+
+  es.onmessage = async (ev) => {
+    if (!ofThisMode(mine)) { stopSequenceStream(); return; }
+    const msg = JSON.parse(ev.data);
+    if (!state.sequence) return;
+
+    state.sequence.state = msg.state;
+    state.sequence.done = msg.done;
+    if (msg.frames && msg.frames.length) {
+      state.sequence.frames = (state.sequence.frames || []).concat(msg.frames);
+    }
+    renderSequence();
+    if (state.mode === 'lc') renderLcRun();
+
+    if (msg.finished) {
+      stopSequenceStream();
+      // The analysis is only computed once the run is over, so it comes from a final read
+      // rather than from the stream. A run that was stopped or failed has none, and says so.
+      const full = await (await fetch(`/api/sequences/${id}`)).json();
+      if (!ofThisMode(mine)) return;
+      state.sequence = full;
+      $('seqStop').hidden = true;
+      renderSequence();
+
+      // THE RUN IS OVER, SO THE FIFTH STEP CAN HAPPEN. In the light-curve mode a finished run is
+      // not the end of the measurement, it is the input to it: the depth is fitted, the run joins
+      // the list two conditions can be subtracted from, and the closure panel can compare what the
+      // analytic half predicted with what the frames actually gave back.
+      if (state.mode === 'lc') {
+        rememberLcRun(full);
+        renderLcRun();
+        renderLcChain();
+        if (full.state === 'finished' && full.transient) fitLcDepth();
+      }
+    }
+  };
+  es.onerror = () => { /* the browser retries on its own, as it does for campaigns */ };
+}
+
+function renderSequence() {
+  const s = state.sequence;
+  if (!s) return;
+
+  const frames = s.frames || [];
+  const measured = frames.filter((f) => !f.error);
+  const refused = frames.length - measured.length;
+
+  $('seqProgress').textContent =
+    s.state === 'running' ? `${s.done} of ${s.total}`
+    : s.state === 'finished' ? `${measured.length} frames measured`
+    : s.state === 'cancelled' ? `stopped at ${s.done} of ${s.total}`
+    : 'failed';
+
+  const bits = [
+    `${s.objectName || 'the field'} · ${s.telescope} · ${s.filter} · ${fmt.num(s.exposureSeconds, 0)} s · binning ${s.binning}`,
+    `airmass ${fmt.num(s.airmassFrom, 2)} to ${fmt.num(s.airmassTo, 2)}`,
+    `${s.startUtc} → ${s.endUtc}`,
+    s.calibrate ? 'each frame calibrated' : 'no calibration applied',
+    s.pwv ? `water: ${s.pwv.description}` : 'no water-vapour term',
+    `seed ${s.seed}`,
+    refused ? `${refused} frame(s) refused` : null,
+    s.stopReason || null,
+  ].filter(Boolean);
+  $('seqSubtitle').textContent = bits.join(' · ');
+
+  const a = s.analysis;
+  $('seqVerdict').hidden = !a || !(a.ratio > 0);
+  if (a && a.ratio > 0) {
+    $('seqFloor').textContent = `${fmt.num(a.detrendedPpt, 2)} ppt`;
+    $('seqPhoton').textContent = `${fmt.num(a.photonPpt, 2)} ppt`;
+    $('seqRatio').textContent = fmt.num(a.ratio, 2);
+    // The ratio is the whole verdict, so it says what it means rather than leaving the reader
+    // to remember which way is good.
+    $('seqRatioSub').textContent = a.ratio <= 1.25
+      ? 'at the photon limit: nothing unexplained is left'
+      : 'above the photon limit: something is not photons';
+  }
+
+  // WHAT THIS PANEL STILL OWNS IN THE LIGHT-CURVE MODE. The curve, the refusal reasons and the
+  // preview frame all have their own panels there, and showing them here too meant the reader saw
+  // each of them twice. What is left is what nothing else draws: the floor against the photon
+  // limit, the colour trend, and the numbers behind them.
+  const lcOwnsTheRest = state.mode === 'lc';
+  $('seqCurve').hidden = lcOwnsTheRest;
+  $('seqCurveNote').hidden = lcOwnsTheRest;
+  $('seqPreviewWrap').hidden = lcOwnsTheRest || !s.previewUrl;
+
+  renderSequenceNumbers(a);
+  renderSequenceNotes(a, measured, refused);
+  drawSequence();
+
+  // The comparison needs a finished run: it reads the same frames the analysis did.
+  $('bridgeFold').hidden = s.state !== 'finished';
+
+  if (s.previewUrl && !lcOwnsTheRest
+      && $('seqPreview').getAttribute('src') !== s.previewUrl) {
+    $('seqPreview').src = s.previewUrl;
+  }
+}
+
+function renderSequenceNumbers(a) {
+  const box = $('seqNumbers');
+  if (!a) { box.innerHTML = ''; return; }
+  const rows = [
+    ['frames measured', fmt.int(a.frames)],
+    ['stars in every frame', fmt.int(a.sharedStars)],
+    ['target', a.target || 'n/a'],
+    ['ensemble', a.ensemble || 'n/a'],
+    ['airmass', `${fmt.num(a.airmassMin, 3)} to ${fmt.num(a.airmassMax, 3)}`],
+    ['RMS of the ratio, raw', `${fmt.num(a.rawPpt, 2)} ppt`],
+    ['drift with airmass', `${fmt.num(a.driftPpt, 2)} ppt end to end`],
+    ['RMS with the drift removed', `${fmt.num(a.detrendedPpt, 2)} ppt`],
+    ['photon-limited prediction', `${fmt.num(a.photonPpt, 2)} ppt`],
+    ['raw / photon', fmt.num(a.rawRatio, 3)],
+    ['detrended / photon', fmt.num(a.ratio, 3)],
+    ['colour × airmass slope',
+      a.colourSlope === null ? 'n/a'
+        : `${fmt.num(a.colourSlope, 1)} ± ${fmt.num(a.colourSlopeError, 1)} mmag per airmass per mag B−V (${fmt.int(a.slopeStars)} stars)`],
+  ];
+  box.innerHTML = rows.map(([k, v]) =>
+    `<dt>${k}</dt><dd class="mono">${v}</dd>`).join('');
+}
+
+function renderSequenceNotes(a, measured, refused) {
+  const ul = $('seqNotes');
+  const notes = [];
+  // THE REASONS BELONG TO ONE PANEL. In the light-curve mode the frame table is on screen with
+  // this one and both were printing the same list, so the reader saw every refusal twice. The
+  // frame table owns them there, because that is where the frames are.
+  const framesPanelOwnsThem = state.mode === 'lc';
+  if (refused && !framesPanelOwnsThem) {
+    for (const { reason, count } of groupRefusals(state.sequence?.frames)) {
+      notes.push({ warn: true, text: `${count} frame(s) refused: ${reason}` });
+    }
+  }
+  if (state.sequence?.ladderNote && !framesPanelOwnsThem) {
+    notes.push({ warn: false, text: state.sequence.ladderNote });
+  }
+  const unreliable = measured.filter((f) => f.reliable === false).length;
+  if (unreliable) {
+    notes.push({ warn: true, text:
+      `${unreliable} of ${measured.length} frames reduced unreliably. A floor measured through them is not `
+      + `to be believed; capture one of those epochs on its own to see the reduction's own reasons.` });
+  }
+  for (const n of (a?.notes || [])) notes.push({ warn: n.startsWith('UNRELIABLE'), text: n });
+  ul.innerHTML = notes.map((n) =>
+    `<li class="${n.warn ? 'warn' : ''}">${escapeSeq(n.text)}</li>`).join('');
+}
+
+const escapeSeq = (t) => String(t).replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+// ---------------------------------------------------------------------- the two charts
+
+function drawSequence() {
+  const a = state.sequence?.analysis;
+  if (!a || $('seqPanel').hidden) return;
+  // The ratio curve has its own panel in the light-curve mode; here it would be the same picture
+  // twice, and a hidden canvas has no width to size itself from anyway.
+  if (!$('seqCurve').hidden) drawSequenceCurve(a);
+  drawSequenceSlopes(a);
+}
+
+function drawSequenceCurve(a) {
+  const cv = $('seqCurve');
+  if (!cv || !cv.clientWidth) return;
+  const pts = a.curve || [];
+  if (pts.length < 2) return;
+
+  const { g, w, h } = setupCanvas(cv);
+  const xs = pts.map((p) => p[0]);
+  const ys = pts.map((p) => p[1]);
+  const [xlo, xhi] = extent(xs);
+  const [ylo, yhi] = extent(ys);
+  const { X, Y } = axes(g, w, h, xlo, xhi, ylo, yhi, 'airmass', 'target / ensemble');
+
+  // The fitted drift, drawn over the points, because it is the part that is REAL PHYSICS and is
+  // removed before the floor is scored. Showing the scatter without it would look like noise.
+  const n = pts.length;
+  const mx = xs.reduce((s, v) => s + v, 0) / n;
+  const my = ys.reduce((s, v) => s + v, 0) / n;
+  let sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) { sxx += (xs[i] - mx) ** 2; sxy += (xs[i] - mx) * (ys[i] - my); }
+  const b = sxx > 0 ? sxy / sxx : 0;
+  const a0 = my - b * mx;
+
+  g.strokeStyle = 'rgba(255,180,84,.95)';
+  g.lineWidth = 1.5;
+  g.beginPath();
+  g.moveTo(X(xlo), Y(a0 + b * xlo));
+  g.lineTo(X(xhi), Y(a0 + b * xhi));
+  g.stroke();
+
+  g.fillStyle = 'rgba(94,207,255,.85)';
+  for (const [x, y] of pts) {
+    g.beginPath();
+    g.arc(X(x), Y(y), 2.2, 0, Math.PI * 2);
+    g.fill();
+  }
+
+  $('seqCurveNote').textContent =
+    `The differential light curve: the target divided by the summed ensemble, normalised. In this ratio `
+    + `the zero point, the exposure and the collecting area all cancel, and so does scintillation, which `
+    + `is one draw shared by every star in a frame. The amber line is the drift with airmass: real `
+    + `second-order extinction, because the target and its comparisons are different colours and the `
+    + `atmosphere is not grey. It is removed before the floor is scored.`;
+}
+
+function drawSequenceSlopes(a) {
+  const cv = $('seqSlopes');
+  if (!cv || !cv.clientWidth) return;
+  const pts = a.slopes || [];
+  if (pts.length < 3) {
+    const { g, w, h } = setupCanvas(cv);
+    g.fillStyle = '#4d5867';
+    g.font = '11px ui-monospace, Menlo, monospace';
+    g.fillText('too few stars measured in every frame to fit a colour trend', 16, h / 2);
+    $('seqSlopeNote').textContent = '';
+    return;
+  }
+
+  const { g, w, h } = setupCanvas(cv);
+  const xs = pts.map((p) => p[0]);
+  const ys = pts.map((p) => p[1]);
+  const [xlo, xhi] = extent(xs);
+  const [ylo, yhi] = extent(ys);
+  const { X, Y } = axes(g, w, h, xlo, xhi, ylo, yhi, 'B−V', 'mmag / airmass');
+
+  // Zero is the line that means "this star does not care about the air", so it is drawn.
+  if (ylo < 0 && yhi > 0) {
+    g.strokeStyle = '#2a3340';
+    g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(X(xlo), Y(0)); g.lineTo(X(xhi), Y(0)); g.stroke();
+    g.setLineDash([]);
+  }
+
+  g.strokeStyle = 'rgba(255,180,84,.95)';
+  g.lineWidth = 1.5;
+  g.beginPath();
+  g.moveTo(X(xlo), Y(a.colourSlope * xlo + (ys.reduce((s, v) => s + v, 0) / ys.length
+      - a.colourSlope * (xs.reduce((s, v) => s + v, 0) / xs.length))));
+  g.lineTo(X(xhi), Y(a.colourSlope * xhi + (ys.reduce((s, v) => s + v, 0) / ys.length
+      - a.colourSlope * (xs.reduce((s, v) => s + v, 0) / xs.length))));
+  g.stroke();
+
+  g.fillStyle = 'rgba(94,207,255,.85)';
+  for (const [x, y] of pts) {
+    g.beginPath();
+    g.arc(X(x), Y(y), 2.6, 0, Math.PI * 2);
+    g.fill();
+  }
+
+  $('seqSlopeNote').textContent =
+    `Each star's own drift against the same ensemble, plotted against its colour. The slope of this line `
+    + `is the second-order extinction coefficient, ${fmt.num(a.colourSlope, 1)} ± ${fmt.num(a.colourSlopeError, 1)} `
+    + `mmag per airmass per magnitude of B−V over ${fmt.int(a.slopeStars)} stars. Red stars fade more slowly `
+    + `than blue ones as the air thickens, which is the direction the physics demands. Its zero point is `
+    + `arbitrary, since it depends on the ensemble's own colour; only the slope is the measurement.`;
+}
+
+
+// The per-star measurements, which the reduction has always returned and this panel used to
+// discard. One number for a whole frame says nothing about WHICH stars carry it, and the colour
+// column is what a differential measurement groups on - a red target against blue comparisons is
+// where second-order extinction shows.
+function renderStarTable(d) {
+  const rows = d.matches || [];
+  $('starFold').hidden = rows.length === 0;
+  if (!rows.length) return;
+
+  const shown = rows.slice(0, 300);
+  $('starNote').textContent =
+    `${fmt.int(rows.length)} stars matched to the injected catalogue`
+    + (rows.length > shown.length ? `, brightest ${shown.length} listed` : '')
+    + '. Recovered is what the pixels gave back; residual is that minus the magnitude that went in. '
+    + 'Saturated stars are marked and are excluded from the zero point, the colour term and the scatter.';
+
+  $('starRows').innerHTML = shown.map((m) => {
+    const cls = m.saturated ? ' class="miss"' : '';
+    const bad = m.residualMag !== null && Math.abs(m.residualMag) > 0.05;
+    return `<tr${cls}>`
+      + `<td>${fmt.num(m.trueMagnitude, 2)}</td>`
+      + `<td>${m.colourBv === null || m.colourBv === undefined ? 'n/a' : fmt.num(m.colourBv, 2)}</td>`
+      + `<td>${fmt.num(m.recoveredMagnitude, 3)}</td>`
+      + `<td${bad ? ' class="tag below"' : ''}>${fmt.num(m.residualMag, 3)}</td>`
+      + `<td>${fmt.num(m.snr, 0)}</td>`
+      + `<td>${m.fluxElectrons === null || m.fluxElectrons === undefined ? 'n/a' : fmt.int(m.fluxElectrons)}</td>`
+      + `<td>${m.trueElectrons === null || m.trueElectrons === undefined ? 'n/a' : fmt.int(m.trueElectrons)}</td>`
+      + `<td>${fmt.num(m.raDeg, 4)}</td>`
+      + `<td>${fmt.num(m.decDeg, 4)}</td>`
+      + `</tr>`;
+  }).join('');
+}
+
+// ---------------------------------------------------------------------- the noise bridge
+//
+// Two independent noise models, subtracted on the sequence's own stars. The imaging path is the
+// one ACCURACY.md's cross-validations cover; the light-curve path is the one every detection in
+// this program actually runs on, and its noise side was checked against nothing until there was a
+// sequence to check it against. A model that under-predicts noise calls planets detectable that
+// are not, and a yield map inherits the factor whole.
+
+$('bridgeRun').onclick = async () => {
+  const mine = modeReceipt();
+  if (!state.sequence) return;
+
+  const btn = $('bridgeRun');
+  btn.disabled = true;
+  btn.textContent = 'Comparing…';
+  $('bridgeError').hidden = true;
+
+  try {
+    const r = await fetch(`/api/sequences/${state.sequence.id}/noise-bridge`);
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) {
+      $('bridgeError').hidden = false;
+      $('bridgeError').textContent = d.error || 'The comparison failed.';
+      return;
+    }
+
+    $('bridgeVerdict').hidden = false;
+    $('bridgeCurve').textContent = fmt.num(d.curveOverMeasured, 3);
+    $('bridgeImaging').textContent = fmt.num(d.imagingOverMeasured, 3);
+    $('bridgeStars').textContent = fmt.int(d.stars);
+
+    const off = (1 - d.curveOverMeasured) * 100;
+    $('bridgeNote').textContent =
+      `Over ${fmt.int(d.stars)} stars in all ${fmt.int(d.frames)} frames. `
+      + (d.curveOverMeasured < 0.95
+          ? `The light-curve model predicts ${fmt.num(d.curveOverMeasured, 3)} of the scatter these frames `
+            + `actually show, optimistic by ${fmt.num(off, 0)} %. On a yield map that is planets called `
+            + `detectable that are not.`
+          : d.curveOverMeasured > 1.05
+          ? `The light-curve model predicts ${fmt.num(d.curveOverMeasured, 3)} of the measured scatter: `
+            + `pessimistic, which costs detections rather than inventing them.`
+          : `The light-curve model matches the measured scatter to better than 5 %.`)
+      + ` The imaging error bar reads ${fmt.num(d.imagingOverMeasured, 3)}; it carries no scintillation `
+      + `term, which is not an omission: scintillation is an atmospheric transfer effect and not a `
+      + `term of the CCD equation.`;
+
+    const rows = (d.rows || []).slice(0, 200);
+    $('bridgeTable').hidden = rows.length === 0;
+    $('bridgeRows').innerHTML = rows.map((m) =>
+      `<tr>`
+      + `<td>${fmt.num(m.v, 2)}</td>`
+      + `<td>${fmt.num(m.bv, 2)}</td>`
+      + `<td>${fmt.num(m.measured * 1000, 2)} ppt</td>`
+      + `<td>${fmt.num(m.imaging * 1000, 2)} ppt</td>`
+      + `<td>${fmt.num(m.curve * 1000, 2)} ppt</td>`
+      + `<td>${fmt.num(m.curveOverMeasured, 2)}</td>`
+      + `<td>${fmt.num(m.imagingOverMeasured, 2)}</td>`
+      + `</tr>`).join('');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Compare';
+  }
+};
+
+// ======================================================================================
+// WATER VAPOUR
+//
+// The one weather term this program models, and the reason it is worth a control rather than a
+// constant: it absorbs in narrow bands in the red, so it does NOT cancel in the differential ratio
+// a transit is measured in - unlike everything grey, which does.
+//
+// Three modes, and the choice is the experiment. Constant is the control. Analytic injects a KNOWN
+// signal, which is the one thing a real night cannot provide and the whole reason a simulator can
+// answer "how precisely would I have to measure the water to recover this transit". Measured drives
+// the simulation from a real record.
+// ======================================================================================
+
+function pwvModeChanged() {
+  const mode = $('pwvMode').value;
+  $('pwvConstant').hidden = mode !== 'constant';
+  $('pwvAnalytic').hidden = mode !== 'analytic';
+  $('pwvMeasured').hidden = mode !== 'measured';
+
+  $('pwvOut').textContent =
+    mode === 'none' ? 'absent'
+    : mode === 'constant' ? `${$('pwvMm').value} mm`
+    : mode === 'analytic' ? `${$('pwvMean').value} ± ${$('pwvAmp').value} mm`
+    : 'measured';
+
+  drawPwvCurve();
+
+  $('pwvHint').textContent =
+    mode === 'none'
+      ? 'The frame is taken without the term, exactly as it was before the term existed.'
+    : mode === 'constant'
+      ? 'One column for the whole frame. This is the control an injection-recovery experiment needs: '
+        + 'the run against which a varying column is compared.'
+    : mode === 'analytic'
+      ? 'Not a weather model and not offered as one. It is a KNOWN signal to inject, so that a '
+        + 'correction can be scored against truth, which is the thing a real night cannot give you, '
+        + 'because no real dataset knows its own true water column.'
+      : 'An instant and a column in millimetres per line, whitespace or comma separated. ISO or '
+        + 'seconds since J2000; anything after # is ignored, so a GNSS archive file usually pastes '
+        + 'in unedited. Outside the record the value is held flat rather than extrapolated.';
+}
+
+// BOTH OF THESE SIT ABOVE THE FIRST CALL THAT READS THEM. pwvModeChanged() runs at the top level a
+// few lines down, and it reaches drawPwvCurve, which increments the token; the token used to be
+// declared with `let` further down the file, past that call, so the first draw on every page load
+// died in the temporal dead zone with "Cannot access 'pwvCurveToken' before initialization", an
+// unhandled rejection the console reported and the page did not: the water panel simply came up
+// empty until something else redrew it. Same for the last plot kept for resizes.
+let pwvCurveToken = 0;
+// The last transmission answer drawn, kept so a resize can redraw it from the numbers already in
+// hand rather than asking the server again. Null when the box shows a message and no curve.
+let pwvLastPlot = null;
+
+// EVERY control that changes the column, not just the obvious ones: period and drift alter the
+// value at the frame's instant, and fired no redraw at all, so the panel kept plotting a column
+// the capture would not use.
+for (const id of ['pwvMode', 'pwvMm', 'pwvMean', 'pwvAmp', 'pwvPeriod', 'pwvDrift', 'pwvSeries']) {
+  $(id).addEventListener('input', pwvModeChanged);
+  $(id).addEventListener('change', pwvModeChanged);
+}
+$('capFilter').addEventListener('change', drawPwvCurve);
+pwvModeChanged();
+
+// ======================================================================================
+// THE CURVE THE INTEGRAL ACTUALLY SEES.
+//
+// A water column is a number in a FITS header until you can look at what it did. This plots
+// the three things the passband integral is built from, over exactly the span it integrates:
+// the water's transmission, the filter's own response, and their product. It is the difference
+// between "the term is on" and "here is where it took the light from".
+//
+// Drawn on band MEANS rather than samples: a water spectrum has tens of thousands of lines, and
+// sampling it at 400 points would draw a picture of the sampling.
+// ======================================================================================
+
+/**
+ * The airmass the FRAME will be taken through, and why the plot must not pick its own.
+ *
+ * Water absorption scales with the air column, so a transmission plotted at one airmass against a
+ * frame exposed at another is a picture of a different night. tools/pwv_pair.py made exactly that
+ * mistake - it asked the table at 1.5 while its frames were at 1.02 - and its prediction came out
+ * half again too large, which looked like a physics error rather than a question asked wrong.
+ *
+ * The number comes from the SERVER: /api/forecast carries the airmass of every cell, computed by
+ * Core's own Kasten & Young. Nothing here recomputes it. A booked slot uses that slot's cell; with
+ * nothing booked the server will schedule the forecast's best moment, so the plot uses that one.
+ * Returns null when there is no forecast to ask, and the caller says so rather than inventing 1.5.
+ */
+function frameAirmass() {
+  const f = lastForecast;
+  if (!f) return null;
+  // NOTHING BOOKED MEANS THE SERVER'S 25-HOUR SCAN, not the forecast's 30-night best cell. Those
+  // are two different searches and they land weeks apart: on one field the best cell was 26 nights
+  // out at airmass 1.54 while the frame was taken that night at 1.83, so the panel under-quoted the
+  // water loss by 18 % while captioning it "the moment the server will schedule". The server now
+  // reports the instant the capture will really use, and this reads that.
+  if (!state.fcStartUt) {
+    return typeof f.scheduledAirmass === 'number' && isFinite(f.scheduledAirmass)
+      ? f.scheduledAirmass : null;
+  }
+  if (!f.airmass || !(state.fcStartUt >= f.startUt)) return null;
+  const idx = Math.floor((state.fcStartUt - f.startUt) / f.cellSeconds);
+  const x = f.airmass[idx];
+  return typeof x === 'number' && isFinite(x) ? x : null;
+}
+
+async function drawPwvCurve() {
+  const box = $('pwvCurveBox');
+  // EVERY EXIT TAKES THE TOKEN, including the ones that hide the box. Without that, an in-flight
+  // request still held the current token and, on arrival, un-hid the panel the observer had just
+  // switched off - leaving a confident transmission plot under a control reading "not modelled",
+  // for a column the capture would not use.
+  const token = ++pwvCurveToken;
+  const mode = $('pwvMode').value;
+  const scope = selectedScope();
+  // In orbit there is no water column; the whole row is hidden rather than left as a dead control.
+  const grounded = scope && !scope.isSpaceBased;
+  $('pwvRow').hidden = !grounded;
+  if (mode === 'none' || !grounded) { box.hidden = true; return; }
+
+  // THE SERVER RESOLVES THE SERIES, because it is the one that will drive the frame. Parsing a
+  // pasted record here as well meant plotting a different column than the capture used - the panel
+  // read the last token of each line, the parser reads the second.
+  const body = pwvRequestBody();
+  if (!body) {
+    // An empty measured textarea makes pwvRequestBody return undefined, so the capture goes out
+    // with NO water at all while the control still reads "measured". Silence there is the thing
+    // this panel exists to stop.
+    box.hidden = false;
+    clearPwvCanvas();
+    $('pwvCurveHint').textContent = mode === 'measured'
+      ? 'No measurements pasted yet, so no water-vapour term will be applied to the frame at all: '
+        + 'the control reads "measured" but the capture will go out dry.'
+      : 'This water-vapour series is incomplete, so no term will be applied to the frame.';
+    return;
+  }
+
+  // THE INSTANT THE FRAME WILL BE TAKEN AT, not "now". A booked slot is that instant; with nothing
+  // booked the server schedules the forecast's best moment, which is the same cell frameAirmass()
+  // prices the air column at. Asking about any other instant plots a different night.
+  const atIso = state.fcStartIso || forecastBestIso();
+  let series;
+  try {
+    const r = await fetch('/api/pwv/series' + (atIso ? `?atUtc=${encodeURIComponent(atIso)}` : ''), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    series = await r.json();
+    if (token !== pwvCurveToken) return;
+    if (!r.ok || !series || series.meanMm === undefined) {
+      box.hidden = false;
+      $('pwvCurveHint').textContent =
+        (series && series.error) || 'That water-vapour series could not be read.';
+      clearPwvCanvas();
+      return;
+    }
+  } catch { if (token === pwvCurveToken) { box.hidden = true; } return; }
+
+  // THE COLUMN AT THAT INSTANT, not the series mean. The server returns both and the panel used to
+  // plot the mean: pasting a record that runs 1 to 9 mm drew the curve for 5 mm and quoted 1.03
+  // mmag, while the frame was exposed through 9 mm and lost 1.91 - the panel disagreeing with the
+  // capture about the very number it exists to show.
+  const mm = typeof series.mmAtEpoch === 'number' ? series.mmAtEpoch : series.meanMm;
+  const varies = series.maxMm - series.minMm > 0.005;
+  const caveat = [
+    varies ? `the column at ${atIso ? 'that instant' : 'the scheduled moment'}; over the run it goes `
+           + `${fmt.num(series.minMm, 2)} to ${fmt.num(series.maxMm, 2)} mm` : null,
+    series.coversEpoch === false
+      ? 'and that instant is outside the pasted record, so the value is held flat at its nearest end'
+      : null,
+    (series.notes || []).join(' ') || null,
+  ].filter(Boolean).join('; ');
+  return plotPwv(token, scope.name, mm, caveat || null);
+}
+
+/**
+ * The instant the server would schedule if nothing is booked: the forecast's best cell, which is
+ * exactly what /api/capture picks when atUtc is absent. Null when there is no forecast to ask.
+ */
+function forecastBestIso() {
+  // The instant an unbooked capture will actually be taken at, as the SERVER computes it. This
+  // used to derive the forecast's best cell and call it "exactly what /api/capture picks when
+  // atUtc is absent", which was false: bestUt grades thirty nights, the capture scans twenty-five
+  // hours. The server now publishes the one the capture uses.
+  const f = lastForecast;
+  return (f && f.scheduledUtc) ? f.scheduledUtc : null;
+}
+
+function clearPwvCanvas() {
+  pwvLastPlot = null;
+  const cv = $('pwvCurve');
+  if (cv.clientWidth) setupCanvas(cv); else cv.getContext('2d').clearRect(0, 0, cv.width, cv.height);
+}
+
+function redrawPwvCurve() {
+  if (pwvLastPlot && !$('pwvCurveBox').hidden && !$('pwvRow').hidden) paintPwv(pwvLastPlot);
+}
+
+/**
+ * The curve itself, through setupCanvas like every other chart here: logical height in data-h,
+ * bitmap sized from the element's own width, drawing in CSS pixels. This used to draw into a fixed
+ * 640 by 180 bitmap under the page's "canvas { width: 100% }" rule, which stretched that bitmap to
+ * whatever the column measured and squashed it back to 180 px tall: the one chart on the page
+ * whose text and lines were the wrong shape.
+ */
+function paintPwv(d) {
+  const cv = $('pwvCurve');
+  if (!cv.clientWidth) return;
+  const { g: ctx, w: W, h: H } = setupCanvas(cv);
+  const L = 44, R = 10, T = 10, B = 24;
+  const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue('--ink') || '#dfe6ee';
+  const dim = css.getPropertyValue('--dim') || '#8a97a6';
+
+  const xs = d.curve.map(p => p.nm);
+  const x0 = xs[0], x1 = xs[xs.length - 1];
+  const px = nm => L + (W - L - R) * (nm - x0) / (x1 - x0);
+  const py = t => T + (H - T - B) * (1 - t);
+
+  ctx.strokeStyle = dim; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+  for (const t of [0, 0.5, 1]) {
+    ctx.beginPath(); ctx.moveTo(L, py(t)); ctx.lineTo(W - R, py(t)); ctx.stroke();
+  }
+  ctx.globalAlpha = 1; ctx.fillStyle = dim; ctx.font = '10px ui-monospace, monospace';
+  ctx.textAlign = 'right';
+  for (const t of [0, 0.5, 1]) ctx.fillText(t.toFixed(1), L - 6, py(t) + 3);
+  ctx.textAlign = 'center';
+  for (const nm of [x0, 0.5 * (x0 + x1), x1]) ctx.fillText(nm.toFixed(0), px(nm), H - 8);
+  ctx.textAlign = 'left';
+
+  const line = (key, colour, width, alpha) => {
+    ctx.beginPath(); ctx.strokeStyle = colour; ctx.lineWidth = width; ctx.globalAlpha = alpha;
+    d.curve.forEach((p, i) => (i ? ctx.lineTo(px(p.nm), py(p[key])) : ctx.moveTo(px(p.nm), py(p[key]))));
+    ctx.stroke(); ctx.globalAlpha = 1;
+  };
+  line('filter', dim, 1, 0.7);
+  line('water', '#5fb0ff', 1, 0.9);
+  line('product', ink, 1.6, 1);
+}
+
+async function plotPwv(token, telescope, mm, caveat) {
+  const box = $('pwvCurveBox');
+  const x = frameAirmass();
+  let d;
+  try {
+    const r = await fetch(`/api/pwv/transmission?pwv=${mm}&airmass=${x === null ? 1.5 : x}`
+                        + `&telescope=${encodeURIComponent(telescope)}`
+                        + `&filter=${encodeURIComponent(fieldBand())}&points=400`);
+    d = await r.json();
+    if (token !== pwvCurveToken) return;
+    if (!r.ok) {
+      box.hidden = false;
+      $('pwvCurveHint').textContent = d.error || 'The transmission curve is unavailable.';
+      clearPwvCanvas();
+      return;
+    }
+  } catch { if (token === pwvCurveToken) { box.hidden = true; } return; }
+
+  box.hidden = false;
+  pwvLastPlot = d;
+  paintPwv(d);
+
+  const whichX = x === null
+    ? `at airmass ${fmt.num(d.airmass, 2)}, a reference value: no forecast has answered yet, so this `
+      + `is not the air column the frame will be exposed through`
+    : `at airmass ${fmt.num(d.airmass, 2)}, which is `
+      + `${state.fcStartUt ? 'the slot booked on the calendar' : "the moment the server will schedule"}`;
+  $('pwvCurveHint').textContent =
+    `${d.telescopeDisplay}, ${d.filter}, ${d.fromNm} to ${d.toNm} nm ${whichX}. `
+  + `${d.pwvMm} mm of water transmits ${(100 * d.meanTransmission).toFixed(3)} % of the band on `
+  + `average, ${d.lossMmagFlat.toFixed(2)} mmag for a flat spectrum, against the ${d.referencePwvMm} mm `
+  + `reference the table is measured from. (The library carries ozone and molecular oxygen too, and `
+  + `those do not vary with the water; referencing to its driest column removes them, so they are not `
+  + `counted twice against the site's own measured extinction.) `
+  + `Grey is the filter, blue the water, white their product, which is what the passband integral `
+  + `sees.${caveat ? ' Plotted at ' + caveat + '.' : ''}`
+  + (d.clippedToTable ? ' The passband runs past the table, and the plot stops where the table does.' : '');
+}
+
+// The request body's water block, or undefined when the term is off. Shared by the single capture
+// and the sequence, so the two cannot drift into meaning different things.
+function pwvRequestBody() {
+  const mode = $('pwvMode').value;
+  if (mode === 'none') return undefined;
+  // Never sent for an orbital instrument: the control is hidden there, and the server refuses a
+  // water series above the atmosphere rather than dropping it silently. Sending one anyway would
+  // turn a hidden control into a rejected capture.
+  const scope = selectedScope();
+  if (!scope || scope.isSpaceBased) return undefined;
+  if (mode === 'constant') return { mode: 'constant', mm: parseFloat($('pwvMm').value) };
+  if (mode === 'analytic') {
+    return {
+      mode: 'analytic',
+      meanMm: parseFloat($('pwvMean').value),
+      amplitudeMm: parseFloat($('pwvAmp').value),
+      periodHours: parseFloat($('pwvPeriod').value),
+      driftMmPerDay: parseFloat($('pwvDrift').value),
+    };
+  }
+  const text = $('pwvSeries').value.trim();
+  if (!text) return undefined;
+  return { mode: 'measured', series: text, label: 'pasted in the interface' };
+}
+
+
+// ======================================================================================
+// LIGHT CURVE
+//
+// The fourth mode, and the only one that measures across time. The other three ask a question
+// about one frame, one campaign or one archive record; this one takes a batch of frames at a
+// regular interval, reduces each as it goes, and fits a depth out of the ratio.
+//
+// IT HAS TWO HALVES AND THEY MEET AT THE END.
+//
+//   ANALYTIC   the passband integral run against the water table. No frames, no exposure,
+//              seconds to answer. It predicts what a column costs a given pair of stars, what
+//              column accuracy a photometric budget demands, and how much of a water excursion
+//              survives the baseline fit a transit pipeline runs.
+//
+//   MEASURED   real frames of a real field, through a real instrument, with a transit of known
+//              depth injected into a catalogue star. It recovers a depth and reports the bias.
+//
+// The closure panel puts them side by side on the same field, the same instrument and the same
+// stars, which is the only place either number can be checked against anything.
+//
+// THE RULE THIS SECTION OBEYS, and it has been broken here twice: THE PAGE ASKS, THE SERVER
+// ANSWERS. Not one physical quantity below is computed in JavaScript. Everything drawn is a
+// number the server returned; the arithmetic in this file is limited to axes, colours and pixel
+// positions. When a figure needed something the endpoints did not have, the endpoint gained it.
+// ======================================================================================
+
+const LC_BLOCKS = ['lcChainBlock', 'lcFieldBlock', 'lcPredictBlock', 'lcTransferBlock',
+                   'lcInstrumentBlock'];
+const LC_PANELS = ['lcBandPanel', 'lcLossPanel', 'lcBandsPanel', 'lcReqPanel', 'lcColourPanel',
+                   'lcTransferPanel', 'lcStarsPanel', 'lcCurvePanel', 'lcFramesPanel',
+                   'lcDepthPanel', 'lcPairPanel', 'lcClosurePanel'];
+
+/* ONE SOURCE PER QUANTITY, WHICHEVER MODE IS ASKING. The capture panel and the light-curve panel
+   both need a field and a band, and the tempting shape is a copy of each control. That is exactly
+   how the water term went wrong once before: two controls that were meant to agree, did not, and
+   the plot showed a column the frame was never exposed through. These read whichever control is
+   on screen, and every request builder goes through them. */
+function fieldRa() {
+  return parseFloat((state.mode === 'lc' ? $('lcRa') : $('capRa')).value);
+}
+function fieldDec() {
+  return parseFloat((state.mode === 'lc' ? $('lcDec') : $('capDec')).value);
+}
+function fieldBand() {
+  const el = state.mode === 'lc' ? $('lcBand') : $('capFilter');
+  return (el && el.value) || 'Luminance';
+}
+
+/** The instrument's bands, in the picker, with each one's span in the tooltip. */
+function fillLcBands() {
+  const sel = $('lcBand');
+  if (!sel) return;
+  const scope = selectedScope();
+  const was = sel.value;
+  sel.textContent = '';
+  if (!scope) return;
+  const names = (scope.bands && scope.bands.length) ? scope.bands.map((b) => b.name) : scope.filters;
+  for (const n of names) {
+    const opt = document.createElement('option');
+    opt.value = n;
+    opt.textContent = (scope.filterLabels && scope.filterLabels[n]) || n;
+    const b = scope.bands && scope.bands.find((x) => x.name === n);
+    if (b && b.centralWavelengthNm) {
+      const half = (b.bandwidthAngstrom || 0) / 20;
+      opt.title = `${(b.centralWavelengthNm - half).toFixed(0)}-${(b.centralWavelengthNm + half).toFixed(0)} nm`
+                + (b.measuredCurve ? ', measured curve' : ', top-hat');
+    }
+    sel.appendChild(opt);
+  }
+  if (was && names.includes(was)) sel.value = was;
+  lcBandHint();
+}
+
+function lcBandHint() {
+  const scope = selectedScope();
+  const b = scope && scope.bands && scope.bands.find((x) => x.name === $('lcBand').value);
+  if (!b || !b.centralWavelengthNm) { $('lcBandHint').textContent = ''; return; }
+  const half = (b.bandwidthAngstrom || 0) / 20;
+  $('lcBandHint').textContent =
+    `${b.name}: ${(b.centralWavelengthNm - half).toFixed(0)} to ${(b.centralWavelengthNm + half).toFixed(0)} nm, `
+    + (b.measuredCurve
+        ? `measured curve, ${b.curvePoints || '?'} points.`
+        : `top-hat, no measured curve supplied.`);
+}
+
+/** The nine DUET bands, which is what this whole term was measured on. */
+const LC_DUET_BANDS = [
+  ["g'", 400, 550], ["r'", 550, 700], ["i'", 700, 850], ["z'", 850, 1000], ["I+z'", 750, 1000],
+  ['Y', 970, 1070], ['YJ', 970, 1330], ['J', 1170, 1330], ['Hs', 1500, 1650],
+];
+
+function seedLcBandList() {
+  const ta = $('lcBands');
+  if (ta && !ta.value.trim()) {
+    ta.value = LC_DUET_BANDS.map(([n, a, b]) => `${n}, ${a}, ${b}`).join('\n');
+  }
+}
+
+/** Parse the band textarea. `name, from, to` per line; a name alone means a band the instrument has. */
+function parseLcBands() {
+  const out = [], bad = [];
+  for (const raw of ($('lcBands').value || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const parts = line.split(',').map((t) => t.trim());
+    if (parts.length === 1) { out.push({ name: parts[0] }); continue; }
+    if (parts.length < 3) { bad.push(line); continue; }
+    const from = Number(parts[1]), to = Number(parts[2]);
+    if (!isFinite(from) || !isFinite(to) || !(to > from)) { bad.push(line); continue; }
+    out.push({ name: parts[0], fromNm: from, toNm: to });
+  }
+  return { bands: out, bad };
+}
+
+function fillLcSites() {
+  const sel = $('ciSite');
+  if (!sel || !state.boot) return;
+  const was = sel.value;
+  sel.innerHTML = state.boot.sites.map((s) => `<option value="${s.id}">${s.name} · ${s.country}</option>`).join('');
+  if (was) sel.value = was;
+}
+
+/** Which steps of the chain are done, so the column says where you are. */
+function renderLcChain() {
+  const done = {
+    1: !!selectedScope(),
+    2: !!(state.lcStars && state.lcStars.length),
+    3: !!state.lcReq,
+    4: !!(state.sequence && state.sequence.state === 'finished'),
+    5: !!state.lcDepth,
+  };
+  let now = 1;
+  for (let i = 1; i <= 5; i++) if (done[i]) now = i + 1;
+  for (const li of document.querySelectorAll('#lcChain li')) {
+    const n = Number(li.dataset.step);
+    li.classList.toggle('done', !!done[n]);
+    li.classList.toggle('now', n === now && !done[n]);
+  }
+}
+
+const lcEsc = (t) => String(t === null || t === undefined ? '' : t)
+  .replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+function lcFail(id, message) {
+  const el = $(id);
+  el.hidden = !message;
+  el.textContent = message || '';
+}
+
+// ---------------------------------------------------------------------- step 2: the field's stars
+
+$('lcProbe').onclick = async () => {
+  const mine = modeReceipt();
+  const scope = selectedScope();
+  if (!scope) return;
+  const btn = $('lcProbe');
+  btn.disabled = true; btn.textContent = 'Exposing…';
+  lcFail('lcProbeError', '');
+
+  try {
+    const r = await fetch('/api/capture', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        telescope: scope.name,
+        site: $('site').value,
+        raDeg: fieldRa(),
+        decDeg: fieldDec(),
+        filter: fieldBand(),
+        exposureSeconds: parseFloat($('lcProbeExp').value),
+        binning: parseInt($('lcBin').value, 10),
+        objectName: 'light-curve probe',
+        // The probe is a LOOK, not a measurement, so it carries no water term: the point is to
+        // find out which stars this instrument can measure in this field, and a column would only
+        // make them fainter without changing which ones qualify.
+      }),
+    });
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) { lcFail('lcProbeError', d.error || 'The probe frame was refused.'); return; }
+
+    state.capture = d.id;
+    btn.textContent = 'Reducing…';
+    const pr = await fetch(`/api/captures/${d.id}/photometry`);
+    const pd = await pr.json();
+    if (!ofThisMode(mine)) return;
+    if (!pr.ok) { lcFail('lcProbeError', pd.error || 'The frame could not be reduced.'); return; }
+
+    state.lcStars = pd.matches || [];
+    state.lcProbe = { id: d.id, reliable: pd.reliable, detection: pd.detection };
+    state.lcProbedWith = lcScopeStamp(scope);
+    markLcStarsStale(false);
+    renderLcStars();
+    renderLcChain();
+  } catch (e) {
+    lcFail('lcProbeError', String(e));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Take a probe frame and list its stars';
+  }
+};
+
+/* THE ARRAY THE PAGE USED TO IGNORE.
+   /api/captures/{id}/photometry has always returned every matched star with its position, its
+   colour, its magnitude and its signal-to-noise. Choosing a transit host out of that was a
+   scripting job: the engine refuses a host that is not a real star ("the transit would have been
+   injected into empty sky"), and the sequence says so when the host is not measurable in every
+   frame ("the recovered depth means nothing"). Both of those are avoidable in two clicks if the
+   list is on the page, sorted, with the disqualifying conditions marked. */
+function renderLcStars() {
+  const rows = state.lcStars || [];
+  $('lcStarsPanel').hidden = rows.length === 0;
+  if (!rows.length) return;
+
+  const usable = (m) => !m.saturated && m.snr !== null && m.snr >= 100;
+  const filtered = rows.filter((m) =>
+    state.lcStarFilter === 'all' ? true
+    : state.lcStarFilter === 'saturated' ? m.saturated
+    : usable(m));
+
+  const { key, dir } = state.lcStarSort;
+  const sorted = filtered.slice().sort((a, b) => {
+    const av = a[key], bv = b[key];
+    if (av === null || av === undefined) return 1;
+    if (bv === null || bv === undefined) return -1;
+    return av === bv ? 0 : (av < bv ? -1 : 1) * dir;
+  });
+
+  const shown = sorted.slice(0, 400);
+  const nUsable = rows.filter(usable).length;
+  $('lcStarsNote').textContent = `${fmt.int(filtered.length)} shown of ${fmt.int(rows.length)} matched`;
+  $('lcStarsCaption').textContent =
+    `${fmt.int(nUsable)} of ${fmt.int(rows.length)} are usable as a host. The reddest gives the `
+    + `largest water term.`
+    + (state.lcProbe && state.lcProbe.reliable === false
+        ? ' This frame reduced UNRELIABLY, so its own numbers are not to be believed.' : '');
+
+  $('lcStarRows').innerHTML = shown.map((m, i) => {
+    const picked = state.lcHost
+      && Math.abs(state.lcHost.raDeg - m.raDeg) < 1e-6
+      && Math.abs(state.lcHost.decDeg - m.decDeg) < 1e-6;
+    const state_ = m.saturated ? '<span class="tag below">saturated</span>'
+      : (m.snr === null || m.snr < 100) ? '<span class="tag below">S/N low</span>'
+      : '<span class="tag detected">usable</span>';
+    return `<tr class="${picked ? 'picked' : (m.saturated ? 'miss' : '')}" data-star="${i}">`
+      + `<td>${fmt.num(m.trueMagnitude, 2)}</td>`
+      + `<td>${m.colourBv === null || m.colourBv === undefined ? 'n/a' : fmt.num(m.colourBv, 2)}</td>`
+      + `<td>${fmt.num(m.snr, 0)}</td>`
+      + `<td>${m.fluxElectrons === null || m.fluxElectrons === undefined ? 'n/a' : fmt.int(m.fluxElectrons)}</td>`
+      + `<td>${fmt.num(m.raDeg, 5)}</td>`
+      + `<td>${fmt.num(m.decDeg, 5)}</td>`
+      + `<td>${state_}</td>`
+      + `<td><button class="rowbtn" data-host="${i}">${picked ? 'host ✓' : 'use as host'}</button></td>`
+      + `</tr>`;
+  }).join('');
+
+  // The button carries the index into the SHOWN list, so it is bound after each render rather
+  // than delegated on a stale array.
+  for (const btn of $('lcStarRows').querySelectorAll('button[data-host]')) {
+    btn.onclick = () => useAsHost(shown[Number(btn.dataset.host)]);
+  }
+}
+
+/** Put a real star's position into the transit controls, and say what it will cost. */
+function useAsHost(star) {
+  if (!star) return;
+  state.lcHost = star;
+  $('seqTransit').checked = true;
+  $('seqTransitBox').hidden = false;
+  $('seqTransitHint').hidden = false;
+  $('seqTrRa').value = star.raDeg.toFixed(6);
+  $('seqTrDec').value = star.decDeg.toFixed(6);
+  // Three arcsec is the engine's own default and is comfortably inside one pixel of every
+  // instrument on the roster, so it matches this star and nothing else.
+  if (!parseFloat($('seqTrRad').value)) $('seqTrRad').value = '3';
+  // The predicted requirement is a function of the HOST's colour, so choosing a host changes it.
+  if (star.colourBv !== null && star.colourBv !== undefined) {
+    $('lcTargetK').dataset.fromColour = String(star.colourBv);
+  }
+  renderLcStars();
+  renderLcChain();
+  $('seqSetup').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+for (const th of document.querySelectorAll('#lcStarTable th[data-sort]')) {
+  th.onclick = () => {
+    const key = th.dataset.sort;
+    state.lcStarSort = { key, dir: state.lcStarSort.key === key ? -state.lcStarSort.dir : -1 };
+    for (const other of document.querySelectorAll('#lcStarTable th[data-sort]')) {
+      other.classList.remove('sorted-asc', 'sorted-desc');
+    }
+    th.classList.add(state.lcStarSort.dir > 0 ? 'sorted-asc' : 'sorted-desc');
+    renderLcStars();
+  };
+}
+for (const chip of document.querySelectorAll('#lcStarChips .chip')) {
+  chip.onclick = () => {
+    state.lcStarFilter = chip.dataset.starfilter;
+    for (const c of document.querySelectorAll('#lcStarChips .chip')) c.classList.toggle('on', c === chip);
+    renderLcStars();
+  };
+}
+
+
+/**
+ * THE BAND THE WHOLE ANALYTIC HALF IS ABOUT.
+ *
+ * Four panels - the drawn band, the loss curve, the colour matrix and the transfer function - are
+ * each a property of ONE band, and they have to be the same one or the page is four answers about
+ * four different things under one heading. Two of them independently fell back to `bands[0]`
+ * whenever the instrument's own band was not in the list, so a page set to Luminance on a RedCat
+ * silently drew a g' matrix and swept a g' transfer function. One function, so there is one answer
+ * to "which band is this".
+ *
+ * The order of preference is: what the reader explicitly picked; what the server chose when it
+ * derived the requirement (the widest differential, the band where it actually bites); the band in
+ * the instrument's own picker; and failing all of those, the first line of the list.
+ */
+function lcChosenBand() {
+  const { bands } = parseLcBands();
+  const wanted = state.lcGridBand
+              || (state.lcReq && state.lcReq.colourGrid && state.lcReq.colourGrid.band)
+              || $('lcBand').value;
+  return bands.find((b) => b.name === wanted)
+      || bands.find((b) => b.name === $('lcBand').value)
+      || bands[0]
+      || { name: $('lcBand').value };
+}
+
+// ---------------------------------------------------------------------- step 3: predict
+
+$('lcBandsDuet').onclick = () => {
+  $('lcBands').value = LC_DUET_BANDS.map(([n, a, b]) => `${n}, ${a}, ${b}`).join('\n');
+};
+$('lcBandsInstrument').onclick = () => {
+  const scope = selectedScope();
+  if (!scope) return;
+  const names = (scope.bands && scope.bands.length) ? scope.bands.map((b) => b.name) : scope.filters;
+  // Named alone, with no span: the server then integrates the instrument's OWN passband, measured
+  // curve and all, rather than a rectangle standing in for it.
+  $('lcBands').value = names.join('\n');
+};
+
+$('lcBand').addEventListener('change', () => {
+  // THE READER'S PICK WINS. lcChosenBand() prefers the server's own choice once a requirement has
+  // been derived, so changing this select redrew the band panel and left the loss curve, the
+  // colour matrix and the transfer function on whatever band the server had picked - four panels
+  // under one heading answering about two different bands. An explicit change here is exactly the
+  // "what the reader explicitly picked" that the order of preference puts first.
+  state.lcGridBand = $('lcBand').value;
+  lcBandHint(); drawLcBand();
+  if (state.lcLoss) drawLcLoss();
+  if (state.lcReq) renderLcColourGrid(state.lcReq.colourGrid, state.lcReq);
+});
+
+$('lcPredict').onclick = async () => {
+  const mine = modeReceipt();
+  const scope = selectedScope();
+  if (!scope) return;
+  const { bands, bad } = parseLcBands();
+  if (!bands.length) {
+    lcFail('lcPredictError', 'Give at least one band: a name alone for one this instrument carries, '
+                           + 'or "name, fromNm, toNm" for one it does not.');
+    return;
+  }
+  if (bad.length) {
+    lcFail('lcPredictError', `Could not read: ${bad.slice(0, 3).map(lcEsc).join(' | ')}`
+                           + `. Each line is "name, fromNm, toNm", or a band name on its own.`);
+    return;
+  }
+
+  const btn = $('lcPredict');
+  btn.disabled = true; btn.textContent = 'Integrating…';
+  lcFail('lcPredictError', '');
+
+  const airmass = parseFloat($('lcX').value);
+  const pwv = parseFloat($('lcPwv').value);
+  const step = parseFloat($('lcStep').value);
+  const targetK = parseFloat($('lcTargetK').value);
+  const compK = parseFloat($('lcCompK').value);
+
+  try {
+    // THE BAND THE GRID IS FOR. The colour matrix is a property of ONE band, so which one is not
+    // an afterthought: an earlier version fell back to the first band in the list whenever the
+    // instrument's own band was not among them, and drew a g' matrix under a panel the reader had
+    // set to I+z'. Omitted, the server picks the band where the requirement actually bites - the
+    // largest differential - and reports which it chose. `state.lcGridBand` overrides that once
+    // the reader has picked one from the panel's own list.
+    const gridBand = state.lcGridBand
+      ? bands.find((b) => b.name === state.lcGridBand) || null
+      : null;
+
+    const r = await fetch('/api/pwv/requirement', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        telescope: scope.name, bands, airmass, pwvMm: pwv, stepMm: step,
+        targetTeffK: targetK, compTeffK: compK,
+        budgetPpm: parseFloat($('lcBudget').value),
+        achievedMm: parseFloat($('lcAchieved').value),
+        specMm: parseFloat($('lcSpec').value),
+        gridBand: gridBand || undefined,
+        // A grid wide enough to contain both the M dwarfs the effect is largest on and the
+        // solar-type stars an ensemble is usually made of, including the matched diagonal.
+        gridTargetTeffK: [2000, 2600, 3200, 4000],
+        gridCompTeffK: [3000, 4000, 5000, 5800],
+      }),
+    });
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) {
+      lcFail('lcPredictError', d.error || 'The requirement could not be derived.');
+      // NUMBERS MUST NOT OUTLIVE THE REQUEST THAT PRODUCED THEM. The panels kept the previous
+      // run's table under the refusal, so a reader who mistyped a temperature saw an error message
+      // beside a full set of figures that no longer answered anything they had asked. They are not
+      // thrown away - that would punish a typo - but they are marked as belonging to the request
+      // before this one.
+      state.lcStaleReason = 'request';
+      markLcPredictionStale(true);
+      return;
+    }
+    state.lcStaleReason = null;
+    markLcPredictionStale(false);
+    state.lcReq = d;
+    state.lcPredictedWith = lcScopeStamp(scope);
+
+    // The loss curve, for the band in the picker: the figure that is Peter's own, plus the
+    // differential column his does not have.
+    // The loss curve is drawn for the SAME band as the matrix and the transfer function. The
+    // requirement has just come back, so lcChosenBand() now resolves to whatever the server chose.
+    const shown = lcChosenBand();
+    const q = new URLSearchParams({
+      telescope: scope.name, filter: shown.name || $('lcBand').value,
+      airmass: String(airmass), points: '28',
+      teffK: '2000,2600,3200,4000,5000,5800', compTeffK: String(compK),
+    });
+    if (shown.fromNm) q.set('fromNm', String(shown.fromNm));
+    if (shown.toNm) q.set('toNm', String(shown.toNm));
+    const lr = await fetch('/api/pwv/loss-curve?' + q);
+    const ld = await lr.json();
+    if (!ofThisMode(mine)) return;
+    state.lcLoss = lr.ok ? ld : null;
+
+    renderLcPrediction();
+    drawLcBand();
+    renderLcChain();
+  } catch (e) {
+    lcFail('lcPredictError', String(e));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Predict';
+  }
+};
+
+const LC_STALE_REQUEST_NOTE = 'The panels below answer the request BEFORE this one. They were kept '
+  + 'rather than cleared, but they do not describe what was just asked.';
+
+/**
+ * Mark, or clear, the prediction panels as belonging to something other than what is now asked:
+ * a request older than the last one (the default note), or an instrument other than the one
+ * selected (`why` says which). The band panel is in the set because it is drawn for the same
+ * instrument and band as the other four.
+ */
+function markLcPredictionStale(stale, why) {
+  for (const id of ['lcBandPanel', 'lcBandsPanel', 'lcReqPanel', 'lcLossPanel', 'lcColourPanel']) {
+    const el = $(id);
+    if (el) el.classList.toggle('stale', !!stale);
+  }
+  const note = $('lcStaleNote');
+  if (!note) return;
+  note.hidden = !stale;
+  note.textContent = stale ? (why || LC_STALE_REQUEST_NOTE) : '';
+}
+
+function markLcStarsStale(stale, why) {
+  $('lcStarsPanel').classList.toggle('stale', !!stale);
+  const note = $('lcStarsStale');
+  note.hidden = !stale;
+  note.textContent = stale ? why : '';
+}
+
+function markLcTransferStale(stale, why) {
+  $('lcTransferPanel').classList.toggle('stale', !!stale);
+  const note = $('lcTransferStale');
+  note.hidden = !stale;
+  note.textContent = stale ? why : '';
+}
+
+/** The instrument an answer was measured through, as the key every lookup uses and the label the reader saw. */
+function lcScopeStamp(scope) {
+  return { key: scope.name, label: `${scope.telescope} + ${scope.camera}` };
+}
+
+/**
+ * THE INSTRUMENT CHANGED; WHAT ON THE PAGE STILL DESCRIBES THE OLD ONE.
+ *
+ * Nothing here was cleared when the instrument changed, so the four analytic panels, the transfer
+ * function and the star list went on showing the previous instrument's numbers under the new
+ * instrument's name: a requirement derived through a deep-depletion CCD read as if it were the
+ * InGaAs arm's. The same rule as a refused request applies. Nothing is thrown away, because a
+ * reader who flicks through the roster and comes back should not lose a probe frame that took a
+ * minute to expose, but every panel measured through another instrument is dimmed and says which
+ * one, and it stays that way until it is measured again. Coming back to the instrument it was
+ * measured with clears the mark, and only that mark: a prediction refused before the change keeps
+ * its own note.
+ */
+function refreshLcInstrumentStaleness(scope) {
+  const other = (w) => !!(w && w.key !== scope.name);
+  const why = (w) => `Measured through ${w.label}, not through ${scope.telescope} + ${scope.camera}, `
+    + 'which is now selected. Kept rather than cleared, but it does not describe this instrument.';
+
+  if (state.lcReq || state.lcLoss) {
+    if (other(state.lcPredictedWith)) markLcPredictionStale(true, why(state.lcPredictedWith));
+    else if (state.lcStaleReason === 'request') markLcPredictionStale(true);
+    else markLcPredictionStale(false);
+  }
+  if (state.lcTransfer) {
+    markLcTransferStale(other(state.lcTransferredWith),
+                        other(state.lcTransferredWith) ? why(state.lcTransferredWith) : '');
+  }
+  if (state.lcStars && state.lcStars.length) {
+    markLcStarsStale(other(state.lcProbedWith),
+                     other(state.lcProbedWith)
+                       ? why(state.lcProbedWith) + ' A different instrument sees different stars, '
+                         + 'and which of them can be a host with it is not known until a probe frame is taken.'
+                       : '');
+  }
+}
+
+/**
+ * The requirement rows in the order the reader asked for, or the server's own when no header has
+ * been clicked. Six headers were styled as sortable, with the arrow and the pointer, and clicking
+ * them did nothing: the handler below existed only for the star table. The chart under the table
+ * takes the same rows, so sorting the one sorts the other. "no limit" sorts last under the sigma
+ * column, which is where an unlimited band belongs when looking for the tightest.
+ */
+function lcSortedReqRows(rows) {
+  const sort = state.lcReqSort;
+  if (!sort) return rows;
+  const val = (b) => (sort.key === 'requiredSigmaMm' && b.unlimited ? Infinity : b[sort.key]);
+  return rows.slice().sort((a, b) => {
+    const av = val(a), bv = val(b);
+    if (av === null || av === undefined) return 1;
+    if (bv === null || bv === undefined) return -1;
+    if (typeof av === 'string' || typeof bv === 'string') return String(av).localeCompare(String(bv)) * sort.dir;
+    return av === bv ? 0 : (av < bv ? -1 : 1) * sort.dir;
+  });
+}
+
+for (const th of document.querySelectorAll('#lcReqTable th[data-sort]')) {
+  th.onclick = () => {
+    const key = th.dataset.sort;
+    const was = state.lcReqSort;
+    state.lcReqSort = { key, dir: was && was.key === key ? -was.dir : 1 };
+    for (const other of document.querySelectorAll('#lcReqTable th[data-sort]')) {
+      other.classList.remove('sorted-asc', 'sorted-desc');
+    }
+    th.classList.add(state.lcReqSort.dir > 0 ? 'sorted-asc' : 'sorted-desc');
+    if (state.lcReq) renderLcPrediction();
+  };
+}
+
+function renderLcPrediction() {
+  const d = state.lcReq;
+  if (!d) return;
+  const rows = lcSortedReqRows((d.bands || []).filter((b) => !b.refusal));
+  const refused = (d.bands || []).filter((b) => b.refusal);
+
+  $('lcBandsPanel').hidden = rows.length === 0;
+  $('lcReqPanel').hidden = rows.length === 0;
+  $('lcLossPanel').hidden = !state.lcLoss;
+  $('lcColourPanel').hidden = !(d.colourGrid && d.colourGrid.sigmaMm);
+
+  $('lcBandsNote').textContent =
+    `${d.telescopeDisplay} · airmass ${fmt.num(d.airmass, 2)} · ${fmt.num(d.pwvMm, 2)} ± ${fmt.num(d.stepMm, 2)} mm`;
+  $('lcReqNote').textContent =
+    `${fmt.num(d.targetTeffK, 0)} K against ${fmt.num(d.compTeffK, 0)} K · budget ${fmt.num(d.budgetPpm, 0)} ppm`;
+
+  // The table, sortable, because nine bands is exactly the number where an eye wants to reorder.
+  const cell = (b) => {
+    const sig = b.requiredSigmaMm;
+    const cls = b.unlimited ? 'cell-none' : (sig < 0.1 ? 'cell-tight' : sig > d.achievedMm ? 'cell-loose' : '');
+    const txt = b.unlimited ? 'no limit' : `${fmt.num(sig, 3)} mm`;
+    return `<td class="${cls}">${txt}</td>`;
+  };
+  // A ROW THAT CONTAINS NO DETECTOR SAYS SO. Past a quantum-efficiency curve's range the
+  // response is held at its endpoint, and a constant multiplier cancels exactly out of a loss
+  // ratio, so the row becomes a top-hat on the sky with no instrument in it. Served
+  // indistinguishable from a real row, J and Hs came back at 201 and 211 µmag/mm on a
+  // deep-depletion curve ending at 1100 nm AND on a flat-response roster instrument: not similar,
+  // identical. Marked here, and the reason is on the row rather than in a footnote nobody reads.
+  $('lcReqRows').innerHTML = rows.map((b) =>
+    `<tr${b.detectorNote ? ' class="nodetector" title="' + lcEsc(b.detectorNote) + '"' : ''}>`
+    + `<td>${lcEsc(b.band)}${b.detectorNote ? ' <span class="warnmark">no detector</span>' : ''}</td>`
+    + `<td>${fmt.num(b.fromNm, 0)}-${fmt.num(b.toNm, 0)}</td>`
+    + `<td>${fmt.num(b.absorbedUmagPerMm, 0)}</td>`
+    + `<td>${fmt.num(b.differentialUmagPerMm, 0)}</td>`
+    + `<td>${fmt.num(b.residualAtAchievedPpm, 0)} ppm</td>`
+    + cell(b)
+    + `</tr>`).join('')
+    + refused.map((b) =>
+      `<tr class="miss"><td>${lcEsc(b.band)}</td><td colspan="5">${lcEsc(b.refusal)}</td></tr>`).join('');
+
+  $('lcBandsCaption').textContent =
+    `Grey is what one star loses; cyan is what survives the ratio. Only the second limits a transit.`;
+
+  // AND THE CAPTION MUST NOT CLAIM A BAND FITS when the row carries no detector. The old caption
+  // listed J among the bands that "already fit inside 0.53 mm" on an instrument whose response
+  // stops at 1100 nm.
+  const blind = rows.filter((b) => b.detectorNote).map((b) => b.band);
+  const blindNote = blind.length
+    ? ` ${blind.join(', ')} lie outside this detector's published response, so those rows are the `
+      + `atmosphere and the filter with no instrument in them.`
+    : '';
+
+  // A VERDICT IS ONLY GIVEN ON A BAND THAT CARRIES THE INSTRUMENT. The caption used to read
+  // "g', r', i', J already fit inside 0.53 mm" on a detector whose response stops at 1100 nm: J
+  // was being certified as safe on the strength of a number that contains no detector at all.
+  // Blind rows are named separately, in blindNote, rather than folded into a verdict.
+  const seeing = rows.filter((b) => !b.detectorNote);
+  const tight = seeing.filter((b) => !b.unlimited && b.requiredSigmaMm < d.specMm);
+  const loose = seeing.filter((b) => !b.unlimited && b.requiredSigmaMm > d.achievedMm);
+  $('lcReqCaption').textContent =
+    (tight.length
+      ? `${tight.map((b) => b.band).join(', ')} need${tight.length === 1 ? 's' : ''} better than the `
+        + `${fmt.num(d.specMm, 2)} mm goal. `
+      : `No band here is tighter than the ${fmt.num(d.specMm, 2)} mm goal. `)
+    + (loose.length
+      ? `${loose.map((b) => b.band).join(', ')} already fit inside ${fmt.num(d.achievedMm, 2)} mm. `
+        + `The verdict is per band, not per observatory.`
+      : '')
+    + blindNote;
+
+  $('lcReqNotes').innerHTML = (d.notes || []).map((n) =>
+    `<li class="${n.startsWith('THE SIGMA COLUMN') ? 'warn' : ''}">${lcEsc(n)}</li>`).join('');
+
+  drawLcBandsChart(rows);
+  drawLcRequirement(rows, d);
+  renderLcColourGrid(d.colourGrid, d);
+  if (state.lcLoss) drawLcLoss();
+}
+
+// ---------------------------------------------------------------------- the drawings
+//
+// Every one of these takes numbers the server returned and turns them into pixels. There is no
+// physics in this half of the file, and there must never be: the panel that once parsed a pasted
+// water record itself read a different column than the server did, and drew a confident curve for
+// a column no frame was ever exposed through.
+
+/** A log scale that survives a zero, which a µmag/mm column legitimately contains. */
+function logScale(values, floorFactor = 1e-3) {
+  const pos = values.filter((v) => v > 0);
+  if (!pos.length) return null;
+  const hi = Math.max(...pos);
+  const lo = Math.max(Math.min(...pos), hi * floorFactor);
+  return { lo: lo / 2, hi: hi * 1.6 };
+}
+
+function drawLcBandsChart(rows) {
+  const cv = $('lcBandsChart');
+  if (!cv || !cv.clientWidth || !rows.length) return;
+  const { g, w, h } = setupCanvas(cv);
+
+  const all = rows.flatMap((b) => [b.absorbedUmagPerMm, b.differentialUmagPerMm]);
+  const sc = logScale(all);
+  if (!sc) return;
+
+  const L = 78, R = 16, T = 16, B = 46;
+  const Y = (v) => h - B - (Math.log10(Math.max(v, sc.lo)) - Math.log10(sc.lo))
+                          / (Math.log10(sc.hi) - Math.log10(sc.lo)) * (h - T - B);
+  const slot = (w - L - R) / rows.length;
+
+  // Decade gridlines, labelled, because a log axis without them cannot be read off.
+  g.font = '10px ui-monospace, Menlo, monospace';
+  g.textBaseline = 'middle'; g.textAlign = 'right';
+  for (let e = Math.floor(Math.log10(sc.lo)); e <= Math.ceil(Math.log10(sc.hi)); e++) {
+    const v = Math.pow(10, e);
+    if (v < sc.lo || v > sc.hi) continue;
+    g.strokeStyle = '#141a22';
+    g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(w - R, Y(v)); g.stroke();
+    g.fillStyle = '#4d5867';
+    g.fillText(v >= 1000 ? (v / 1000) + 'k' : String(v), L - 8, Y(v));
+  }
+
+  rows.forEach((b, i) => {
+    const x0 = L + slot * i;
+    const bw = Math.max(4, slot * 0.32);
+    // Absorbed: what one star loses. Dim, because it is the number that does NOT limit anything.
+    g.fillStyle = 'rgba(125,138,156,.45)';
+    g.fillRect(x0 + slot * 0.12, Y(b.absorbedUmagPerMm), bw, h - B - Y(b.absorbedUmagPerMm));
+    // Differential: what survives the ratio. Cyan, the measurement colour everywhere else here.
+    g.fillStyle = 'rgba(94,207,255,.85)';
+    g.fillRect(x0 + slot * 0.12 + bw + 2, Y(b.differentialUmagPerMm), bw, h - B - Y(b.differentialUmagPerMm));
+
+    g.save();
+    g.translate(x0 + slot / 2, h - B + 8);
+    g.textAlign = 'right'; g.textBaseline = 'middle';
+    g.rotate(-Math.PI / 4);
+    g.fillStyle = '#7d8a9c';
+    g.fillText(b.band, 0, 0);
+    g.restore();
+  });
+
+  g.textAlign = 'left'; g.textBaseline = 'top';
+  g.fillStyle = '#3d4757';
+  g.fillText('µmag per mm of PWV', L, 2);
+  g.fillStyle = 'rgba(125,138,156,.75)'; g.fillText('■ absorbed', w - 168, 2);
+  g.fillStyle = 'rgba(94,207,255,.95)'; g.fillText('■ differential', w - 88, 2);
+}
+
+function drawLcRequirement(rows, d) {
+  const cv = $('lcReqChart');
+  if (!cv || !cv.clientWidth || !rows.length) return;
+  const { g, w, h } = setupCanvas(cv);
+
+  const finite = rows.filter((b) => !b.unlimited && b.requiredSigmaMm > 0);
+  if (!finite.length) return;
+  const vals = finite.map((b) => b.requiredSigmaMm).concat([d.specMm, d.achievedMm].filter((v) => v > 0));
+  const sc = logScale(vals);
+  if (!sc) return;
+
+  const L = 78, R = 16, T = 16, B = 46;
+  const Y = (v) => h - B - (Math.log10(Math.max(v, sc.lo)) - Math.log10(sc.lo))
+                          / (Math.log10(sc.hi) - Math.log10(sc.lo)) * (h - T - B);
+  const slot = (w - L - R) / rows.length;
+
+  g.font = '10px ui-monospace, Menlo, monospace';
+  g.textBaseline = 'middle'; g.textAlign = 'right';
+  for (let e = Math.floor(Math.log10(sc.lo)); e <= Math.ceil(Math.log10(sc.hi)); e++) {
+    const v = Math.pow(10, e);
+    if (v < sc.lo || v > sc.hi) continue;
+    g.strokeStyle = '#141a22';
+    g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(w - R, Y(v)); g.stroke();
+    g.fillStyle = '#4d5867'; g.fillText(String(v), L - 8, Y(v));
+  }
+
+  // THE TWO REFERENCE LINES ARE THE POINT OF THE FIGURE. One is what a thesis stated as a goal;
+  // the other is what four low-cost receivers actually delivered. A band whose bar sits BELOW a
+  // line needs better than that line provides.
+  // THE LABELS SIT AT THE RIGHT EDGE, not the left. On the left they landed on top of the decade
+  // labels and the axis title, and the two most important annotations on the figure were the least
+  // legible thing on it.
+  const rule = (v, colour, label) => {
+    if (!(v > 0) || v < sc.lo || v > sc.hi) return;
+    g.strokeStyle = colour; g.lineWidth = 1.25; g.setLineDash([5, 4]);
+    g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(w - R, Y(v)); g.stroke();
+    g.setLineDash([]);
+    g.font = '10px ui-monospace, Menlo, monospace';
+    const tw = g.measureText(label).width;
+    // A pill behind it, so the text stays readable where a bar passes under the line.
+    g.fillStyle = 'rgba(14,18,24,.85)';
+    g.fillRect(w - R - tw - 8, Y(v) - 12, tw + 8, 12);
+    g.fillStyle = colour; g.textAlign = 'right'; g.textBaseline = 'bottom';
+    g.fillText(label, w - R - 4, Y(v) - 2);
+  };
+
+  rows.forEach((b, i) => {
+    const x0 = L + slot * i + slot * 0.18;
+    const bw = Math.max(6, slot * 0.64);
+    if (b.unlimited) {
+      // A colour-matched ensemble cancels the water exactly, so there is no bar to draw. Saying
+      // so is the honest answer; a very tall bar would be a rounding artefact pretending to be a
+      // measurement.
+      g.fillStyle = 'rgba(94,207,255,.5)';
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText('no limit', x0 + bw / 2, (T + h - B) / 2);
+    } else {
+      const tight = b.requiredSigmaMm < d.specMm;
+      g.fillStyle = tight ? 'rgba(255,123,114,.8)' : 'rgba(126,231,135,.7)';
+      g.fillRect(x0, Y(b.requiredSigmaMm), bw, h - B - Y(b.requiredSigmaMm));
+    }
+    g.save();
+    g.translate(x0 + slot * 0.32, h - B + 8);
+    g.textAlign = 'right'; g.textBaseline = 'middle';
+    g.rotate(-Math.PI / 4);
+    g.fillStyle = '#7d8a9c'; g.fillText(b.band, 0, 0);
+    g.restore();
+  });
+
+  rule(d.specMm, 'rgba(255,180,84,.9)', `${d.specMm} mm, the stated goal`);
+  rule(d.achievedMm, 'rgba(185,138,255,.9)', `${d.achievedMm} mm, achieved by low-cost GNSS`);
+
+  g.textAlign = 'left'; g.textBaseline = 'top';
+  g.fillStyle = '#3d4757';
+  g.fillText('σ_PWV required, mm. Lower is harder.', 4, 2);
+}
+
+function drawLcLoss() {
+  const d = state.lcLoss;
+  if (!d) return;
+  const temps = d.teffK || [];
+  const rows = d.curve || [];
+  if (rows.length < 2 || !temps.length) return;
+
+  $('lcLossNote').textContent =
+    `${d.band} · ${fmt.num(d.fromNm, 0)}-${fmt.num(d.toNm, 0)} nm · airmass ${fmt.num(d.airmass, 2)}`;
+
+  // A colour per temperature, blue for hot and red for cool: the same direction as the sky, so
+  // nobody has to consult a key to know which line is the M dwarf.
+  const colourFor = (t) => {
+    const f = Math.max(0, Math.min(1, (t - 2000) / 3800));
+    return `hsl(${Math.round(8 + f * 200)}, 78%, ${Math.round(58 + f * 8)}%)`;
+  };
+
+  const plot = (cvId, key, label) => {
+    const cv = $(cvId);
+    if (!cv || !cv.clientWidth) return;
+    const series = temps.map((_, k) => rows.map((r) => (r[key] || [])[k]).map((v) => (v === null ? NaN : v)));
+    const finite = series.flat().filter((v) => isFinite(v));
+    if (!finite.length) return;
+    const { g, w, h } = setupCanvas(cv);
+    const xs = rows.map((r) => r.pwvMm);
+    const [xlo, xhi] = extent(xs);
+    const [ylo, yhi] = extent(finite);
+    const { X, Y } = axes(g, w, h, xlo, xhi, ylo, yhi, 'PWV mm', label);
+    temps.forEach((t, k) => {
+      g.strokeStyle = colourFor(t); g.lineWidth = 1.6;
+      g.beginPath();
+      let started = false;
+      rows.forEach((r, i) => {
+        const v = series[k][i];
+        if (!isFinite(v)) return;
+        if (!started) { g.moveTo(X(xs[i]), Y(v)); started = true; } else g.lineTo(X(xs[i]), Y(v));
+      });
+      g.stroke();
+      const last = series[k].map((v, i) => [v, i]).filter(([v]) => isFinite(v)).pop();
+      if (last) {
+        g.fillStyle = colourFor(t);
+        g.font = '10px ui-monospace, Menlo, monospace';
+        g.textAlign = 'right'; g.textBaseline = 'middle';
+        g.fillText(`${t} K`, X(xs[last[1]]) - 4, Y(last[0]) - 7);
+      }
+    });
+  };
+
+  plot('lcLossCurve', 'loss', 'mmag absorbed');
+  plot('lcDiffCurve', 'differential', 'mmag differential');
+
+  $('lcLossCaption').textContent =
+    `Against ${fmt.num(d.compTeffK, 0)} K comparisons, referenced to the table's driest column `
+    + `(${d.referencePwvMm} mm) rather than to vacuum.`;
+}
+
+function renderLcColourGrid(grid, d) {
+  if (!grid || !grid.sigmaMm) { $('lcColourPanel').hidden = true; return; }
+  $('lcColourPanel').hidden = false;
+  $('lcColourNote').textContent = `${grid.band} · budget ${fmt.num(d.budgetPpm, 0)} ppm`
+    + (grid.chosenAutomatically ? ' · the widest differential of the bands given' : '');
+
+  // Which band the matrix is for, as a control rather than a caption: it is a property of ONE
+  // band, and a reader comparing it against the table above has to be able to move it.
+  const picker = $('lcColourPick');
+  if (picker) {
+    const rows = (d.bands || []).filter((b) => !b.refusal);
+    picker.innerHTML = rows.map((b) =>
+      `<option value="${lcEsc(b.band)}"${b.band === grid.band ? ' selected' : ''}>${lcEsc(b.band)}</option>`).join('');
+  }
+
+  $('lcColourHead').innerHTML = '<th>target ＼ comps</th>'
+    + grid.compTeffK.map((c) => `<th>${fmt.num(c, 0)} K</th>`).join('');
+
+  $('lcColourRows').innerHTML = grid.targetTeffK.map((t, i) =>
+    `<tr><td>${fmt.num(t, 0)} K</td>`
+    + grid.compTeffK.map((c, j) => {
+        const v = grid.sigmaMm[i][j];
+        if (v === null) return `<td class="cell-none">no limit</td>`;
+        const cls = v < d.specMm ? 'cell-tight' : v > d.achievedMm ? 'cell-loose' : '';
+        return `<td class="${cls}">${fmt.num(v, 3)}</td>`;
+      }).join('')
+    + `</tr>`).join('');
+
+  const flat = grid.sigmaMm.flat().filter((v) => v !== null && v > 0);
+  const span = flat.length ? Math.max(...flat) / Math.min(...flat) : 0;
+  $('lcColourCaption').textContent =
+    `Required σ_PWV in mm. Across this grid it moves by a factor of ${fmt.num(span, 0)}, and choosing `
+    + `the ensemble costs nothing. Every other way of relaxing it is hardware.`;
+}
+
+/** Figure 7: the band itself: filter, water, and the product the integral actually sees. */
+async function drawLcBand() {
+  const scope = selectedScope();
+  const cv = $('lcBandCurve');
+  if (!scope || !cv) return;
+  const mine = modeReceipt();
+
+  const chosen = lcChosenBand();
+
+  const q = new URLSearchParams({
+    telescope: scope.name, filter: chosen.name, points: '400',
+    pwv: String(parseFloat($('lcPwv').value) || 2.5),
+    airmass: String(parseFloat($('lcX').value) || 1.5),
+    teffK: String(parseFloat($('lcTargetK').value) || 2600),
+  });
+  if (chosen.fromNm) q.set('fromNm', String(chosen.fromNm));
+  if (chosen.toNm) q.set('toNm', String(chosen.toNm));
+
+  let d;
+  try {
+    const r = await fetch('/api/pwv/transmission?' + q);
+    d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) {
+      $('lcBandPanel').hidden = false;
+      $('lcBandCaption').textContent = d.error || 'That band could not be integrated.';
+      return;
+    }
+  } catch { return; }
+
+  $('lcBandPanel').hidden = false;
+  $('lcBandNote').textContent =
+    `${d.telescopeDisplay} · ${d.filter} · ${fmt.num(d.fromNm, 0)}-${fmt.num(d.toNm, 0)} nm`;
+
+  const { g, w, h } = setupCanvas(cv);
+  const rows = d.curve || [];
+  if (rows.length < 2) return;
+  const xs = rows.map((p) => p.nm);
+  const { X, Y } = axes(g, w, h, xs[0], xs[xs.length - 1], 0, 1, 'nm', 'transmission');
+
+  const line = (key, colour, width, alpha) => {
+    g.beginPath(); g.strokeStyle = colour; g.lineWidth = width; g.globalAlpha = alpha;
+    rows.forEach((p, i) => (i ? g.lineTo(X(p.nm), Y(p[key])) : g.moveTo(X(p.nm), Y(p[key]))));
+    g.stroke(); g.globalAlpha = 1;
+  };
+  line('filter', '#7d8a9c', 1, 0.75);
+  line('water', '#5ecfff', 1, 0.9);
+  line('product', '#ccd6e4', 1.6, 1);
+
+  $('lcBandCaption').textContent =
+    `Water at ${d.pwvMm} mm, airmass ${fmt.num(d.airmass, 2)}. `
+    + (d.measuredFilterCurve
+        ? `The band is this instrument's own measured curve. `
+        : `The band is a top-hat: no measured curve was supplied, so its edges are rectangles. `)
+    + `${d.pwvMm} mm transmits ${(100 * d.meanTransmission).toFixed(3)} % of the band on average, `
+    + `${fmt.num(d.lossMmagFlat, 2)} mmag for a flat spectrum.`
+    + (d.spanNote ? ' ' + d.spanNote : '');
+}
+
+// ---------------------------------------------------------------------- the transfer function
+
+$('lcTransfer').onclick = async () => {
+  const mine = modeReceipt();
+  const scope = selectedScope();
+  if (!scope) return;
+  const btn = $('lcTransfer');
+  btn.disabled = true; btn.textContent = 'Sweeping…';
+  lcFail('lcTransferError', '');
+
+  const chosen = lcChosenBand();
+
+  try {
+    const r = await fetch('/api/pwv/transit-bias', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        telescope: scope.name, band: chosen,
+        targetTeffK: parseFloat($('lcTargetK').value),
+        compTeffK: parseFloat($('lcCompK').value),
+        depthPpm: parseFloat($('lcTbDepth').value),
+        durationHours: parseFloat($('lcTbDur').value),
+        baselineHours: parseFloat($('lcTbBase').value),
+        cadenceSeconds: parseFloat($('lcTbCad').value),
+        pwvMm: parseFloat($('lcPwv').value),
+        amplitudeMm: parseFloat($('lcTbAmp').value),
+        baseline: $('lcTbModel').value,
+      }),
+    });
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) { lcFail('lcTransferError', d.error || 'The sweep was refused.'); return; }
+    state.lcTransfer = d;
+    state.lcTransferredWith = lcScopeStamp(scope);
+    markLcTransferStale(false);
+    renderLcTransfer();
+    renderLcClosure();
+  } catch (e) {
+    lcFail('lcTransferError', String(e));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Measure the transfer function';
+  }
+};
+
+function renderLcTransfer() {
+  const d = state.lcTransfer;
+  if (!d) return;
+  $('lcTransferPanel').hidden = false;
+  $('lcTransferNote').textContent =
+    `${d.band} · ${fmt.num(d.injectedDepthPpm, 0)} ppm over ${fmt.num(d.durationHours, 2)} h `
+    + `in a ${fmt.num(d.windowHours, 2)} h window`;
+
+  $('lcTransferVerdict').hidden = false;
+  $('lcTfWorst').textContent = `${fmt.num(d.worstPeriodHours, 2)} h`;
+  $('lcTfPeak').textContent = `${fmt.num(d.worstPpmPerMm, 0)} ppm/mm`;
+  $('lcTfSlow').textContent = d.slowestRmsPpm === null ? 'n/a' : `${fmt.num(d.slowestRmsPpm, 1)} ppm`;
+
+  $('lcTfBaselineRows').innerHTML = (d.constantColumn || []).map((c) =>
+    `<tr>`
+    + `<td>${lcEsc(c.baseline)}</td>`
+    + `<td>${fmt.num(c.depthPpm, 1)}</td>`
+    + `<td class="${Math.abs(c.biasPpm) > 100 ? 'tag below' : ''}">${fmt.num(c.biasPpm, 1)}</td>`
+    + `<td>${c.correlatedWith ? `${fmt.num(c.profileCorrelation, 3)} with ${lcEsc(c.correlatedWith)}` : 'n/a'}</td>`
+    + `</tr>`).join('');
+
+  const timeOnly = (d.constantColumn || []).find((c) => c.baseline === 'Time');
+  const withX = (d.constantColumn || []).find((c) => c.baseline === 'TimeAirmass');
+  $('lcTransferCaption').textContent =
+    `Bias on the fitted depth against the timescale the column moves on, over every phase. `
+    + (timeOnly && withX
+        ? `At a constant column a time-only baseline still leaves ${fmt.num(timeOnly.biasPpm, 0)} ppm; `
+          + `an airmass regressor brings it to ${fmt.num(withX.biasPpm, 0)} ppm.`
+        : '');
+
+  $('lcTransferNotes').innerHTML = (d.notes || []).map((n) => `<li>${lcEsc(n)}</li>`).join('');
+  drawLcTransfer(d);
+}
+
+function drawLcTransfer(d) {
+  const cv = $('lcTransferChart');
+  const rows = (d.sweep || []).filter((s) => s.ppmPerMm !== null && s.periodHours > 0);
+  if (!cv || !cv.clientWidth || rows.length < 2) return;
+  const { g, w, h } = setupCanvas(cv);
+
+  const L = 78, R = 16, T = 16, B = 44;
+  const px = rows.map((s) => Math.log10(s.periodHours));
+  const xlo = Math.min(...px), xhi = Math.max(...px);
+  const vals = rows.map((s) => s.ppmPerMm).filter((v) => v > 0);
+  const sc = logScale(vals);
+  if (!sc) return;
+
+  const X = (lp) => L + (lp - xlo) / (xhi - xlo || 1) * (w - L - R);
+  const Y = (v) => h - B - (Math.log10(Math.max(v, sc.lo)) - Math.log10(sc.lo))
+                          / (Math.log10(sc.hi) - Math.log10(sc.lo)) * (h - T - B);
+
+  g.font = '10px ui-monospace, Menlo, monospace';
+  g.textBaseline = 'middle'; g.textAlign = 'right';
+  for (let e = Math.floor(Math.log10(sc.lo)); e <= Math.ceil(Math.log10(sc.hi)); e++) {
+    const v = Math.pow(10, e);
+    if (v < sc.lo || v > sc.hi) continue;
+    g.strokeStyle = '#141a22';
+    g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(w - R, Y(v)); g.stroke();
+    g.fillStyle = '#4d5867'; g.fillText(v >= 1000 ? (v / 1000) + 'k' : String(v), L - 8, Y(v));
+  }
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  for (const p of [0.25, 1, 3, 12, 24, 72]) {
+    const lp = Math.log10(p);
+    if (lp < xlo || lp > xhi) continue;
+    g.strokeStyle = '#131920';
+    g.beginPath(); g.moveTo(X(lp), T); g.lineTo(X(lp), h - B); g.stroke();
+    g.fillStyle = '#4d5867'; g.fillText(p < 1 ? `${p * 60}m` : `${p}h`, X(lp), h - B + 7);
+  }
+
+  // The transit's own duration and the window, marked: the peak sits near one of them and the
+  // reader should be able to see which without being told.
+  const mark = (hours, colour, label) => {
+    const lp = Math.log10(hours);
+    if (!(hours > 0) || lp < xlo || lp > xhi) return;
+    g.strokeStyle = colour; g.setLineDash([4, 4]); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(X(lp), T); g.lineTo(X(lp), h - B); g.stroke();
+    g.setLineDash([]);
+    g.save();
+    g.translate(X(lp) + 4, T + 4);
+    g.textAlign = 'left'; g.textBaseline = 'top';
+    g.fillStyle = colour; g.fillText(label, 0, 0);
+    g.restore();
+  };
+  mark(d.durationHours, 'rgba(185,138,255,.7)', 'the event');
+  mark(d.windowHours, 'rgba(255,180,84,.7)', 'the window');
+
+  g.strokeStyle = 'rgba(94,207,255,.95)'; g.lineWidth = 1.8;
+  g.beginPath();
+  rows.forEach((s, i) => (i ? g.lineTo(X(px[i]), Y(s.ppmPerMm)) : g.moveTo(X(px[i]), Y(s.ppmPerMm))));
+  g.stroke();
+  g.fillStyle = 'rgba(94,207,255,.9)';
+  rows.forEach((s, i) => { g.beginPath(); g.arc(X(px[i]), Y(s.ppmPerMm), 2.4, 0, Math.PI * 2); g.fill(); });
+
+  g.textAlign = 'left'; g.textBaseline = 'top';
+  g.fillStyle = '#3d4757';
+  g.fillText('ppm of depth per mm of PWV excursion', L, 2);
+  g.textAlign = 'right';
+  g.fillText('timescale the column varies on', w - R, h - B + 22);
+}
+
+// ---------------------------------------------------------------------- step 5: fit the depth
+
+$('lcDepthFit').onclick = () => fitLcDepth();
+
+async function fitLcDepth() {
+  const mine = modeReceipt();
+  const seq = state.sequence;
+  if (!seq) return;
+  const btn = $('lcDepthFit');
+  btn.disabled = true; btn.textContent = 'Fitting…';
+  try {
+    const q = new URLSearchParams({
+      baseline: $('lcDepthModel').value,
+      correct: $('lcDepthCorrect').checked ? 'true' : 'false',
+    });
+    const r = await fetch(`/api/sequences/${seq.id}/depth?${q}`);
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    $('lcDepthPanel').hidden = false;
+    if (!r.ok) {
+      state.lcDepth = null;
+      $('lcDepthVerdict').hidden = true;
+      $('lcDepthCaption').textContent = d.error || 'The depth could not be fitted.';
+      $('lcDepthNumbers').innerHTML = '';
+      $('lcDepthNotes').innerHTML = '';
+      // THE EXPORT ROW GOES WITH THE FIT. The panel is shown so the refusal can be read, and the
+      // export row inside it used to come up with it: two download links pointing at "#" after a
+      // first refusal, or at the previous run's files after a later one.
+      lcExportLinks(null);
+      renderLcChain();
+      return;
+    }
+    state.lcDepth = d;
+    renderLcDepth();
+    renderLcClosure();
+    renderLcChain();
+  } finally {
+    btn.disabled = false; btn.textContent = 'Fit';
+  }
+}
+
+/** The export row: shown and live for the run a fit came back for, hidden and inert otherwise. */
+function lcExportLinks(seq) {
+  $('lcExportBox').hidden = !seq;
+  for (const [id, tail] of [['lcExportCsv', '/export.csv'], ['lcExportJson', '']]) {
+    const a = $(id);
+    if (seq) { a.href = `/api/sequences/${seq.id}${tail}`; a.removeAttribute('aria-disabled'); }
+    else { a.href = '#'; a.setAttribute('aria-disabled', 'true'); }
+  }
+  $('lcExportCsv').textContent = 'CSV of the series';
+}
+
+function renderLcDepth() {
+  const d = state.lcDepth;
+  if (!d) return;
+  $('lcDepthPanel').hidden = false;
+  $('lcDepthNote').textContent =
+    `${d.points} epochs · ${d.inTransit} in transit, ${d.outOfTransit} out · baseline ${d.baseline}`
+    + (d.waterCorrected ? ' · water corrected' : '');
+
+  $('lcDepthVerdict').hidden = false;
+  $('lcDepthVal').textContent = `${fmt.num(d.depthPpm, 0)} ppm`;
+  $('lcDepthErr').textContent = `± ${fmt.num(d.depthErrorPpm, 0)} ppm formal`;
+  $('lcDepthTruth').textContent = `${fmt.num(d.injectedPpm, 0)} ppm`;
+  $('lcDepthBias').textContent = `${d.biasPpm > 0 ? '+' : ''}${fmt.num(d.biasPpm, 0)} ppm`;
+  const nSigma = d.depthErrorPpm > 0 ? Math.abs(d.biasPpm) / d.depthErrorPpm : NaN;
+  $('lcDepthSig').textContent = isFinite(nSigma)
+    ? (nSigma < 1
+        ? `${fmt.num(nSigma, 1)}σ, consistent with no bias`
+        : `${fmt.num(nSigma, 1)}σ from zero`)
+    : 'recovered minus injected';
+
+  $('lcDepthNumbers').innerHTML = [
+    ['depth over its own error', `${fmt.num(d.significanceSigma, 1)} σ`],
+    ['residual scatter about the model', `${fmt.num(d.residualPpm, 0)} ppm`],
+    ['target B−V', fmt.num(d.targetBv, 3)],
+    ['ensemble B−V', fmt.num(d.ensembleBv, 3)],
+    ['profile against the baseline', d.correlatedWith
+      ? `${fmt.num(d.profileCorrelation, 3)} with ${lcEsc(d.correlatedWith)}` : 'no baseline regressor'],
+    ...(d.coefficients || []).map((c) => [`coefficient · ${lcEsc(c.name)}`,
+      `${fmt.num(c.value, 6)} ± ${fmt.num(c.error, 6)}`]),
+  ].map(([k, v]) => `<dt>${k}</dt><dd class="mono">${v}</dd>`).join('');
+
+  $('lcDepthNotes').innerHTML = (d.notes || []).map((n) =>
+    `<li class="${n.startsWith('UNRELIABLE') ? 'warn' : ''}">${lcEsc(n)}</li>`).join('');
+
+  $('lcDepthCaption').textContent =
+    `Points are the measured ratio, dashed is the fitted baseline, solid is the baseline with the `
+    + `transit. The shaded band is where the event was injected.`;
+
+  lcExportLinks(state.sequence);
+  // ONE CURVE, NOT TWO. The fitted model is drawn over the light curve in its own panel rather
+  // than into a second canvas here, so the points a reader is looking at and the model over them
+  // are the same picture.
+  if (state.sequence) drawLcCurve(state.sequence);
+}
+
+// ---------------------------------------------------------------------- two conditions
+
+function refreshLcRunPickers() {
+  const runs = state.lcRuns || [];
+  for (const id of ['lcPairA', 'lcPairB']) {
+    const sel = $(id);
+    if (!sel) continue;
+    const was = sel.value;
+    sel.innerHTML = runs.map((r) =>
+      `<option value="${r.id}">${lcEsc(r.label)}</option>`).join('');
+    if (was && runs.some((r) => r.id === was)) sel.value = was;
+  }
+  $('lcPairPanel').hidden = runs.length < 2;
+  if (runs.length >= 2 && $('lcPairA').value === $('lcPairB').value) {
+    $('lcPairB').value = runs[runs.length - 1].id;
+    if ($('lcPairA').value === $('lcPairB').value) $('lcPairA').value = runs[0].id;
+  }
+}
+
+/** Remember a finished run so two conditions can be subtracted later. */
+function rememberLcRun(seq) {
+  if (!seq || seq.state !== 'finished') return;
+  state.lcRuns = (state.lcRuns || []).filter((r) => r.id !== seq.id);
+  state.lcRuns.push({
+    id: seq.id,
+    label: `${seq.id} · ${seq.pwv ? seq.pwv.description : 'no water'} · seed ${seq.seed}`,
+  });
+  // The server holds eight sequences; holding more here would offer runs it has already dropped.
+  state.lcRuns = state.lcRuns.slice(-8);
+  refreshLcRunPickers();
+}
+
+$('lcPairRun').onclick = async () => {
+  const mine = modeReceipt();
+  const a = $('lcPairA').value, b = $('lcPairB').value;
+  lcFail('lcPairError', '');
+  if (!a || !b || a === b) {
+    lcFail('lcPairError', 'Pick two different runs. A difference needs two conditions.');
+    return;
+  }
+  const btn = $('lcPairRun');
+  btn.disabled = true; btn.textContent = 'Comparing…';
+  try {
+    const q = new URLSearchParams({
+      a, b, baseline: $('lcDepthModel').value,
+      correct: $('lcDepthCorrect').checked ? 'true' : 'false',
+    });
+    const r = await fetch('/api/sequences/compare?' + q);
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) { lcFail('lcPairError', d.error || 'The comparison failed.'); $('lcPairVerdict').hidden = true; return; }
+
+    $('lcPairVerdict').hidden = false;
+    $('lcPairNote').textContent = `baseline ${d.baseline}${d.waterCorrected ? ' · water corrected' : ''}`;
+    $('lcPairDiff').textContent = `${d.differencePpm > 0 ? '+' : ''}${fmt.num(d.differencePpm, 0)} ppm`;
+    $('lcPairErr').textContent = `± ${fmt.num(d.differenceErrorPpm, 0)} ppm`;
+    $('lcPairSig').textContent = `${fmt.num(d.significanceSigma, 1)} σ`;
+    $('lcPairVerdictSub').textContent = d.significanceSigma >= 3
+      ? 'the conditions are distinguished'
+      : 'not distinguished by these two runs';
+    $('lcPairNotes').innerHTML = [d.verdict, ...(d.warnings || [])]
+      .filter(Boolean).map((n) => `<li class="${n.startsWith('A shared base seed') ? 'warn' : ''}">${lcEsc(n)}</li>`).join('');
+  } catch (e) {
+    lcFail('lcPairError', String(e));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Compare';
+  }
+};
+
+// ---------------------------------------------------------------------- the closure
+//
+// THE ONLY PLACE EITHER HALF CAN BE CHECKED AGAINST ANYTHING. The analytic half predicts a bias in
+// ppm of depth per mm of column, from the passband integral and a synthetic light curve. The
+// measured half recovers a depth out of real frames with real photon noise. Neither has anything to
+// be compared with on its own; together, on the same field and the same stars, they do.
+
+function renderLcClosure() {
+  const tf = state.lcTransfer, fit = state.lcDepth, seq = state.sequence;
+  if (!tf || !fit || !seq) { $('lcClosurePanel').hidden = true; return; }
+  if (!seq.pwv) { $('lcClosurePanel').hidden = true; return; }
+
+  $('lcClosurePanel').hidden = false;
+  $('lcClosureNote').textContent = `${tf.band} · run ${seq.id}`;
+
+  // The excursion the RUN actually had, as the server reported it, times the transfer function at
+  // the timescale that run spans. Both numbers come from the server; the multiplication is the
+  // only arithmetic here and it is the definition of a transfer function.
+  const swing = (seq.pwv.maxMm !== null && seq.pwv.minMm !== null)
+    ? (seq.pwv.maxMm - seq.pwv.minMm) / 2 : null;
+  const predicted = swing !== null ? tf.worstPpmPerMm * swing : null;
+  const measured = Math.abs(fit.biasPpm);
+
+  $('lcClosureVerdict').hidden = false;
+  $('lcClosurePred').textContent = predicted === null ? 'n/a' : `${fmt.num(predicted, 0)} ppm`;
+  $('lcClosurePredSub').textContent = predicted === null
+    ? 'this run reports no water range'
+    : `${fmt.num(tf.worstPpmPerMm, 0)} ppm/mm × ${fmt.num(swing, 2)} mm of swing, at the worst timescale`;
+  $('lcClosureMeas').textContent = `${fmt.num(measured, 0)} ppm`;
+  $('lcClosureMeasSub').textContent = `|recovered − injected|, ± ${fmt.num(fit.depthErrorPpm, 0)} ppm`;
+
+  const ratio = predicted > 0 ? measured / predicted : null;
+  $('lcClosureRatio').textContent = ratio === null ? 'n/a' : fmt.num(ratio, 2);
+  $('lcClosureSub').textContent = ratio === null ? '' : 'measured over predicted';
+
+  const notes = [];
+  notes.push('The predicted figure is an UPPER BOUND, and deliberately so: it uses the transfer '
+    + 'function at its worst timescale, which is the column turning over about once inside the '
+    + 'visit. A real column that drifts monotonically across the night lands far below it.');
+  notes.push('The measured figure carries this run\'s whole photon error, '
+    + `± ${fmt.num(fit.depthErrorPpm, 0)} ppm. If that exceeds the predicted bias, the run cannot `
+    + 'test the prediction: it can only fail to contradict it. Compare two runs, or raise the water swing.');
+  if (fit.depthErrorPpm > (predicted || 0)) {
+    notes.push('UNRELIABLE: the error bar on the recovered depth exceeds the predicted bias here, so '
+      + 'the agreement below is not evidence either way.');
+  }
+  $('lcClosureNotes').innerHTML = notes.map((n) =>
+    `<li class="${n.startsWith('UNRELIABLE') ? 'warn' : ''}">${lcEsc(n)}</li>`).join('');
+}
+
+// ======================================================================================
+// DEFINE AN INSTRUMENT  (the form the API has always been waiting for)
+//
+// `POST /api/instruments/custom` has accepted a whole instrument since it was written, and
+// `grep -c "instruments/custom" web/app.js` returned 0: nothing in the browser called it. So the
+// first step of the water experiment - describe the instrument you actually want to know about -
+// was reproducible from a shell and not from the site, which is the one rule this project does
+// not bend.
+//
+// THE FORM DOES NOT INVENT ANYTHING, and neither does the server behind it. A quantity that is not
+// given is derived by a stated relation, or declared unmodelled, or refused with the reason. The
+// three lists come back with the instrument and are shown here, because a frame from an instrument
+// with an unmodelled optical train is not the same evidence as one from a characterised telescope,
+// and the page that defined it is where that has to be said.
+// ======================================================================================
+
+/** A CSV of `wavelength_nm,value`, parsed to the shape the endpoint takes. Never evaluated here. */
+function parseCurveCsv(text) {
+  const points = [];
+  const bad = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || /^[a-z_ ]*wave/i.test(line)) continue;
+    const parts = line.split(/[,;\t ]+/).filter(Boolean);
+    if (parts.length < 2) { bad.push(line); continue; }
+    const nm = Number(parts[0]), v = Number(parts[1]);
+    if (!isFinite(nm) || !isFinite(v)) { bad.push(line); continue; }
+    points.push({ wavelengthNm: nm, value: v });
+  }
+  return { points, bad };
+}
+
+/** The band list from the textarea: `name, centre_nm, width_A, peak`. */
+function parseInstrumentBands() {
+  const out = [], bad = [];
+  for (const raw of ($('ciBands').value || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const p = line.split(',').map((t) => t.trim());
+    if (p.length < 3) { bad.push(line); continue; }
+    const centre = Number(p[1]), width = Number(p[2]);
+    if (!p[0] || !isFinite(centre) || !isFinite(width) || centre <= 0 || width <= 0) { bad.push(line); continue; }
+    const band = { label: p[0], centralWavelengthNm: centre, bandwidthAngstrom: width };
+    if (p.length > 3 && p[3] !== '') {
+      const peak = Number(p[3]);
+      if (isFinite(peak)) band.peakTransmission = peak;
+      else bad.push(line);
+    }
+    const curve = state.lcCurves[p[0]];
+    if (curve && curve.length) band.transmissionCurve = curve;
+    out.push(band);
+  }
+  return { bands: out, bad };
+}
+
+function refreshCurveBandPicker() {
+  const sel = $('ciCurveBand');
+  if (!sel) return;
+  const { bands } = parseInstrumentBands();
+  const was = sel.value;
+  sel.innerHTML = bands.map((b) => `<option value="${lcEsc(b.label)}">${lcEsc(b.label)}</option>`).join('')
+                || '<option value="">add a band first</option>';
+  if (was && bands.some((b) => b.label === was)) sel.value = was;
+
+  const attached = Object.entries(state.lcCurves);
+  $('ciCurveList').innerHTML = attached.length
+    ? attached.map(([name, pts]) =>
+        `<li>${lcEsc(name)}: ${pts.length} measured points. The curve is integrated directly and the `
+        + `published peak is not applied on top of it.</li>`).join('')
+    : '';
+}
+
+$('ciBands').addEventListener('input', refreshCurveBandPicker);
+
+$('ciCurveFile').addEventListener('change', async () => {
+  const file = $('ciCurveFile').files[0];
+  const band = $('ciCurveBand').value;
+  $('ciCurveFile').value = '';
+  if (!file) return;
+  if (!band) { lcFail('ciError', 'Name a band first, then attach its curve to it.'); return; }
+  const { points, bad } = parseCurveCsv(await file.text());
+  if (points.length < 2) {
+    lcFail('ciError', `${file.name} gave ${points.length} usable point(s). A curve needs at least two `
+                    + `lines of "wavelength_nm,value"; one point is a flat value, which the peak field `
+                    + `already expresses.`);
+    return;
+  }
+  lcFail('ciError', bad.length ? `${bad.length} line(s) of ${file.name} were not read as numbers.` : '');
+  state.lcCurves[band] = points;
+  refreshCurveBandPicker();
+});
+
+$('ciQeFile').addEventListener('change', async () => {
+  const file = $('ciQeFile').files[0];
+  if (!file) return;
+  const { points } = parseCurveCsv(await file.text());
+  if (points.length < 2) {
+    lcFail('ciError', `${file.name} gave ${points.length} usable point(s) for the QE curve.`);
+    $('ciQeFile').value = '';
+    return;
+  }
+  state.lcQeCurve = points;
+  $('ciQeHint').textContent = `${file.name}: ${points.length} points, evaluated per wavelength inside `
+                            + `the passband integral rather than as one number.`;
+});
+
+$('ciClear').onclick = () => {
+  for (const id of ['ciName', 'ciCamera', 'ciAperture', 'ciFocal', 'ciObstruction', 'ciOptics',
+                    'ciWidth', 'ciHeight', 'ciPixel', 'ciQe', 'ciWell', 'ciRead', 'ciDark',
+                    'ciTemp', 'ciBits', 'ciEpa', 'ciSeeing', 'ciBands']) $(id).value = '';
+  state.lcCurves = {};
+  state.lcQeCurve = null;
+  $('ciQeHint').textContent = 'CSV of wavelength_nm,value.';
+  lcFail('ciError', '');
+  $('ciNotes').innerHTML = '';
+  refreshCurveBandPicker();
+};
+
+$('ciSubmit').onclick = async () => {
+  const mine = modeReceipt();
+  lcFail('ciError', '');
+  const num = (id) => {
+    const v = $(id).value.trim();
+    return v === '' ? undefined : Number(v);
+  };
+
+  const { bands, bad } = parseInstrumentBands();
+  if (bad.length) {
+    lcFail('ciError', `Could not read ${bad.length} band line(s): ${bad.slice(0, 2).map(lcEsc).join(' | ')}. `
+                    + `Each is "name, centre_nm, width_A" with an optional peak transmission.`);
+    return;
+  }
+
+  const body = {
+    name: $('ciName').value.trim(),
+    cameraName: $('ciCamera').value.trim() || undefined,
+    apertureMeters: num('ciAperture'),
+    focalLengthMeters: num('ciFocal'),
+    secondaryObstructionFraction: num('ciObstruction'),
+    opticsTransmission: num('ciOptics'),
+    sensorWidthPx: num('ciWidth'),
+    sensorHeightPx: num('ciHeight'),
+    pixelSizeMicrons: num('ciPixel'),
+    quantumEfficiency: num('ciQe'),
+    quantumEfficiencyCurve: state.lcQeCurve || undefined,
+    fullWellElectrons: num('ciWell'),
+    readNoiseElectrons: num('ciRead'),
+    darkCurrentElectronsPerSecond: num('ciDark'),
+    detectorTemperatureCelsius: num('ciTemp'),
+    adcBits: num('ciBits'),
+    electronsPerAduAtUnityGain: num('ciEpa'),
+    zenithSeeingFwhmArcsec: num('ciSeeing'),
+    siteId: $('ciSite').value,
+    filters: bands.length ? bands : undefined,
+  };
+
+  const btn = $('ciSubmit');
+  btn.disabled = true; btn.textContent = 'Building…';
+  try {
+    const r = await fetch('/api/instruments/custom', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!ofThisMode(mine)) return;
+    if (!r.ok) {
+      // THE SERVER'S REFUSAL, SHOWN AS IT CAME. Every one of them names the quantity and says why
+      // a frame would be meaningless without it; paraphrasing them here would lose the reason,
+      // and swallowing them would be worse than not having the form.
+      lcFail('ciError', d.error || 'The instrument was refused.');
+      return;
+    }
+
+    // The instrument is now pointable, so the list has to be rebuilt before it can be selected.
+    state.telescopes = await (await fetch('/api/telescopes')).json();
+    const inst = $('instrument');
+    const offered = state.mode === 'lc'
+      ? state.telescopes.filter((t) => !t.isSpaceBased) : state.telescopes;
+    inst.innerHTML = offered.map((t) => `<option value="visual:${t.name}">${t.displayName}</option>`).join('');
+    inst.value = `visual:${d.name}`;
+    onInstrumentChange();
+
+    $('ciNotes').innerHTML =
+      `<li>Built as <b>${lcEsc(d.name)}</b> and selected. It survives a restart: the definition is `
+      + `written beside the catalogue and rebuilt through this same path when the server starts, so `
+      + `an instrument that would be refused today is refused today rather than living on.</li>`
+      + (d.bands || []).map((b) =>
+          `<li>${lcEsc(b.name)}: ${fmt.num(b.centralWavelengthNm, 0)} nm, `
+          + `${fmt.num(b.bandwidthAngstrom, 0)} Å, `
+          + (b.measuredCurve ? `<b>measured curve, ${b.curvePoints} points</b>` : 'top-hat') + `.</li>`).join('')
+      + (d.derived || []).map((n) => `<li>${lcEsc(n)}</li>`).join('')
+      + (d.assumptions || []).map((n) => `<li class="warn">${lcEsc(n)}</li>`).join('');
+    renderLcChain();
+  } catch (e) {
+    lcFail('ciError', String(e));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Define it';
+  }
+};
+
+// The colour matrix is a property of ONE band; moving it is a deliberate act, so it re-derives.
+$('lcColourPick').addEventListener('change', () => {
+  state.lcGridBand = $('lcColourPick').value;
+  // Everything in the analytic half is about one band, so moving it re-derives all of it rather
+  // than leaving three panels describing the band before and one the band after.
+  state.lcTransfer = null;
+  $('lcTransferPanel').hidden = true;
+  $('lcPredict').click();
+});
+
+// ---------------------------------------------------------------------- the run, made visible
+//
+// TWO THINGS THIS PANEL COULD NOT DO, AND HAD TO.
+//
+// A run whose frames were mostly refused produced no analysis, and with no analysis there was no
+// curve, no table and no picture: a summary line and nothing else. The frames themselves are still
+// there, with their conditions and their reasons, and they are what a reader needs when a run goes
+// wrong. They are drawn now whether or not the analysis succeeded.
+//
+// And the summary GUESSED. It said "the field was down or the sky was not dark", which it had no
+// evidence for: every refused frame carries its own reason and the summary threw them away. The
+// commonest reason in practice was neither of those two, it was a transit aimed at a position with
+// no star on it, and the reader was told something false about their own run.
+
+state.lcAxis = 'time';
+
+for (const chip of document.querySelectorAll('#lcCurveAxis .chip')) {
+  chip.onclick = () => {
+    state.lcAxis = chip.dataset.axis;
+    for (const c of document.querySelectorAll('#lcCurveAxis .chip')) c.classList.toggle('on', c === chip);
+    renderLcRun();
+  };
+}
+
+/** The frames and the curve, for whatever the run produced. */
+function renderLcRun() {
+  const s = state.sequence;
+  if (state.mode !== 'lc' || !s) return;
+  renderLcFrames(s);
+  drawLcCurve(s);
+}
+
+function renderLcFrames(s) {
+  const frames = s.frames || [];
+  $('lcFramesPanel').hidden = frames.length === 0;
+  if (!frames.length) return;
+
+  const refused = frames.filter((f) => f.error);
+  const measured = frames.length - refused.length;
+  $('lcFramesNote').textContent =
+    `${fmt.int(measured)} taken, ${fmt.int(refused.length)} refused, of ${fmt.int(s.total)}`;
+
+  // THE REASONS AS THE SERVER GAVE THEM, grouped and counted. Never a guess.
+  $('lcFrameReasons').innerHTML = groupRefusals(frames)
+    .map(({ reason, count }) => `<li class="warn">${fmt.int(count)} frame(s): ${lcEsc(reason)}</li>`).join('')
+    + (s.ladderNote ? `<li>${lcEsc(s.ladderNote)}</li>` : '')
+    + (s.stopReason ? `<li class="warn">${lcEsc(s.stopReason)}</li>` : '');
+
+  const shown = frames.slice(0, 400);
+  $('lcFrameRows').innerHTML = shown.map((f) => {
+    if (f.error) {
+      return `<tr class="refused">`
+        + `<td>${f.index}</td><td>${lcEsc(f.observedUtc)}</td>`
+        + `<td colspan="6" class="reason">${lcEsc(f.error)}</td>`
+        + `<td><span class="tag below">refused</span></td></tr>`;
+    }
+    const inTransit = f.transitFactor !== null && f.transitFactor < 1;
+    return `<tr>`
+      + `<td>${f.index}</td>`
+      + `<td>${lcEsc(f.observedUtc)}</td>`
+      + `<td>${fmt.num(f.airmass, 3)}</td>`
+      + `<td>${f.pwvMm === null || f.pwvMm === undefined ? 'n/a' : fmt.num(f.pwvMm, 2)}</td>`
+      + `<td>${inTransit ? fmt.num((1 - f.transitFactor) * 1e6, 0) + ' ppm' : 'out'}</td>`
+      + `<td>${fmt.num(f.seeingArcsec, 2)}</td>`
+      + `<td>${fmt.num(f.fwhmPx, 2)}</td>`
+      + `<td>${fmt.int(f.stars)}</td>`
+      + `<td>${f.reliable === false ? '<span class="tag alias">unreliable</span>'
+                                    : '<span class="tag detected">measured</span>'}</td>`
+      + `</tr>`;
+  }).join('');
+
+  $('lcFramesCaption').textContent = frames.length > shown.length
+    ? `First ${shown.length} of ${fmt.int(frames.length)} rows.`
+    : '';
+
+  if (s.previewUrl) {
+    $('lcFramePreview').hidden = false;
+    if ($('lcFramePreview').getAttribute('src') !== s.previewUrl) $('lcFramePreview').src = s.previewUrl;
+  }
+}
+
+/**
+ * The light curve itself, drawn from the run's own series.
+ *
+ * Independent of the depth fit on purpose: a run can produce a perfectly good curve and still have
+ * no depth to recover, and a reader who cannot see the curve cannot tell which of the two happened.
+ * The fitted model is drawn over it when there is one.
+ */
+function drawLcCurve(s) {
+  const a = s.analysis;
+  const cv = $('lcCurve');
+  $('lcCurvePanel').hidden = false;
+
+  const rows = (a && a.series ? a.series : []).filter((p) => p.ratio !== null && isFinite(p.ratio));
+  if (rows.length < 3) {
+    $('lcCurveNote').textContent = s.state === 'running' ? `${s.done} of ${s.total}` : 'no series';
+    lcFail('lcCurveError',
+      (a && a.notes && a.notes.length)
+        ? a.notes.join(' ')
+        : 'This run produced no differential series, so there is no curve. The frame table below '
+          + 'gives each frame and the reason it was refused.');
+    $('lcCurveCaption').textContent = '';
+    if (cv && cv.clientWidth) setupCanvas(cv);
+    return;
+  }
+  lcFail('lcCurveError', '');
+
+  $('lcCurveNote').textContent =
+    `${rows.length} epochs · ${s.filter} · ${fmt.num(s.exposureSeconds, 0)} s · binning ${s.binning}`;
+
+  if (!cv || !cv.clientWidth) return;
+  const { g, w, h } = setupCanvas(cv);
+
+  const t0 = rows[0].ut;
+  const axis = state.lcAxis || 'time';
+  const xOf = (p) => axis === 'airmass' ? p.airmass
+                   : axis === 'pwv' ? p.pwvMm
+                   : (p.ut - t0) / 3600;
+  const label = axis === 'airmass' ? 'airmass' : axis === 'pwv' ? 'PWV mm' : 'hours from the first frame';
+
+  const usable = rows.filter((p) => xOf(p) !== null && isFinite(xOf(p)));
+  if (usable.length < 3) {
+    $('lcCurveCaption').textContent = axis === 'pwv'
+      ? 'This run carried no water-vapour term, so there is no column to plot against.'
+      : 'Not enough epochs carry that quantity.';
+    return;
+  }
+
+  const xs = usable.map(xOf);
+  const ys = usable.map((p) => p.ratio);
+  const [xlo, xhi] = extent(xs);
+  const [ylo, yhi] = extent(ys);
+  const { X, Y } = axes(g, w, h, xlo, xhi, ylo, yhi, label, 'target / ensemble');
+
+  // Where the injected event is, shaded, so the depth being measured is visible rather than stated.
+  if (axis === 'time') {
+    g.fillStyle = 'rgba(185,138,255,.08)';
+    let runStart = null;
+    usable.forEach((p, i) => {
+      const inn = p.transitFactor !== null && p.transitFactor < 1;
+      if (inn && runStart === null) runStart = i;
+      if ((!inn || i === usable.length - 1) && runStart !== null) {
+        const x0 = X(xs[runStart]), x1 = X(xs[Math.max(runStart, inn ? i : i - 1)]);
+        g.fillRect(x0, PAD.t, Math.max(2, x1 - x0), h - PAD.t - PAD.b);
+        runStart = null;
+      }
+    });
+  }
+
+  // The photon prediction as an error bar per point, where the run supplied one.
+  g.strokeStyle = 'rgba(94,207,255,.28)'; g.lineWidth = 1;
+  usable.forEach((p, i) => {
+    if (!(p.photonPpt > 0)) return;
+    const e = p.photonPpt / 1000;
+    g.beginPath(); g.moveTo(X(xs[i]), Y(p.ratio - e)); g.lineTo(X(xs[i]), Y(p.ratio + e)); g.stroke();
+  });
+
+  // The fitted model, when a depth has been fitted on this run.
+  const fit = state.lcDepth;
+  if (fit && fit.sequence === s.id && axis === 'time' && (fit.curve || []).length) {
+    const draw = (key, colour, width, dash) => {
+      g.strokeStyle = colour; g.lineWidth = width; g.setLineDash(dash || []);
+      g.beginPath();
+      let started = false;
+      fit.curve.forEach((c) => {
+        const v = c[key];
+        if (v === null || !isFinite(v)) return;
+        const x = (c.ut - t0) / 3600;
+        if (!started) { g.moveTo(X(x), Y(v)); started = true; } else g.lineTo(X(x), Y(v));
+      });
+      g.stroke(); g.setLineDash([]);
+    };
+    draw('baseline', 'rgba(255,180,84,.85)', 1.4, [5, 4]);
+    draw('model', 'rgba(126,231,135,.95)', 1.6);
+  }
+
+  g.fillStyle = 'rgba(94,207,255,.85)';
+  usable.forEach((p, i) => { g.beginPath(); g.arc(X(xs[i]), Y(p.ratio), 2.2, 0, Math.PI * 2); g.fill(); });
+
+  const bits = [];
+  if (a.detrendedPpt) bits.push(`scatter ${fmt.num(a.detrendedPpt, 2)} ppt after the airmass drift is removed`);
+  if (a.photonPpt) bits.push(`photon limit ${fmt.num(a.photonPpt, 2)} ppt`);
+  if (s.transient) bits.push(`injected ${fmt.num(s.transient.depthPpt, 2)} ppt`);
+  $('lcCurveCaption').textContent = bits.join(' · ')
+    + (fit && fit.sequence === s.id && axis === 'time' ? '. Dashed is the fitted baseline, solid the baseline with the transit.' : '.');
+}
+
+/**
+ * Redraw every light-curve canvas from the answers already in hand.
+ *
+ * A canvas here sizes its backing store from its own clientWidth, so anything that changes the
+ * column's width leaves the previous drawing stretched over the new one. Nothing is re-fetched:
+ * these all draw from state, so this is cheap enough to run on every resize tick.
+ */
+function redrawLcCanvases() {
+  if (state.mode !== 'lc') return;
+  if (state.lcReq) renderLcPrediction();
+  if (state.lcTransfer) drawLcTransfer(state.lcTransfer);
+  if (state.sequence) drawLcCurve(state.sequence);
+}
+
+// A ResizeObserver on the run column sat here for a while. It went, for two reasons: showing or
+// hiding a panel does NOT change the column's width (the grid column is 1fr either way, so there
+// was no case for it to catch), and it delivered no callbacks at all in the embedded browser this
+// was checked in. The window's own resize event does fire and is enough.
+
+/**
+ * Refusals grouped by what actually distinguishes them.
+ *
+ * A refusal often carries the offending VALUE, at full precision, inside its own sentence: "the
+ * water-vapour table covers 0.5 to 20 mm and was asked for 22.179499325733897 mm". Grouping on the
+ * sentence therefore made one group per frame, and a run whose column left the table printed
+ * sixteen near-identical lines that said one thing. The numbers are folded out to form the key and
+ * folded back in as a range, so the reader gets the sentence once with the span it covered.
+ */
+function groupRefusals(frames) {
+  const groups = new Map();
+  for (const f of (frames || [])) {
+    if (!f.error) continue;
+    const sentence = f.error.split(/(?<=\.)\s/)[0];
+    const key = sentence.replace(/-?\d+(?:\.\d+)?/g, '#');
+    const values = (sentence.match(/-?\d+\.\d{3,}/g) || []).map(Number);
+    const g = groups.get(key) || { reason: sentence, count: 0, values: [] };
+    g.count++;
+    g.values.push(...values);
+    groups.set(key, g);
+  }
+  return [...groups.values()]
+    .map((g) => {
+      if (g.values.length < 2) return { reason: g.reason, count: g.count };
+      // One sentence, with the values it varied over rather than one arbitrary instance of them.
+      const lo = Math.min(...g.values), hi = Math.max(...g.values);
+      const reason = g.reason.replace(/-?\d+\.\d{3,}/,
+        `${fmt.num(lo, 2)} to ${fmt.num(hi, 2)}`).replace(/\s*-?\d+\.\d{3,}/g, '');
+      return { reason, count: g.count };
+    })
+    .sort((a, b) => b.count - a.count);
+}

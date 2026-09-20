@@ -126,6 +126,117 @@ RC20 at 300 s with −50 °C requested:
 that it falls as ambient falls, so at a cold site the reachable floor here is optimistic by an
 amount no manufacturer publishes.
 
+**The air column had the same fault, fixed 2026-08-25.** `spec.SiteAltitudeMeters` is Core's
+altitude for the instrument's home mountain, and it fed four atmospheric terms — the extinction
+inside the passband integral, the scintillation sigma, the sky's zodiacal transmission and the
+differential-refraction sub-bands — whatever site the frame was actually taken from, so the RC20
+carried to Paranal was extinguishing through Haute-Provence's extra 1985 m of air. Rayleigh
+extinction scales as exp(−h/8000 m), which is why the column matters and why any term that scales
+with the same column (PWV among them) must be threaded the same way.
+`DeepSkyCamera.AtmosphereAltitudeMeters(spec, site)` now prefers the site's altitude with the
+spec's as fallback; `Prepare` evaluates it once, records it on the `PreparedExposure`, and
+`FrameReduction` rebuilds its `SystemResponse` from that recorded value so the reduction describes
+the same atmosphere as the pixels. `DetectionLimits` uses the same helper for the same reason.
+Measured consequence, RC20 M13 field booked at X = 2.17 in Blue: sky 91.2 e⁻/px through ORM's
+2396 m against 89.7 e⁻/px through the spec's 650 m, a 1.7 % shift that was previously attributed
+to the wrong mountain. At X = 1 the change is invisible by construction: extinction here is
+relative to the zenith (`10^(−0.4·k·(X−1))`), unity at X = 1 whatever the column.
+
+### 2.3b The layout frame is fixed on the sky, not on the zenith
+
+`Engine/Simulation/DeepSkyCamera.cs`
+
+The image used to be laid out with **up toward the zenith**, which made the atmospheric dispersion
+vertical by construction and cost nothing while Studio only ever produced one frame at a time.
+Across a **sequence** it is a first-order error: a zenith-referenced frame rotates with the
+parallactic angle, so the same star lands somewhere different in every exposure. Measured on a
+field at dec +36 from Roque de los Muchachos over one night: **104 degrees of rotation**, moving
+stars **587 to 1407 px** against 590 to 1420 px predicted from the parallactic angle alone.
+
+That is the behaviour of an alt-az telescope with no derotator, and **nothing in the roster is
+one**: the RC20, the RedCat 51 and the CDK1000 are equatorially mounted, and FORS2 and SPHERE are
+alt-az instruments that carry derotators. Every one of them holds a fixed sky orientation.
+
+**What it cost, measured** ([MILESTONE_0B.md](MILESTONE_0B.md)): the rotation moved every star to a
+new sub-pixel phase each frame, and `Core/AperturePhotometry`'s hard-edged aperture - a pixel is
+wholly in or wholly out by its centre, with no partial-pixel weighting - turned that into a 0.6 %
+flux jitter, six times the photon noise. The differential photometric floor came out at **4.21x**
+the photon limit against **1.65x** with the geometry held still, and the predicted jitter correlated
+with the observed residual at **+0.89** over 15 of 15 bright stars.
+
+`up` is now the celestial pole projected into the tangent plane, with the zenith as the fallback
+where that degenerates on a field at the pole itself. The dispersion is no longer assumed vertical:
+the zenith direction is resolved into the image's own axes and the offset is carried as
+`OffsetX`/`OffsetY`, which `ChromaticSubBand` has always accepted. With the old frame that
+resolution comes out (0, 1) and the offsets are exactly what they were, so this is a
+generalisation rather than a change of physics.
+
+**On the pole the fallback has to be a SKY direction too.** "Toward the pole" degenerates when the
+boresight *is* the pole, and the first version of this fell back to the zenith — which is fixed to
+the *horizon*, so a dec = ±90 field rolled at the full sidereal rate, 15°/hour, reinstating exactly
+the defect the frame exists to remove. The vernal equinox is the fallback now, and it cannot
+degenerate where that branch is reached: it is reached only when the boresight is the pole, and
+RA 0, dec 0 is exactly perpendicular to that. Up then means "RA 0 to the top" — arbitrary, as any
+roll on the pole is, but the *same* arbitrary roll in every frame of the night.
+`Verify` section 15a pins it: 0.000 px of movement over six hours on a dec = 90 pointing.
+
+**The dispersion ran 180° from the zenith, and that was a separate, older fault.**
+`AtmosphericRefraction.DifferentialRefractionArcsec` is documented "positive when the FIRST is
+lifted more, which for shorter wavelengths it is", and `BuildSubBands` passed it the passband centre
+first and the sub-band second. So a blue sub-band came back *negative* and was laid down on the far
+side of the band centre: the blue end of every ground passband placed away from the zenith, which is
+the opposite of what refraction does. Core's own `SplitPassband`, which serves the orbital path, has
+always passed them the other way round. Photometrically it is close to neutral — a circular aperture
+on a mirrored PSF loses the same light — but the frame's dispersion direction was wrong, and it is
+the direction a chromatic measurement turns on. Fixed, with `Verify` asserting that blue lands on
+the zenith side and red on the far one.
+
+**Still not modelled**: a requested position angle. Frames are north-up, where a real visit is
+scheduled at an orientation the observer asks for. That is the natural next addition and it is
+declared rather than implied.
+
+### 2.3c The displayed PNG is the same way up as the FITS
+
+`Engine/Simulation/PngWriter.cs`
+
+Row 0 of a frame is its **bottom** — `GnomonicProjection` says so, and the renderer, the FITS writer
+and the WCS all agree. PNG scanline 0 is the **top**. Handing the array straight to the encoder
+therefore published a *vertical mirror* of the file the same capture writes: not a rotation, a
+mirror, so no roll angle could reconcile them, while the render endpoint's own note said the picture
+was "what DS9, IRAF or Siril show when they open the FITS". It was not. `Encode8BitGrayscale` flips
+the row order, so both products agree; the sky chart's layer is rendered top-down for the browser
+already and goes to the encoder directly.
+
+Invisible for as long as a frame had no definite orientation to be wrong about. §2.3b gave it one.
+
+**The remaining half of the floor is in `Core/` and is reported rather than patched**: partial-pixel
+aperture weighting, the standard remedy, is what photutils' `exact` mode does. Either fix alone is
+enough - exact-area apertures make rotation harmless, and a fixed field orientation makes the hard
+aperture a constant per-star offset that cancels in a ratio - and it is the product of the two that
+set the floor.
+
+### 2.3d An instrument is re-seated at the site it is used from
+
+`Engine/Simulation/Campaign.cs`, `Engine/Simulation/DeepSkyCamera.cs`
+
+The same fault as §2.3 and §2.3b, in the third quantity that Core keys to the instrument's home
+mountain, and it had both halves of the program. `InstrumentSpec.SiteAltitudeMeters` feeds every
+atmospheric term of a light curve — `AtmosphericNoise.ScintillationExcessSigma` through
+`LightCurveSimulator.TotalNoiseSigma`, and the extinction and scintillation inside
+`TransitPhotometry` — so a campaign scheduled for one site was computing its noise for another.
+Driving SuperWASP-North (2400 m) from Mauna Kea (4205 m) carried exp(-2400/8000) = 0.741 of an
+atmosphere where the site has exp(-4205/8000) = 0.591: about **25 % too much scintillation sigma**
+on every epoch.
+
+`Campaign.AtSite` re-seats the instrument on a **copy**, because the roster's specs are shared and
+writing a site into one would leak into every later run. `Verify` section 15b asserts both halves:
+the campaign carries 4205 m at Mauna Kea, the roster entry still reads 2400 m afterwards, and the
+scintillation ratio between the two sites reproduces exp(-h/8000) to machine precision.
+
+Worth stating, because it is visible in that check's own output: at its home site the instrument
+now takes **2396 m**, the published figure `ObservingSites` carries, rather than Core's rounded
+2400. Four metres is nothing; that one number governs is not.
+
 ### 2.4 The Moon
 
 `MoonlightPollution` reads a moon's RA as `meanAnomaly + LanPlusArgPe` at declination 0, so the
@@ -349,13 +460,66 @@ generator as `new Random()`, so an identical request gave a different answer eve
 recovered semi-amplitude could be checked by anyone else. The imaging path never had the gap, since
 its PCG32 streams are seeded per exposure and the seed goes into the FITS header as `RANDSEED`.
 
-The fix touches two **vendored** files and is recorded as a fork in
+The fix touches two of the copied files and is recorded in
 [CORE_PROVENANCE.md](CORE_PROVENANCE.md). It is additive (a trailing `int? randomSeed = null`), so
 the mod can take it as a paste, and it should.
 
 Evidence, `Verify` section 9: two runs on seed 20260814 agree to **0.0 m/s** across 28 epochs; a
 differently seeded run differs by up to 4.4 m/s, which is what shows the seed is actually consumed
 rather than merely stored.
+
+**The imaging request takes the same discipline (2026-08-25).** `/api/capture` accepts `seed` and
+echoes it with the exact epoch (`observedUt`, seconds since J2000 TT) in the response; the drawn
+fallback remains the millisecond counter, which is why a *sequence* must supply its own per-frame
+seeds — two frames drawn in the same millisecond would share their noise realisation. Measured:
+two captures posted with the same request, seed and `atUtc` return byte-identical FITS
+(sha256-equal). `/api/captures/{id}/calibration` takes and echoes a seed the same way.
+
+**Seed 0 is refused**, not remapped. `FitsWriter` treats `RandomSeed == 0` as its no-seed sentinel
+and omits `RANDSEED`, so the frame most likely to be produced by a first script would have come
+back looking unseeded; remapping instead would have broken the one property the seed exists for,
+that the same request repeats.
+
+#### Calibration draws from its own streams, because one seed everywhere had to stay safe
+
+Offering a seed on both endpoints created a trap that offering it on neither did not.
+`CalibrationFrames.Build` seeded frame *f* as `Pcg32(seed + f*7919, StreamShotNoise/StreamReadNoise)`
+— the identical constructor and streams `Digitise` uses with the capture's seed. Frame 0 of a bias
+built with the light's own seed therefore carried **the light's exact read-noise realisation**, and
+subtracting that master cancelled real noise rather than the pedestal: at the default 16 frames,
+a deterministic 1/16 of the light's read noise removed, with the photometric scatter coming out
+better than the physics and nothing saying so. The same collision made a dark and a bias sharing a
+seed differ by no read noise at all.
+
+Calibration now draws from streams no exposure uses, one pair per kind (`StreamCalibShot/Read`,
+32 and 33 with a stride of 2, clear of the 1–10 `Core/Pcg32` claims). Measured on an RC20 bias and
+dark, single frames, binning 8:
+
+| | ADU |
+|---|---|
+| scatter of one bias | 4.274 (fixed pattern + read noise) |
+| bias(42) − bias(999), so the fixed pattern cancels | 2.795 → read noise σ = **1.976** |
+| dark(42) − bias(999), independent seeds | 2.832 → dark shot σ = **0.46** |
+| **dark(42) − bias(42), the same seed** | **2.840** |
+| ratio, same seed against different | **1.0030** |
+
+A ratio of 1 is the statement: sharing a seed between two frames now removes nothing. Had the
+streams still been shared, that difference would have held the dark shot noise alone, 0.46 against
+2.83 ADU — **a ratio near 0.16**, derived from the two σ measured in the same table. Two builds at
+the same seed and kind remain byte-identical, so reproducibility is untouched.
+
+#### The frame store bounds masters too
+
+Exempting masters from the lights' FIFO was necessary — they are made *before* the frames they
+calibrate, so eviction by age removed exactly the wrong entries — but exempt is not unbounded, and
+the first version had no cap at all: every calibration build and every upload added a permanent
+full-frame entry. Lights and masters now rotate against separate caps
+(`EXOSTUDIO_MAX_FRAMES`, `EXOSTUDIO_MAX_MASTERS`), eviction is serialised so two concurrent
+captures cannot evict a third frame between them, and a cap that is **set but unparseable is
+refused at startup** rather than falling back to the default: the fallback was invisible, and its
+symptom was a long run's own frames expiring halfway through with a 404 and no explanation. The
+caps are read in the constructor for that reason — as `static readonly` fields they initialised
+lazily on first capture, so the process printed `listening` and only then refused.
 
 ---
 
@@ -528,14 +692,22 @@ deposits, with the magnitude it went in at and the pixel it landed on, projected
 observer would: source detection, aperture photometry through Core's `AperturePhotometry` (verified
 against photutils in the mod's `tools/photometry-tests`), and a zero point fitted from the field.
 
-### Results, RC20 at Roque de los Muchachos, M13, 120 s, binning 1
+### Results, RC20 at Roque de los Muchachos, North Galactic Pole, 120 s, binning 1
+
+**The fixture was re-pointed on 2026-08-26**, 0.3 deg east of the pole and booked at transit rather
+than left to the scheduler. Centred exactly on the pole the frame catches a V = 9.67 star whose halo
+and spider spikes are found as separate peaks - 567 detections against 175 injected stars, tripping
+the UNRELIABLE rule at 3x - and the scheduler, which searches the night AFTER the requested Ut, was
+putting the frame at airmass 1.8 with 13 px per FWHM rather than the airmass-1 well-sampled frame
+this section claims. Offset and booked, the brightest star in frame is V = 12.62 and the closure
+improves: the colour-matched residual is **-6.3 mmag** where it was -11.7.
 
 | | |
 |---|---|
-| detected / matched | 198 / 99, at 9.1 px per FWHM |
-| **median &#124;recovered − injected&#124;** | **6.8 mmag** |
-| **zero point, pixels vs passband integral** | 22.0967 vs 22.1584, **−0.062 mag apart** |
-| drift of that agreement over a factor 2 in exposure | **0.6 mmag** |
+| detected / matched | 107 / 79, at 9.1 px per FWHM |
+| **median &#124;recovered − injected&#124;** | **11.6 mmag** |
+| **zero point, pixels vs passband integral** | **−0.060 mag apart** |
+| drift of that agreement over a factor 2 in exposure | **2.5 mmag** |
 
 The last row is the check that the gain and the exposure each enter exactly once: a residual that
 moved with exposure time would mean one of them was applied twice.
@@ -616,8 +788,8 @@ Bessell 2005, ARA&A **43**, 293). Measured from the field's own stars: **0.050 m
 | **measured raw residual** | **0.062 mag** | |
 | left over | 0.006 mag | |
 
-With the colour term applied, the fitted and the analytic zero point agree to **−11.7 mmag**. That
-is the honest headline: **the forward model and its inverse agree to 12 millimagnitudes**, and the
+With the colour term applied, the fitted and the analytic zero point agree to **−6.3 mmag**. That
+is the honest headline: **the forward model and its inverse agree to better than 7 millimagnitudes**, and the
 0.062 mag that looked like a discrepancy was two textbook effects and a comparison made on the
 wrong scale.
 
@@ -759,18 +931,741 @@ every magnitude measured away from the centre. On FORS2 it is not a gradient at 
 past which there is no data. Neither is removable by stacking, by a longer exposure or by anything
 except a flat.
 
+### Charge-transfer smear, and the difference between impossible and unpublished
+
+`Core/ChargeTransferSmear` models the stripe a shutterless CCD lays down its own columns, and
+inverts it exactly. A packet travels through every row between its own and the serial register, and
+where the array is still lit during that journey it arrives carrying a sample of everything it
+passed over:
+
+    measured(y) = light(y) + k * SUM over y' < y of light(y'),      k = t_transfer / (N * t_exposure)
+
+One dimensionless constant out of two published times and the row count, nothing fitted. The
+relation is lower triangular with a unit diagonal, so it inverts by forward substitution in one
+pass: the effect and its correction are **one equation solved in two directions**, the same
+discipline `DetectorLinearity` follows, and the round trip is the identity to 1e-7 (`Verify`
+section 15).
+
+Three ordering decisions carry the physics, and each is checked rather than asserted:
+
+- **The smear is added to the MEAN light plane, before the Poisson draw**, so the smear charge
+  carries its own shot noise. Added to an already-sampled frame it comes out perfectly smooth,
+  which is a frame whose noise is wrong in exactly the region a desmearing algorithm is judged on.
+- **After the photo response and the illumination**, because the charge is collected in the pixels
+  it TRANSITS and takes their response, not its destination's.
+- **In the reduction, after the bias and before the flat.** Both neighbours matter. The inverse
+  sums rows, so a pedestal left in every pixel is summed into a ramp no detector produced, and the
+  harness measures that error at 48.9 ADU against 3e-5 in the right order. And the flat must come after,
+  or the stripe is divided by the wrong pixel's response — the order Kepler and TESS both use.
+
+**The gate is architecture, not a missing number**, and `DeepSkyCamera.SmearConstantFor` enforces
+it: an HgCdTe array reads every pixel where it sits, so a frame-transfer time on one is a
+contradiction rather than a configuration, and it is refused. Drawing the stripe anyway would put a
+specific, visible, physically impossible feature on the frame, which is a worse failure than having
+no model — and it is what a simulator invites when it offers smear as a switch on any camera.
+
+No instrument on this roster smears, and the field says per device why:
+
+| | why it carries NaN |
+|---|---|
+| RedCat 51, RC20, CDK1000 (ASI294MM Pro) | CMOS. Read in place, no charge crosses a pixel. **Impossible.** |
+| FORS2, WFC3/UVIS | Full-frame CCD behind a mechanical shutter, shut before the first row clocks. **Impossible.** |
+| WFC3/IR | HgCdTe. No charge transfer at all. **Impossible.** |
+| SPHERE/ZIMPOL | Back-illuminated **frame-transfer** CCD, so the mechanism is genuinely present. What this project has from Schmid et al. (2018) Table 4 is the full well, read noise, dark current, conversion factor and minimum integration time; a transfer time is not among them. **Not sourced.** |
+
+That last row is left NaN rather than filled with a plausible millisecond figure, on the grounds
+`Core/BrighterFatter` states for the same situation: the model is here and waiting for a number,
+rather than absent because a number was believed not to exist. An observer modelling a real
+shutterless instrument supplies `frameTransferSeconds` through the custom-instrument endpoint, and
+the frame then carries the stripe and the reduction takes it back off.
+
+A flat is where this bites hardest. Smearing a UNIFORM field does not produce a faint stripe, it
+produces a clean linear **ramp**, deepest at the readout edge, and a master flat built from such
+frames carries a gradient that was never the array's photo response. Dividing by that master prints
+the gradient into every science frame it calibrates, inverted, where it reads as real sky. The
+calibration endpoint reports the ramp's depth on any frame that has one.
+
 ### What is still omitted
 
 Fringing (`Core/Fringing` is vendored and computes it from the airglow line spectrum; not yet
-wired), cosmic rays, charge-transfer smear, hot pixels, and **dark-current non-uniformity**, the
-matching fixed pattern on the dark term, which no device in this roster publishes. A master dark
-here therefore corrects the dark's LEVEL but not its structure.
+wired), cosmic rays, hot pixels, and **dark-current non-uniformity**, the matching fixed pattern on
+the dark term, which no device in this roster publishes. A master dark here therefore corrects the
+dark's LEVEL but not its structure.
 
 The modelled photo-response is **white**. Real thick back-illuminated CCDs also show tree rings from
 radial dopant variations and brick walls from laser annealing; Luo et al. (2024, AJ **168**, 251)
 measure both on one such device, the rings falling from 1.6 % peak-to-valley at 287 nm to 0.7 % at
 947 nm. Neither pattern is published for any detector in this roster, and borrowing another device's
 would put specific, visible, wrong structure into every frame.
+
+---
+
+## 5.7 The two noise models, subtracted
+
+`Engine/Program.cs` (`/api/noise-model`), `tools/noise_bridge.py`
+
+Studio carries two independent noise models, and until 2026-08-27 only one was checked. The imaging
+path deposits photons and reduces the frame back — that is what ACCURACY.md covers and what §5.5
+closes against its own inverse. The light-curve path (`LightCurveSimulator.TotalNoiseSigma` through
+`Core/TransitPhotometry`) predicts one scalar sigma per epoch, and **every radial-velocity and
+transit detection in this program runs on it**. Its signal side is checked (51 Peg b's K to 1.6 %);
+its noise side was checked against nothing.
+
+`/api/noise-model` builds a `PhotometricDetector` from an astrograph's own published figures and
+returns the light-curve model's budget term by term. `tools/noise_bridge.py` compares it, per star,
+against the scatter the same star actually shows across a 100-frame sequence.
+
+| | median over 90 stars |
+|---|---|
+| light-curve model / measured, before | **0.679** |
+| light-curve model / measured, after the refinement below | **0.776** |
+| imaging error bar / measured | 0.848 |
+
+**The whole model-vs-model gap was the Gaussian encircled-energy assumption.** Rebuilding the
+model's sigma with the frames' measured fraction lands it on the imaging error bar to 1.4 %. See
+[MILESTONE_0C.md](MILESTONE_0C.md) for the decomposition and for the ~15 % per-star shortfall that
+both implementations share and that is **recorded as open rather than absorbed**.
+
+Two details that keep the comparison honest and are worth stating: the model is evaluated on a
+12-point airmass grid and averaged in quadrature over the frames rather than asked at the mean
+airmass, because sigma is convex in X; and the measured scatter is detrended against airmass,
+because real extinction is signal rather than noise. Detrending order makes no difference (linear,
+quadratic, cubic and against seeing all give 3.87 ppt), which is what says the residual is noise and
+not an unremoved trend.
+
+---
+
+## 5.8 Sequences in the interface, and the check the harness cannot make
+
+`Engine/Simulation/PhotometricSequence.cs`, `Engine/Program.cs`, `web/`
+
+Everything the differential-photometry work measured is reachable from the site: `POST
+/api/sequences` takes the airmass ladder, streams its progress, reduces each frame as it arrives
+and **discards it**. A hundred sub-exposures at binning 1 is gigabytes of pixels and a few hundred
+kilobytes of measurements, and only the measurements answer the question a sequence is started to
+answer, so only they are kept. One preview frame survives, and that limitation is stated in the
+panel rather than discovered: take a single capture at the epoch of interest if you want its FITS.
+
+The interface carries the whole of it — the ladder and the base seed as inputs, live progress, the
+differential light curve with its fitted drift drawn over it, the colour-slope plot the
+second-order extinction coefficient comes from, the twelve numbers, and the two-noise-model
+comparison of §5.7.
+
+**And a second harness, because `Verify` cannot see any of this.** `Verify` calls the engine's
+classes directly; it never issues an HTTP request and never loads a page. Two breakages shipped
+past a fully green run:
+
+| what | why the harness could not see it |
+|---|---|
+| `/api/forecast` returned **500** whenever called with ra+dec and no instrument — which is how every page load calls it | a null reached a field access on a branch no C# test takes |
+| a sequence could not find its own instrument, having stored `"PlaneWave RC20"` where every lookup matches `"RC20"` | both are strings and both compile |
+
+Neither is a physics fault, and no amount of physics checking would have found either.
+`tools/smoke_site.py` asks the server the questions the browser asks and checks the answers are
+shaped the way the browser reads them, including that **every id the script reaches for is created
+somewhere** — a renamed id is silently `null` in JavaScript and throws only when a user presses the
+button. 35 checks, about a minute, or a few with `--sequence`.
+
+---
+
+## 5.9 Water vapour
+
+`Engine/Simulation/PwvTransmission.cs`, `Engine/Simulation/PwvSeries.cs`, `tools/fetch_pwv_grid.py`,
+`tools/pwv_pair.py`, `GET /api/pwv/transmission`, `POST /api/pwv/series`
+
+The one weather term this program models, and it is modelled because it is the one that does **not**
+cancel in a differential measurement. Water absorbs in narrow bands in the red — 720, 820 and
+940 nm — so its effect depends on a star's colour, and a colour-dependent term survives the ratio
+of a target to its comparisons that a transit is measured in. Everything grey cancels there.
+
+### The table, and why it is a table
+
+| | |
+|---|---|
+| source | ESO telluric library, `ftp.eso.org/pub/dfs/pipelines/skytools/telluric_libs/` |
+| model | LBLRTM line-by-line for Cerro Paranal, behind the Cerro Paranal Advanced Sky Model (Noll et al. 2012, A&A **543**, A92; Jones et al. 2013, A&A **560**, A91) |
+| resolution | R = 60,000, resampled to 0.02 nm bins |
+| coverage | 300 to 1300 nm, 50,000 bins |
+| water column | 0.5, 1.0, 1.5, 2.5, 3.5, 5.0, 7.5, 10.0, 20.0 mm |
+| airmass | 1.0, 1.5, 2.0, 2.5, 3.0 |
+
+Water absorption in this range is a forest of tens of thousands of lines, not a curve with a
+coefficient. Any closed form is a fit to somebody's table, so the transmission **is** the published
+table, bilinearly interpolated in (PWV, airmass), and **outside its range a capture is refused
+rather than extrapolated**.
+
+### The library is not water only, and that had to be dealt with
+
+The file is the transmission of the **whole molecular atmosphere** at a given water column, and ESO
+publishes no species-resolved version. Measured on the files themselves at airmass 1:
+
+| | at 1 mm | at 20 mm | what it is |
+|---|---|---|---|
+| 400 nm | 1.0000 | 0.9996 | nothing — **there is no Rayleigh in the file** |
+| 550 nm | 0.9772 | 0.9772 | ozone, Chappuis band |
+| 760 nm | 0.6797 | 0.6815 | molecular oxygen, A band |
+| 940 nm | 0.9949 | 0.8816 | **water** |
+
+Neither moves with the water column, and both are divided out — **but only one of them was being
+double counted, and an audit caught me claiming otherwise for both.**
+
+**Ozone was.** The extinction law here is Rayleigh plus an aerosol term whose amplitude is whatever
+residual brings the total at Johnson V to 0.20 mag/airmass — a typical value an observer *measures*,
+and a measured V coefficient necessarily contains that site's ozone. Applying the library's ozone on
+top would have dimmed every frame that switched water on by about **25 mmag in Luminance, none of it
+water**. (My first justification said the coefficient was "each site's own measured value". It is a
+single `const` shared by every site; Studio has no per-site extinction at all. The double count is
+real because 0.20 is an observed number, not because it is fitted per site.)
+
+**Molecular oxygen was not.** Studio models no oxygen anywhere, and a smooth λ^-1.3 aerosol law
+contains no A band. Removing it is therefore a *choice*, not a correction: the band does not vary
+with the water column, so it carries none of the differential signal this term exists for, while
+adding a 0.68 transmission notch at 760 nm would silently change absolute photometry for every
+filter that crosses it. **Studio still has no molecular oxygen** — a declared simplification, not a
+term that was fixed.
+
+So every slice is divided by the driest column's at its own airmass. The division is **exact** for
+the purpose: at fixed airmass every species independent of the water column appears identically
+above and below and cancels to the bit. The 760 nm oxygen band goes from 0.68 to 0.999 — what is
+left there is the weak water lines that share the band.
+
+**What the term means afterwards**: the water *in excess of* the reference column, 0.5 mm, and at
+the reference it is exactly one — the frame is exactly the frame Studio took before the term
+existed. **Stated assumption**: a site's measured extinction was measured on nights that had some
+water in them, and 0.5 mm is drier than most. The absolute zero point therefore sits at a drier
+night than the site's own calibration; every *difference* between two columns is exact regardless,
+which is what the term is for.
+
+**Resampled by averaging, and that is exact rather than convenient.** The passband integral is
+linear in transmission, so the mean of T over a bin gives the same integral as T itself, provided
+the source and the response vary little across one bin — they vary over hundreds of nanometres and
+the bins are 0.02 nm. Averaging in optical depth would be wrong, because Beer-Lambert is not linear.
+
+**Not shipped**, for the same reason the Gaia catalogues are not. `tools/fetch_pwv_grid.py` builds
+`data/PwvTransmission.grid` (7.4 MB) from the source; `/api/capture/data` reports whether it was
+found, and without it the term is declared absent.
+
+### Where it enters
+
+`DeepSkyCamera.BuildSystemResponse`'s five-argument form multiplies the water curve into the
+**filter curve**, so it reaches the passband integral per wavelength — the same integrand that
+already carries the source spectrum, the reddening, the optics, the quantum efficiency and the
+Rayleigh-plus-aerosol extinction. A band-averaged factor would be wrong twice over: Beer-Lambert is
+not linear, and it would erase the colour dependence the term exists for.
+
+**The series is resolved by the server, never by the interface.** `POST /api/pwv/series` takes the
+same request body a capture takes and returns what the series is: identifier, description, mean,
+range, the column at a given instant, and **what the parse had to skip**. The panel plots that. It
+used to parse a pasted record itself and took the *last* whitespace-or-comma token of each line
+where `PwvSeries.Parse` takes the second and also accepts semicolons and tabs — so a three-column
+GNSS record plotted its uncertainty column while the frame was exposed through its water column,
+and a semicolon-separated record plotted its year. Two parsers is one too many.
+
+**A water series on an orbital instrument is refused**, not dropped. It used to be dropped from the
+physics while `PwvSeriesId` was still written into the frame's header — a water-vapour provenance
+card on photons that never crossed an atmosphere. The header field is now tied to the *value*: no
+column, no provenance.
+
+**The zenith is not out of range.** Kasten & Young returns 0.99971 straight overhead — a property of
+the fit, not of the sky — so a strict `airmass < 1` refused every field within 1.39° of the
+zenith, which are the best-placed fields at any site, with a message that rounded the offending
+value to "1" and said 1 was outside 1 to 3. `ImagingObservingConditions.ZenithAirmass` publishes the
+model's own zenith value, the table serves from there upward, and anything below it — which the sky
+cannot present — is still refused.
+
+**In the interface, the curve is plotted at the airmass the frame will actually be exposed
+through** — the booked slot's, or the moment the server will schedule when nothing is booked.
+`/api/forecast` carries the airmass of every cell, computed by `ImagingObservingConditions.AirmassAt`,
+because the page must not do physics. A plot drawn at a fixed reference airmass while the frame is
+taken at another is a picture of a different night: 10 mm of water costs 2.2 mmag at airmass 1.03 and
+3.7 at 2.57 on the same field.
+
+**The passband integral is converged, and was not.** `SystemBandpass` integrated on a fixed 257
+Simpson nodes — chosen when the only curves it saw were measured filter responses a few hundred
+samples long. The water term multiplies a line forest sampled at 0.05 nm into that same curve, so
+the rule was taking one point in every twenty-one of the curve's own: nudging a band edge by 0.01 nm,
+which changes no physics, swung the effective width **30 %**. Every millimagnitude figure this
+section reports rested on that.
+
+Each node now carries the **mean** of the curve over the interval it stands for
+(`SpectralCurve.MeanOver`) rather than a point sample. That is exact — the integral is linear in the
+curve — and costs nothing, where sizing the quadrature to the curve instead converged equally well
+and took a wet capture from 24 s to over 400. Converged to **0.147 % across a 0.1 nm nudge**, and
+`Verify` sweeps the band edge and asserts it.
+
+**The product curve spans exactly the support the passband already had** — the filter curve's own
+span where there is one, and centre ± half the nominal width where there is not. A first version
+used the 1.5× margin the chromatic sub-bands use, which widened Luminance from 685 to 751 nm, walked
+the band into a water feature, and made the *bluer* filter look more water-sensitive than the redder
+one. `Verify` 14d catches exactly that, by asserting a unit transmission reproduces the untouched
+response to a part in a million.
+
+### The column as a function of time
+
+`PwvSeries.PwvMm(ut)` is a **pure function of ut** with no state and no draw, which is what keeps
+the warp invariant intact: a series that remembered anything, or drew per tick, would make a run
+depend on how fast it was played. Three kinds:
+
+- **constant** — the control an injection–recovery experiment is compared against;
+- **analytic** — a mean, a sinusoid and a drift. Not a weather model and not offered as one: a
+  *known* signal to inject, so a correction can be scored against truth, which no real night can
+  supply because no real dataset knows its own true column;
+- **measured** — a record the observer uploads, interpolated between samples and **held flat
+  outside them** rather than extrapolated, with `CoversUt` saying which.
+
+The analytic form keeps its two terms on **two different clocks**, and the reason is worth stating
+because getting it wrong is silent in both directions. The **oscillation** runs on absolute time, so
+a frame booked at 22:00 and one at 02:00 see different columns and any two askers agree on the same
+instant. The **drift** runs from the run's own epoch — a sequence's first frame, or the instant a
+capture is booked for — because a drift running from absolute zero puts metres of water on the sky
+in a perfectly well-formed double. A drift with no epoch to drift from is refused. On a single frame
+the drift term is therefore nil, correctly: 0.8 mm/day over a 10 s exposure is nothing.
+
+The epoch is the **observation's**, never the request's. It was `DateTime.UtcNow` — the moment the
+POST arrived — so the same booked night came back with a different column and a different identifier
+on every submission, with every unit check passing. `tools/smoke_site.py` posts the same request
+twice and compares.
+
+Every series carries an id that is an FNV-1a hash of what defines it, so two identical series agree
+on it in any process. The frame writes `PWV` and `PWVSRC` into its FITS header beside `AIRMASS`,
+because a reduction that wants to correct for water has to know what it was.
+
+### What it is worth, measured
+
+Effective photometric width for a 3500 K star, RC20 at airmass 1.5, 1 → 10 mm of water:
+
+| band | cost |
+|---|---|
+| Luminance, 420–685 nm | **2.8 mmag** |
+| Red, 597–685 nm | **3.2 mmag** |
+| I+z′, 750–950 nm (from the table; FORS2 and SPHERE both reach into it) | **89 mmag** |
+
+**It is the filter that decides, not the water**, and that is the finding. Measured across every
+ground filter on the roster, flat spectrum, 1 → 10 mm at airmass 1.5:
+
+| instrument | filter | span | 1 → 10 mm |
+|---|---|---|---|
+| RedCat51 / RC20 / CDK1000 | Blue | 420–508 nm | 0.34 mmag |
+| " | Luminance | 420–685 nm | 2.13 mmag |
+| " | Green | 508–597 nm | 2.93 mmag |
+| " | Red | 597–685 nm | 3.11 mmag |
+| " | **Hα** | 653–660 nm | **9.04 mmag** |
+| VLT SPHERE | Luminance | 500–900 nm | **17.95 mmag** |
+| VLT FORS2 | Luminance | 330–1100 nm | **38.58 mmag** |
+| VLT FORS2 | **Red / Green / Blue** | 330–1200 nm | **66.77 mmag** |
+
+**Three orders of magnitude, from 0.05 mmag on SII to 67 on FORS2's red arm.** Two things in that
+table were missed for a long time and are worth naming. **Hα sits in a water feature**: the band at
+656 nm is weak next to 720/820/940, but a 7 nm passband centred on it has nowhere to hide, so the
+narrowest filter on the roster is three times more water-sensitive than the widest. And **the VLT
+instruments reach the strong bands outright** — SPHERE's Luminance runs to 900 nm and FORS2's
+measured curves to 1200.
+
+An earlier version of this section said the opposite: that every passband here stopped at 685 nm and
+the term was therefore small on this roster. That was asserted from RC20 alone, and RC20 is the
+narrowest-ranging instrument in the catalogue. See §5.9's note on what the check now does.
+
+### What two frames measured
+
+Not a self-check but a measurement, and the one that says the term survives the whole pipeline
+rather than only the integral. One field, one seed, one instant, two water columns, reduced
+identically — 0.5 mm against 20 mm at airmass 1.017 on RedCat51, Luminance, 120 s:
+
+| | | before the integral was converged |
+|---|---|---|
+| predicted, flat spectrum | +3.06 mmag | 3.06 |
+| measured, 2245 stars over 9 noise realisations | **+3.25 mmag** | 4.52 |
+| colour slope, least squares | **+1.25 ± 0.59 mmag per mag of B−V** (2.1σ) | +2.30 ± 0.62 (3.7σ) |
+
+Prediction and measurement agree to **0.19 mmag**. They were 1.46 apart on the unconverged integral,
+a gap that was explained here as the stars being redder than a flat spectrum; it was the quadrature
+error instead. The colour slope moved the other way — **3.7σ became 2.1σ** — so the colour dependence
+is suggestive in frames rather than established. What the converged integral did produce is four
+colour quartiles rising monotonically (2.80, 3.03, 3.47, 3.98 mmag), which the aliased one did not.
+Per-star scatter is 7.4 mmag against a trend of 1.
+
+    python3 tools/pwv_pair.py --at 2026-08-28T20:09:16Z --exposure 120 --binning 2 \
+            --min-snr 150 --dry 0.5 --wet 20 --repeats 9
+
+**Stated assumption**: the library is computed for Cerro Paranal and is applied at every site. The
+column is the parameter, so the first-order dependence is explicit; the difference in pressure
+broadening between one mountain and another is not carried.
+
+### What accuracy a water-vapour sensor has to reach
+
+`tools/pwv_requirement.py`, `Verify` §"what PWV accuracy a programme actually needs"
+
+The question an observatory has to answer is not how much water absorbs but **how well the column
+must be known**, and that is a different quantity. A *constant* PWV error is harmless: differential
+photometry normalises on the out-of-transit baseline, so a bias common to the night divides out with
+everything else grey. What survives is the error on the **change** across the event. The requirement
+is therefore set by the derivative
+
+&nbsp;&nbsp;&nbsp;&nbsp;`dD/dP`, where `D(P) = loss(T_target, P) − loss(T_comparison, P)`
+
+in µmag per mm. The table's 0.5 mm reference column cancels in the difference, so this figure does
+not inherit the anchor.
+
+**External framing.** Meier (MSc 2026, ETH Zurich, Institute of Geodesy and Photogrammetry;
+supervisors Soja, Cegla, Baumann, Pedersen) processes four low-cost GNSS receivers at the SPECULOOS
+Southern Observatory against Paranal's LHATPRO radiometer: **target 0.1 mm**, achieved **σ = 0.53 mm**
+with an offset of −0.01 mm. Its Figure 4.5 gives the time axis this term needs — RMSE ≈ 0.55 mm at
+5–10 min binning, 0.30 mm daily, 0.15 mm at 14 days — and states the residual is *short- to sub-daily
+variability rather than a fixed bias*. Sub-daily is the transit timescale, so the 5–10 min figure is
+the one that applies and the daily one is not available as a defence.
+
+Measured here at airmass 1.5, around 2.5 mm, 2600 K against 5800 K comparisons, for a 100 ppm budget:
+
+| band | absorbed µmag/mm | differential µmag/mm | σ_PWV needed |
+|---|---|---|---|
+| g′ 400–550 | 60 | 17 | 6.27 mm |
+| r′ 550–700 | 715 | 109 | 1.00 mm |
+| i′ 700–850 | 5 066 | 66 | 1.65 mm |
+| z′ 850–1000 | 25 840 | 1 555 | 0.070 mm |
+| **I+z′ 750–1000** | 19 034 | **3 544** | **0.031 mm** |
+| Y 970–1070 | 2 804 | 339 | 0.320 mm |
+| YJ 970–1330 | 16 830 | 508 | 0.214 mm |
+| J 1170–1330 | 9 702 | 201 | 0.540 mm |
+| Hs 1500–1650 | 3 305 | 211 | 0.515 mm |
+
+Converged to 0.3 % between a 0.5 mm and a 0.1 mm half-step, and identical at 64 and 128 quadrature
+nodes. The bands are **rectangular top-hats** at standard edges, not measured transmission curves.
+
+**Two consequences.** The stated 0.1 mm goal is about three times too loose for I+z′, the band
+SPECULOOS observes in, and 0.53 mm leaves 1 729 ppm there — a quarter of a TRAPPIST-1-sized depth.
+But for g′, r′, i′, J and Hs the achieved 0.53 mm is *already* inside a 100 ppm budget, so a single
+verdict for an observatory is the wrong shape of answer.
+
+**The term the observer controls for free.** The requirement scales with the target-to-comparison
+colour difference, not with the target alone. Recomputed by `PwvRequirement.ColourGrid` at the same
+airmass, operating point and 100 ppm budget as the table above:
+
+| target ＼ comps | 3000 K | 4000 K | 5000 K | 5800 K |
+|---|---|---|---|---|
+| 2000 K | 0.040 mm | 0.026 | 0.022 | 0.020 |
+| 2600 K | **0.126** | 0.048 | 0.035 | **0.031** |
+| 3200 K | 0.308 | 0.103 | 0.058 | 0.047 |
+| 4000 K | 0.077 | **no limit** | 0.131 | 0.086 |
+
+A 2600 K target needs **0.126 mm against 3000 K comparisons where it needs 0.031 against solar
+ones** — a factor of four, bought by choosing which stars go in the ensemble and paid for with
+nothing. At equal temperature the differential is **exactly zero**, which both harnesses assert as
+`== 0.0` rather than as a tolerance, because it is an identity of the passband integral and not a
+limit; the endpoint serves that cell as `null` with `unlimited: true` and never as the string
+`"Infinity"`.
+
+> **Corrected 2026-09-02.** This matrix previously read 0.028 / 0.116 in the cells above, and
+> **disagreed with the per-band table on the one cell they share**: I+z′ at 2600 K against 5800 K
+> is 0.031 mm in the table and was 0.028 mm here, a ratio of 1.0857. That is exactly the
+> ppm-of-flux to micromagnitude conversion — the matrix had been computed with the 100 ppm budget
+> used directly as 100 µmag, which is the confusion `tools/pwv_requirement.py` warns about in its
+> own comment ("they differ by 8.6 %, so treating them as interchangeable understates a requirement
+> by 8.6 %"). Both tables now come from one expression, `PwvPhotometry.PpmToUmag`, and `Verify`
+> §17 asserts they agree on the shared cell to a part in a billion.
+
+    python3 tools/pwv_requirement.py --port 5228
+
+### An instrument carries its own bands, however many
+
+`Core/VisualTelescopeCatalog.cs` (`Band`, `Bands`, `FindBand`, `BandNames`),
+`DeepSkyCamera.TryResolveBand`
+
+`CameraFilter` is ten names from an amateur filter wheel, and nothing physical makes ten the right
+number. An instrument with nine Sloan and near-infrared bands could not be expressed at all, and
+mounting g′ in the "Green" slot made every downstream label lie: a frame taken over 750–1000 nm
+wrote `FILTER = 'Luminance'` into its FITS header, where the true span sat two cards lower in
+`WAVELNTH` and `BANDWID` and nobody reads those first.
+
+A spec now carries `List<Band> Bands` — name, centre, width, peak, optional measured curve — with no
+limit, and `TryResolveBand` is the one place a requested **name** becomes something the pipeline can
+integrate. It materialises the band into a slot of a **shallow copy**, so the instrument's own spec
+is never mutated; the six endpoints that take a filter all go through it, and an instrument that
+declares its own bands does not also silently answer to the enum's, because "Green" on a DUET arm
+would otherwise integrate a passband nobody defined.
+
+Two consequences worth naming. **A measured curve is accepted on any band**, where the old code
+refused it on anything but Red, Green and Blue because there were three curve fields and nowhere to
+put a fourth. And **a FITS string card now escapes a quote by doubling it**, per the standard, where
+it used to delete the character: a band labelled `I+z'` was recorded as `I+z`, silently, which is
+the same class of fault as rounding a value without saying so.
+
+### The whole term, measured on pixels, on the instrument it is about
+
+`tools/pwv_imaging_figures.py`, `POST /api/instruments/custom`, `POST /api/sequences`
+
+Everything above is the passband integral. This is the same term deposited as photons, digitised and
+reduced, on **DUET's blue arm built as a real instrument**: 1 m at F/8, 2048² of 13.5 µm, and the
+detector's own published figures — 66 529 e⁻ well, 5.96 e⁻ read noise, 0.2 e⁻/s/px dark, −60 °C,
+1.077 e⁻/ADU. The aperture is *inferred* rather than published, and the field is its only check:
+2048 × 0.3481″ = **11.88′** against the 11.9′ quoted. It passes.
+
+Two frames at one instant, one seed, one field, differing only in the water column — 0.5 mm against
+20 mm at airmass 1.198, I+z′ (750–1000 nm), 120 s — reduced identically and cross-matched star by
+star:
+
+| | integral | **pixels** |
+|---|---|---|
+| absolute loss at B−V = 1.2 | 117.5 mmag | **117.9 mmag** |
+| colour slope, per mag of B−V | +14.9 mmag | **+18.1 ± 2.2 mmag** (1266 stars) |
+
+**The absolute figure agrees to 0.3 %** and the colour slope to 1.5σ. The slope is the part that
+matters: the 118 mmag is grey to first order and divides out of a ratio, while the 18 mmag per
+magnitude of colour does not.
+
+The difference image is worth looking at once: every star is a dark dot on a slightly dimmed sky,
+with no structure anywhere. Water is a multiplicative dimming, and nothing in a frame reveals it —
+the two frames are indistinguishable by eye at any stretch.
+
+**What this does NOT yet establish.** The QE curve is a *representative* deep-depletion silicon
+shape, not the detector's published data; a twin instrument `DUET-blue-flat` carries a flat 0.90 so
+the cost of that assumption can be measured. The band is still a rectangular top-hat. And the
+depth-bias measurement through sequences is noisier than the paired design assumed: frame *i* draws
+from `seed + i × 7919`, but the water changes the Poisson **mean**, so two runs at one seed do not
+share a noise realisation and the difference of two recovered depths carries √2 times the single-run
+error rather than nothing.
+
+### CORRECTION: the residual is not the depth error, and what a phase sweep on real frames says
+
+`tools/pwv_depth_from_frames.py`, `tools/pwv_transit_bias.py`
+
+The table above is the amplitude of a perturbation on the light curve. **It is not the error on a
+measured depth.** Every transit pipeline fits a baseline on the out-of-transit points and divides it
+out, so the question is not how big the water term is but how much of it *survives that fit*, and
+the answer depends on the timescale AND on the phase.
+
+**Measured on frames, not on the integral.** DUET's blue arm built as a custom instrument, a
+6400 ppm box transit injected into a real catalogue star of the field (B−V 1.81, V 15.73), 40
+exposures of 120 s across airmass 1.02 to 1.82, and a water column supplied as an explicit record.
+Five nights, identical in every respect except the phase of a 2 mm sinusoid whose period equals the
+3.4 h visit:
+
+| baseline model | no-water control | RMS over the four phases | per mm of amplitude |
+|---|---|---|---|
+| linear in time only | 7 067 ppm | 2 480 ppm | 1 240 ppm/mm |
+| **linear in time and airmass** | **5 954 ppm** | **1 586 ppm** | **793 ppm/mm** |
+
+**Quote 793, and quote the control beside it.** The airmass regressor is what every real reduction
+applies, and it cuts the effect nearly in half. It also moves the *no-water control* by 1 113 ppm on
+a 6400 ppm injection, which is comparable to the water term itself: the estimator's own
+baseline-choice spread has to be published in the same table, or the water number reads as chosen
+rather than measured. The reason the control moves is that the transit sits near the airmass
+minimum, so the profile and an airmass regressor are correlated and the regressor eats part of the
+signal. `TransitDepthFit` reports that correlation for exactly this reason.
+
+**The phase is the whole story, and two of the four phases give zero.** With the time-only baseline:
+
+| phase | recovered | shift against the dry control |
+|---|---|---|
+| 0.00 | 7 058 ± 672 | −9 ± 822, **0.0σ** |
+| **0.25** | **2 987 ± 536** | **−4 080 ± 715, 5.7σ** |
+| 0.50 | 6 965 ± 635 | −103 ± 791, 0.1σ |
+| **0.75** | **9 886 ± 729** | **+2 818 ± 869, 3.2σ** |
+
+At phase 0.25 the column sits at its minimum through the whole event and at its mean outside, so the
+transit reads **53 % too shallow**; at 0.75 it reads 54 % too deep. At 0.00 and 0.50 the column
+crosses its mean symmetrically about mid-transit and the contribution cancels by geometry, whatever
+its amplitude. **Water does not limit a transit by what it absorbs; it falsifies one by when it
+moves, and the sign is set by a phase no observer controls.**
+
+Two honest limits on those significances. The per-run error is about 700 ppm, so the experiment
+could only detect biases above roughly 1 400 ppm: the two nulls are underpowered nulls, not measured
+zeros. And a period equal to the visit is the *constructed worst case*, sitting at about 93 % of the
+transfer function's peak, not a description of weather.
+
+**The airmass closure claimed here previously was a coincidence and is withdrawn**, and the
+geometry is now a parameter so the point can be made with a number instead of an argument. The old
+claim put −1 100 ± 653 ppm measured on frames beside −1 062 predicted by `PwvTransitBias`. The two
+do not share a ladder: the frames fly a **monotonic** climb from 1.018 to 1.815, while the class
+built a **symmetric parabola** with the event at its minimum. Measured through the class itself, one
+constant 2.5 mm column over the same airmass range in I+z′, time-only baseline:
+
+| airmass ladder | bias on the recovered depth |
+|---|---|
+| meridian (symmetric parabola, event at the minimum) | **−1 545 ppm** |
+| **rising (monotonic, what the frames actually fly)** | **+61 ppm** |
+
+A factor of twenty-five and a change of sign. So on the geometry the frames flew, the analytic
+prediction is +61 ppm, not −1 062, and the −1 100 ± 653 measured against it is a 1.8σ *discrepancy*
+rather than a closure. `PwvTransitBiasRequest.AirmassGeometry` selects the ladder and the response
+names which one it flew, because a bias figure is meaningless without it.
+
+**Not established, and the largest of these by far.** The amplitude of the water column's variation
+on a 1 to 3 h timescale at Paranal is not measured here, and every figure above scales linearly with
+it. It is **not** unmeasurable, and an earlier draft of this section wrongly said no such record
+exists: ESO's LHATPRO has produced PWV at 1 to 2 minute cadence since 2011, and the GNSS thesis is
+itself a comparison against it, so the series is already on disk in the group that asked the
+question. What is missing is one reduction of it: the rms of |PWV(t+τ) − PWV(t)| for τ of 1 to 3 h,
+and the distribution of that quantity across a season. `PwvSeries.Measured` already parses two
+columns of (ISO time, mm) and has never been given a real record.
+
+Three further limits found while checking this.
+
+**The band edge carries more of the answer than the atmosphere does.** Holding the blue edge at
+750 nm and moving the red one on DUET-blue: 256 µmag/mm at a 900 nm cut, 966 at 930, 2 926 at 955,
+peaking near 3 474 at 970. DUET's own 955 nm split therefore sits at about 84 % of the worst
+available placement. **Only the blue half of that sweep is robust**: past 1 000 nm the answer is a
+picture of the assumed detector, returning 2 629 µmag/mm at an 1100 nm cut on DUET-blue against 543
+on a roster instrument whose silicon dies at 1050 — a factor of 4.8 on the same physical question,
+and the single largest uncertainty in this chapter.
+
+**The two arms respond with opposite sign**, which no throughput budget can produce because a
+throughput budget contains one star and this quantity contains two. At the 955 nm split, 2600 K
+against 5800 K, airmass 1.5: blue arm 750–955 nm gives **+2 926 µmag/mm**, red arm 955–1100 nm gives
+**−1 380**. The sign survives the QE assumption (a flat-response instrument gives +3 952 / −947).
+The 2600 K spectrum rises across 900–1100 nm and weights the transparent red end while the 5800 K
+one falls and weights the 940 nm core. Two consequences: an arm-to-arm depth discrepancy is not
+automatically astrophysical, and **the arm difference is a monotone in-band water proxy measured on
+the target itself, with no receiver.**
+
+**And the four NIR rows in the table above model no detector at all.** `SpectralCurve.At` clamps to
+the endpoint beyond a curve's range, so Y, YJ, J and Hs return identical figures on every instrument
+in the roster. They are a top-hat on the ESO sky and must not be quoted as requirements for a real
+near-infrared arm. For the same reason the published I+z′ figure of 3 544 µmag/mm is a **no-QE**
+number: DUET-blue itself gives 3 261.
+
+---
+
+## 5.10 The light-curve mode: the term as a screen, and the estimator behind it
+
+`Engine/Simulation/PwvRequirement.cs`, `PwvTransitBias.cs`, `TransitDepthFit.cs`,
+`web/` (mode `lc`), `Verify` §17, `tools/smoke_site.py` §7
+
+Everything in §5.9 was measured with Python scripts that ask the server and divide. That was the
+right way to find the answer and the wrong way to keep it: **a measurement that only exists as a
+`tools/` script is not delivered**, and a reader with a browser could not reproduce a single figure
+in this chapter. The arithmetic has moved into the engine, the scripts remain as the independent
+check, and both harnesses assert the two agree.
+
+### The three questions, and the three endpoints that answer them
+
+| endpoint | answers | reference implementation |
+|---|---|---|
+| `GET /api/pwv/loss-curve` | how the cost grows with the column, per temperature, and how much survives the ratio |, |
+| `POST /api/pwv/requirement` | what column accuracy a photometric budget demands, per band, plus the colour matrix | `tools/pwv_requirement.py` |
+| `POST /api/pwv/transit-bias` | how much of a water excursion reaches a **fitted depth**, against the timescale it moves on | `tools/pwv_transit_bias.py` |
+| `GET /api/sequences/{id}/depth` | the depth recovered out of real frames, and the bias on it | `tools/transit_recover.py` |
+| `GET /api/sequences/compare` | two conditions, fitted identically and subtracted | `tools/pwv_pair.py` |
+| `GET /api/sequences/{id}/export.csv` | the series, with every column a correction needs |, |
+
+**Measured agreement with the Python path**, band by band, on absorbed, differential, required σ and
+residual: worst relative disagreement **7.7 × 10⁻⁴**, and better than 10⁻⁵ on every band except g′.
+The g′ discrepancy is not physics: the endpoint rounds `lossMmagForTeff` to five decimals on the
+wire and g′'s losses are ~0.03 mmag, so the script inherits a rounding the in-process path does not
+have. The C# figure is the more precise of the two.
+
+### One resolver, because two of them disagreed
+
+`PwvPhotometry.TryResolve` is the single place a band request becomes a passband, and the three
+endpoints above plus `/api/pwv/transmission` all go through it. They did not always: the
+transmission endpoint resolved the band **name** against the instrument before it ever looked at
+`fromNm`/`toNm`, so a request naming a band the instrument does not carry was refused *even when it
+also carried the span that defines it*. The consequence was a page that could derive a σ_PWV for
+I+z′ on an RC20 and then be refused when it asked to draw the same band. The contract is now
+explicit and checked in both harnesses:
+
+* **with** an explicit span, the span **is** the passband and the name is only a label;
+* **without** one, the name must be a band the instrument really carries, and a name it does not
+  carry is refused with the list of the ones it does.
+
+The response also stopped lying about which band it drew. It returned `filter: "Luminance"` for a
+750 to 1000 nm span, because that is the internal enum slot the span was mounted in: the same class of
+falsehood `VisualTelescopeSpec.FilterLabels` was added to stop in the FITS header. It now returns
+the name that was asked for, with the slot beside it as `slot`.
+
+### The depth estimator, and three ways of getting it wrong
+
+`TransitDepthFit` fits the **baseline and the depth together**, as a single weighted least-squares
+problem whose design matrix is `[1, t, X, X²]` plus the injected transit profile normalised to unit
+depth. Each of the three obvious alternatives returns a plausible number rather than an error, and
+each was tried first:
+
+1. **Averaging the in-transit points.** The injected event is not a box: the default ingress is a
+   tenth of the duration at each end, so the ramp frames sit above the floor and their mean
+   measures *how much of the event is ramp*. On a 6 400 ppm injection **with no water present at
+   all** that estimator returns **−1 520 ppm**. Fitting the profile the engine actually applied
+   returns the injection exactly: `Verify` §17 asserts the clean bias is **< 0.5 ppm**, and measures
+   **6 400.00 ppm against 6 400 injected**.
+2. **Regressing on the un-normalised profile.** The coefficient is then a *scale factor*, not a
+   depth; it reads **838 767 ppm** and is only obviously wrong because the control exists.
+3. **Fitting the baseline first and reading a deficit after it.** A transit centred on the meridian
+   sits exactly at the airmass minimum, so the airmass regressor and the transit profile are nearly
+   the same shape across the visit. Measured on a no-water control, the recovered depth fell
+   **6 253 → 5 368 → 4 687 ppm** as a time-linear baseline gained an airmass term and then an
+   airmass-squared one, *with nothing whatever to detrend*. Fitted jointly, the degeneracy goes into
+   the covariance instead: the error bar grows, the answer does not move, and the correlation is
+   reported (`profileCorrelation`, **0.751 with airmass** for a 1.2 h event at culmination). Above
+   0.7 the fit says so in its own notes.
+
+**Compare conditions at one baseline model.** The model moves the answer by more than the effect
+under test, so `/api/sequences/compare` refuses two runs fitted with different baselines rather than
+subtracting them.
+
+### The transfer function, re-measured with that estimator
+
+Reproducing §5.9's correction table with the joint matched-filter estimator instead of the two-step
+one, I+z′, 6 920 ppm over 1 h in a 3 h window, 2600 K against 5800 K:
+
+| PWV varies on | ppm of depth per mm of column |
+|---|---|
+| 0.61 h | 672 |
+| **2.53 h** | **2 876**: the worst case |
+| 6.3 h | 916 |
+| 23.7 h | 74.8 |
+| 71 h | 8.1 |
+
+and at a perfectly constant column with the airmass running 1.05 → 1.60:
+
+| baseline fitted | recovered depth | bias |
+|---|---|---|
+| linear in time only | 5 823.1 ppm | **-1 096.9** |
+| linear in time **and airmass** | 6 912.8 | **-7.2** |
+| plus a quadratic airmass term | 6 934.9 | +14.9 |
+
+Both agree with §5.9 in magnitude and in shape, which is the useful statement: the conclusion is a
+property of the physics and not of one estimator. The peak sits at **2.53 h**, nearer the 3 h
+observing window than the 1 h event: a column that turns over about once inside the visit is the
+one a baseline fitted across that visit cannot separate from the visit. The engine measures which of
+the two it is nearer rather than asserting it; the obvious sentence to write is that the peak sits
+at the transit duration, and on these numbers that is false.
+
+### A shared seed does NOT cancel the photon noise between two runs
+
+The paired design in the experiment protocol rests on the claim that two runs at one base seed
+"differ by nothing but the water, and the photon noise subtracts out". **That is false**, and the
+reason is in `Core/NoiseSampler.cs`: the Poisson deviate is drawn by Knuth's product method below a
+mean of ten and by the PTRS transformed-rejection method above it. Both consume a **variable number
+of uniforms** depending on the mean and on how many proposals are rejected. Water changes the
+Poisson mean of every pixel, so the stream desynchronises at the first pixel whose mean moved and
+the two runs do not share a realisation.
+
+`/api/sequences/compare` therefore adds the two errors **in quadrature** rather than cancelling
+them: the difference carries about √2 times a single run's error, and returns the significance so
+that a null result cannot be read as a measurement. The cheap way to see the term is to raise the
+water amplitude, since the response is linear in it to well under a percent at these sizes, and
+report per mm.
+
+### The instrument survives a restart
+
+`CustomInstruments.OpenStore` / `Persist`, `data/CustomInstruments.json`
+
+Instruments lived in a `ConcurrentDictionary` and were written nowhere, so a restart lost them,
+for the one feature in this program that is a *tool* rather than a demonstration. Definitions are
+now written beside the catalogue and rebuilt **through `Build` itself** on startup, not through a
+deserialiser that reconstructs a spec directly: a stored instrument is therefore subject to exactly
+the refusals a freshly posted one is, and an instrument that would be refused today is refused today
+rather than living on because an older build accepted it.
+
+**The request is the stored shape.** A second schema for persistence would be a second thing to keep
+in step with the builder, and the two would drift the first time a field was added to one of them.
+
+**A definition is never lost because this build could not read it.** An entry that no longer parses
+is refused with its reason, skipped, reported at `/api/instruments/custom` under `refusals`, and its
+raw JSON is **written back out on the next save**. Dropping it would mean one incompatible change to
+the request shape silently deletes an observer's work; `Verify` §18 asserts that a corrupted entry
+survives a later save alongside a good one.
+
+The file is in `.gitignore`. Somebody's own telescope is their record and not this repository's: it
+names their site, their detector, and often an unpublished QE curve.
 
 ---
 
@@ -814,7 +1709,7 @@ than only here.
 **Common to every frame**: no solar-system bodies (that half genuinely needs KSP's renderer);
 zodiacal light on the ground path uses the flat polar constant rather than the angle-resolved
 Leinert table; new moon is assumed in the ground sky; detector cosmetics are omitted (flat
-field/PRNU, offset fixed pattern, fringing, cosmic rays, charge-transfer smear, hot pixels) while
+field/PRNU, offset fixed pattern, fringing, cosmic rays, hot pixels) while
 shot noise, dark current, read noise, bias, blooming and digitisation are the real chain; gain is
 fixed at unity.
 
@@ -839,6 +1734,7 @@ Kept because each was invisible in the output and the way it was caught is the u
 | Gaia declination band index | every star field empty, with no error | 66% of stars landed in one band. Studio warns at load via `ValidateBandIndex` |
 | Cooler bound followed the instrument | the RC20 at Mauna Kea offered Provence's range | ambient was on the instrument, not the site (§2.3) |
 | `refreshModeChips()` | selecting **any** astrograph silently stopped redrawing the chart and loading the forecast | the function has never existed; the `ReferenceError` killed the rest of the branch |
+| Only the stars trailed | switching the tracking mount **off** streaked every star and left the galaxies and the nebulae sharp, and sitting at the far end of the drift | `StarFieldRenderer` is handed both meridians and trails between them; `DepositGalaxies` and `DepositEmission` were handed only the END meridian, so they were stamped once, at a position the star trails never reached. Verify section 16 pins both halves: a galaxy's trail now ends **0.39 px** from where a star at the same sky position ends its own, and the old rendering really was **28.8 px** adrift on a 30.5 px drift |
 
 ---
 

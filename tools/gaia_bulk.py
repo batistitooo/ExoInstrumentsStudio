@@ -4,14 +4,15 @@ Reads Gaia DR3 out of ESA's bulk release instead of its query service.
 
 WHY THERE ARE TWO WAYS IN
 
-tools/fetch_star_patch.py normally asks the archive's TAP service for the stars around one
-pointing, which is exact and tiny: the M51 field to G = 20 is about a hundred kilobytes on the
-wire. When it works it is the better route by far, and it stays the default.
+The archive's TAP service answers a cone exactly and tinily: a half-degree field to G = 20 is
+about a hundred kilobytes on the wire. When it works it is the better route by far for one
+pointing.
 
-It does not always work. TAP is a query service with job queues and per account limits, and a
-burst of legitimate queries can leave it resetting connections for hours, which is a wall no
-retry gets past. The bulk release has none of that: it is 3,386 static gzipped files on a CDN,
-served like any other download.
+It does not always work, and it is the wrong shape for the whole sky. TAP is a query service with
+job queues and per account limits, and a burst of legitimate queries can leave it resetting
+connections for hours, which is a wall no retry gets past; and no TAP query delivers 1.8 billion
+rows in any useful time, which is what tools/build_allsky_catalog.py needs. The bulk release has
+neither problem: it is 3,386 static gzipped files on a CDN, served like any other download.
 
 The cost is that you pull whole files rather than whole answers. A file is about 240 MB and holds
 roughly 535,000 sources with all 152 columns, of which this keeps five.

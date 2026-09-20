@@ -29,6 +29,12 @@ namespace ExoStudio.Research
     /// WHAT A SUBMISSION SHOULD LOOK LIKE. Something a person inspected by eye, whose vetting
     /// raised nothing, which is not already registered, and which they can say honestly they
     /// believe is real. Everything else is practice.
+    ///
+    /// "WHOSE VETTING RAISED NOTHING" MEANS ALL OF IT. Readiness once read only the fold's
+    /// vetting object, which is null when nothing repeated, and never the concerns the isolated
+    /// event search keeps on each event. So a single dip whose own search had written that the
+    /// light came from a neighbouring star was declared ready, and the file then described its
+    /// centroid shift as consistent with the target. Both are read now.
     /// </summary>
     public static class CtoiSubmission
     {
@@ -83,6 +89,20 @@ namespace ExoStudio.Research
             if (!repeating && !anySingle)
                 r.Blocking.Add("this run found nothing, so there is nothing to submit.");
 
+            // THE REGISTER KEYS ON A POSITION. A file searched from disk with no coordinates
+            // given records RA 0 and Dec 0, which is a real point on the sky that this star is
+            // not at, and the file below would have carried it as the target's position. Nothing
+            // was cross matched either, for the same reason, so the "already registered" test
+            // underneath would pass for want of having been run.
+            if (!HasPosition(record))
+                r.Blocking.Add("this run has no sky position: the file was searched without a right "
+                             + "ascension and declination, so the submission would name RA 0, Dec 0 as "
+                             + "the target and nothing was cross matched against the registers. Search "
+                             + "it again with the star's coordinates.");
+            else if (known.ValueKind != JsonValueKind.Array && (repeating || anySingle))
+                r.Blocking.Add("nothing was cross matched against the registers for this run, so "
+                             + "whether it is already known is unknown rather than no. Search it again.");
+
             if (known.ValueKind == JsonValueKind.Array && known.GetArrayLength() > 0)
             {
                 var names = known.EnumerateArray()
@@ -93,12 +113,54 @@ namespace ExoStudio.Research
                              + "is rejected.");
             }
 
+            // A register that did not answer is a cross match that did not happen. An empty match
+            // list from a half fetched register looks exactly like a clear one, and it is not.
+            JsonElement unavailable = Prop(record, "knownUnavailable");
+            if (unavailable.ValueKind == JsonValueKind.Array && unavailable.GetArrayLength() > 0)
+                r.Blocking.Add("the cross match could not reach "
+                             + string.Join("; ", unavailable.EnumerateArray().Select(u => u.GetString()))
+                             + ", so an empty match list here means unchecked, not unregistered.");
+
             if (vetting.ValueKind == JsonValueKind.Object
                 && vetting.TryGetProperty("Concerns", out JsonElement concerns)
                 && concerns.ValueKind == JsonValueKind.Array && concerns.GetArrayLength() > 0)
             {
                 foreach (JsonElement c in concerns.EnumerateArray())
                     r.Blocking.Add("vetting raised: " + c.GetString());
+            }
+
+            // THE SINGLE EVENT'S OWN VETTING, which this used to ignore entirely. The fold's
+            // vetting object is null when nothing repeated, and the isolated search keeps its
+            // objections on each event instead, so a run whose own search had said "the light
+            // that disappeared probably came from a neighbouring star" was declared ready. The
+            // event that Build would put in the file is held to its concerns; the other events
+            // in the same curve are not what is being submitted, so theirs are warnings.
+            if (anySingle)
+            {
+                JsonElement submitted = BestSingle(singles);
+                foreach (JsonElement e in singles.EnumerateArray())
+                {
+                    bool isSubmitted = !repeating && e.ValueKind == submitted.ValueKind
+                                       && e.GetRawText() == submitted.GetRawText();
+                    if (!e.TryGetProperty("Concerns", out JsonElement ec)
+                        || ec.ValueKind != JsonValueKind.Array) continue;
+                    foreach (JsonElement c in ec.EnumerateArray())
+                    {
+                        if (isSubmitted) r.Blocking.Add("the isolated event's vetting raised: " + c.GetString());
+                        else r.Warnings.Add("another dip in this light curve was objected to: " + c.GetString());
+                    }
+                }
+
+                // Judged here as well as read from the concerns, at the search's own threshold,
+                // so a record whose concern list was lost or edited cannot carry a shift the
+                // search would have refused. The numbers are what the decision rests on.
+                double shift = NumOrNaN(submitted, "CentroidShiftPixels");
+                double scatter = NumOrNaN(submitted, "CentroidScatterPixels");
+                if (!repeating && !double.IsNaN(shift) && !double.IsNaN(scatter) && scatter > 0
+                    && shift > SingleTransitSearch.CentroidShiftSigma * scatter)
+                    r.Blocking.Add($"the centre of light moved {shift:0.###} px during the dip against a "
+                                 + $"baseline scatter of {scatter:0.###} px, so the light that disappeared "
+                                 + "probably came from a neighbouring star, not this one.");
             }
 
             if (review.ValueKind != JsonValueKind.Object)
@@ -151,8 +213,7 @@ namespace ExoStudio.Research
 
             if (!repeating && singles.ValueKind == JsonValueKind.Array && singles.GetArrayLength() > 0)
             {
-                JsonElement best = singles.EnumerateArray()
-                    .OrderByDescending(e => Num(e, "Snr")).First();
+                JsonElement best = BestSingle(singles);
                 depthPpm = Num(best, "DepthPpm");
                 duration = Num(best, "DurationHours");
                 // TESS times are BTJD; the register wants BJD, which is BTJD plus 2457000.
@@ -186,12 +247,7 @@ namespace ExoStudio.Research
                 notes.Append($"duration ratio {Num(vetting, "DurationRatio"):0.##}. ");
             }
 
-            double shift = SingleCentroid(singles);
-            notes.Append(double.IsNaN(shift)
-                ? "NO CENTROID TEST WAS PERFORMED: this light curve carries no centroid, so a blended "
-                + "background eclipsing binary is not excluded. "
-                : $"Centroid moved {shift:0.####} px during the event, consistent with the flux "
-                + "originating on the target. ");
+            notes.Append(CentroidSentence(singles));
 
             notes.Append("No follow up photometry or spectroscopy has been obtained. ");
             notes.Append("Reported as a candidate for vetting, not as a confirmed planet.");
@@ -201,8 +257,10 @@ namespace ExoStudio.Research
                 ["TIC ID"] = TicId(record),
                 ["Flag"] = "newctoi",
                 ["Disposition"] = "PC",
-                ["RA"] = Fmt(Num(target, "RaDeg"), 6),
-                ["Dec"] = Fmt(Num(target, "DecDeg"), 6),
+                // Blank rather than 0.000000 when no position was given: a blank column is a
+                // question the reviewer will ask, a zero is a point on the sky this star is not at.
+                ["RA"] = HasPosition(record) ? Fmt(Num(target, "RaDeg"), 6) : "",
+                ["Dec"] = HasPosition(record) ? Fmt(Num(target, "DecDeg"), 6) : "",
                 ["Epoch (BJD)"] = epoch > 0 ? Fmt(epoch, 5) : "",
                 ["Period (days)"] = period > 0 ? Fmt(period, 6) : "",
                 ["Depth (ppm)"] = depthPpm > 0 ? Fmt(depthPpm, 0) : "",
@@ -256,12 +314,64 @@ namespace ExoStudio.Research
             return 0;
         }
 
-        private static double SingleCentroid(JsonElement singles)
+        /// <summary>
+        /// The one event the file describes: the strongest. Chosen here for both Assess and
+        /// Build, so the event whose concerns gate the submission is the event whose numbers go
+        /// in it.
+        /// </summary>
+        private static JsonElement BestSingle(JsonElement singles)
+            => singles.EnumerateArray().OrderByDescending(e => Num(e, "Snr")).First();
+
+        /// <summary>
+        /// Whether the record carries a real sky position.
+        ///
+        /// A run searched without coordinates now records null for both, which reads back as
+        /// NaN. Records written before that carry RA 0, Dec 0 for the same case, because the
+        /// request defaulted to zero, and those are treated as none as well rather than as a
+        /// star on the celestial equator at the vernal point: a real star there is refused with
+        /// the reason and can be searched again with its coordinates, which costs a minute,
+        /// while a file submitted at the origin costs a reviewer's trust.
+        /// </summary>
+        private static bool HasPosition(JsonElement record)
         {
-            if (singles.ValueKind != JsonValueKind.Array || singles.GetArrayLength() == 0) return double.NaN;
-            JsonElement best = singles.EnumerateArray().OrderByDescending(e => Num(e, "Snr")).First();
-            double v = Num(best, "CentroidShiftPixels");
-            return v == 0 && !best.TryGetProperty("CentroidShiftPixels", out _) ? double.NaN : v;
+            JsonElement target = Prop(record, "target");
+            double ra = NumOrNaN(target, "RaDeg"), dec = NumOrNaN(target, "DecDeg");
+            return !double.IsNaN(ra) && !double.IsNaN(dec) && !(ra == 0 && dec == 0);
+        }
+
+        /// <summary>
+        /// What the centroid test found, said the way the search itself judged it.
+        ///
+        /// THIS USED TO ASSERT THE OPPOSITE OF THE VETTING. The old sentence read the shift alone
+        /// and wrote "consistent with the flux originating on the target" for any value, including
+        /// a shift the search had already flagged as a neighbour's eclipse; and a record whose
+        /// centroid was never tested stores null, which read back as a shift of zero, so the
+        /// commonest case of all claimed a test that had not been done. The verdict is the shift
+        /// against the baseline scatter, at the same threshold the search uses, and a record that
+        /// did not keep the scatter gets no verdict.
+        /// </summary>
+        private static string CentroidSentence(JsonElement singles)
+        {
+            if (singles.ValueKind != JsonValueKind.Array || singles.GetArrayLength() == 0)
+                return "NO CENTROID TEST WAS PERFORMED: this light curve carries no centroid, so a blended "
+                     + "background eclipsing binary is not excluded. ";
+            JsonElement best = BestSingle(singles);
+            double shift = NumOrNaN(best, "CentroidShiftPixels");
+            double scatter = NumOrNaN(best, "CentroidScatterPixels");
+            if (double.IsNaN(shift))
+                return "NO CENTROID TEST WAS PERFORMED: this light curve carries no centroid, so a blended "
+                     + "background eclipsing binary is not excluded. ";
+            if (double.IsNaN(scatter) || scatter <= 0)
+                return $"Centroid moved {shift:0.####} px during the event; the baseline scatter was not "
+                     + "recorded with this run, so this number alone does not establish where the flux "
+                     + "came from. ";
+            if (shift > SingleTransitSearch.CentroidShiftSigma * scatter)
+                return $"CENTROID MOVED {shift:0.####} px during the event against a baseline scatter of "
+                     + $"{scatter:0.####} px, which points at a neighbouring star as the source of the "
+                     + "lost light. The flux did not stay on the target; do not submit as it stands. ";
+            return $"Centroid moved {shift:0.####} px during the event against a baseline scatter of "
+                 + $"{scatter:0.####} px, within what the baseline does on its own, consistent with the "
+                 + "flux originating on the target. ";
         }
 
         private static JsonElement Prop(JsonElement e, string name)
@@ -274,6 +384,14 @@ namespace ExoStudio.Research
         private static double Num(JsonElement e, string name)
             => e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out JsonElement v)
                && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : 0.0;
+
+        /// <summary>
+        /// A number, or NaN when the field is absent or null. Records write NaN as null, and
+        /// reading null back as zero is how an untested centroid became a zero pixel shift.
+        /// </summary>
+        private static double NumOrNaN(JsonElement e, string name)
+            => e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out JsonElement v)
+               && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : double.NaN;
 
         private static string Fmt(double v, int digits)
             => v.ToString("F" + digits, CultureInfo.InvariantCulture);

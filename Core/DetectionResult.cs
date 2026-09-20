@@ -3,6 +3,8 @@ namespace ExoInstruments.Core
     /// <summary>Result of a transit search over a light curve.</summary>
     public class DetectionResult
     {
+        /// <summary>How many separate transit events the best box drew its points from. A box fed by one event is the window function, not a planet.</summary>
+        public int DistinctEpochs;
         public bool Detected { get; set; }
         public bool InsufficientData { get; set; }
         public double BestPeriodDays { get; set; }

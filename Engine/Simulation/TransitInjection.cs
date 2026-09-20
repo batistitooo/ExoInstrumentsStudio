@@ -1,0 +1,178 @@
+using System;
+using System.Globalization;
+using ExoInstruments.Core;
+
+namespace ExoStudio.Simulation
+{
+    /// <summary>
+    /// A transit of known depth, injected into one star of the field.
+    ///
+    /// WHY AN INJECTION AND NOT A CATALOGUE PLANET. The question Task 2 asks is not "can this
+    /// pipeline see 51 Peg b", it is "what does a KNOWN depth come back as, once it has been
+    /// through the atmosphere, the optics, the detector and the reduction". That needs the truth
+    /// to be something we chose, because the whole measurement is recovered-minus-injected. A real
+    /// catalogue planet has no known truth on the other side of this pipeline.
+    ///
+    /// WHERE IT IS APPLIED, and the discipline is the point. DeepSkyCamera builds a truth record
+    /// for every star it deposits, computed from the SAME call the deposit uses, so the reduction
+    /// can be scored without consulting the forward model. An injection that dimmed the pixels
+    /// without dimming the truth record would score itself as a systematic error; one that dimmed
+    /// the truth without the pixels would score as nothing at all. The factor is therefore computed
+    /// ONCE per frame and multiplied into both, and at depth zero it is exactly 1.0 so the frame is
+    /// bit-for-bit the frame that had no transit in it.
+    ///
+    /// THE SHAPE. A box: out of transit, in transit, and a linear ingress and egress between them.
+    /// The depth is the observable under test and a box states it without argument; limb darkening
+    /// would round the floor and change the number a fit recovers, which is a refinement to make
+    /// once the box is shown to close. Core carries a limb-darkened form
+    /// (LightCurveSimulator.ComputeTransitDip) for when that day comes, and it is parameterised by
+    /// a catalogue StarTarget rather than by free depth, which is why it is not used here.
+    ///
+    /// AVERAGED OVER THE EXPOSURE, not sampled at its midpoint. A frame integrates light for its
+    /// whole exposure, so a frame straddling ingress collects part of one level and part of the
+    /// other. Sampling the factor at one instant quantises the ingress onto the frame grid and puts
+    /// a step where the data has a ramp - the same mistake as point-sampling a line forest onto a
+    /// quadrature node, and it biases exactly the frames a fit leans on hardest.
+    /// </summary>
+    public sealed class TransitInjection
+    {
+        /// <summary>Where the host star is, and how close a catalogue star must be to be it.</summary>
+        public double TargetRaDeg { get; private set; }
+        public double TargetDecDeg { get; private set; }
+        public double MatchRadiusArcsec { get; private set; }
+
+        /// <summary>Mid-transit of the reference event, and the ephemeris that repeats it.</summary>
+        public double EpochUt { get; private set; }
+        public double PeriodSeconds { get; private set; }
+
+        /// <summary>First to fourth contact, and first to second (the ingress ramp).</summary>
+        public double DurationSeconds { get; private set; }
+        public double IngressSeconds { get; private set; }
+
+        /// <summary>Fractional depth: 0.0064 is 6.4 parts per thousand.</summary>
+        public double Depth { get; private set; }
+
+        public string Id { get; private set; }
+        public string Description { get; private set; }
+
+        /// <summary>
+        /// A transit at a known ephemeris. <paramref name="ingressFraction"/> is the share of the
+        /// total duration spent in ingress (and again in egress); 0 is a hard-edged box, and the
+        /// default 0.1 is a shape a real grazing-to-central transit spans without pretending to be
+        /// limb darkened.
+        /// </summary>
+        public static TransitInjection Create(
+            double raDeg, double decDeg, double matchRadiusArcsec,
+            double epochUt, double periodDays, double durationHours, double depth,
+            double ingressFraction = 0.1)
+        {
+            if (!(depth >= 0.0) || depth >= 1.0)
+                throw new ArgumentException(
+                    $"A transit depth of {depth:R} is not a fraction of the star's light. Use "
+                  + "0.0064 for 6.4 parts per thousand.", nameof(depth));
+            if (!(durationHours > 0.0))
+                throw new ArgumentException("A transit needs a duration.", nameof(durationHours));
+            if (!(periodDays > 0.0))
+                throw new ArgumentException("A transit needs a period.", nameof(periodDays));
+
+            double duration = durationHours * 3600.0;
+            double ingress = Math.Clamp(ingressFraction, 0.0, 0.5) * duration;
+
+            return new TransitInjection
+            {
+                TargetRaDeg = raDeg,
+                TargetDecDeg = decDeg,
+                MatchRadiusArcsec = Math.Max(0.1, matchRadiusArcsec),
+                EpochUt = epochUt,
+                PeriodSeconds = periodDays * 86400.0,
+                DurationSeconds = duration,
+                IngressSeconds = ingress,
+                Depth = depth,
+                Id = HashOf(raDeg, decDeg, epochUt, periodDays * 86400.0, duration, ingress, depth),
+                Description = $"{depth * 1000.0:0.##} ppt over {durationHours:0.##} h, "
+                            + $"P = {periodDays:0.####} d",
+            };
+        }
+
+        /// <summary>
+        /// The fraction of the star's light reaching the detector at this instant. Pure: no state,
+        /// no clock, no draw - the same property PwvSeries has, and for the same reason. A transit
+        /// that remembered anything would make a run depend on how fast it was played.
+        /// </summary>
+        public double FactorAt(double ut)
+        {
+            if (Depth <= 0.0) return 1.0;
+
+            // Phase measured from mid-transit, folded onto [-P/2, +P/2).
+            double dt = ut - EpochUt;
+            double phase = dt - Math.Floor(dt / PeriodSeconds + 0.5) * PeriodSeconds;
+            double t = Math.Abs(phase);
+
+            double half = 0.5 * DurationSeconds;
+            if (t >= half) return 1.0;                       // out of transit
+
+            double flatHalf = half - IngressSeconds;
+            if (t <= flatHalf) return 1.0 - Depth;           // flat bottom
+
+            // On the ramp: linear between the two levels.
+            double intoRamp = (t - flatHalf) / Math.Max(1e-9, IngressSeconds);
+            return 1.0 - Depth * (1.0 - intoRamp);
+        }
+
+        /// <summary>
+        /// The factor a frame of this exposure actually collects, averaged over the exposure rather
+        /// than sampled at its midpoint.
+        ///
+        /// The shape is piecewise linear, so a Simpson rule on a modest number of nodes is exact on
+        /// every piece and wrong only where a breakpoint falls inside a node interval - which costs
+        /// a fraction of one ramp. The node count is fixed because the exposure is short next to the
+        /// duration in every case this is used for; if that stops being true it should integrate the
+        /// breakpoints explicitly, and this comment is where to start.
+        /// </summary>
+        public double MeanFactorOver(double startUt, double exposureSeconds)
+        {
+            if (Depth <= 0.0) return 1.0;
+            if (!(exposureSeconds > 0.0)) return FactorAt(startUt);
+
+            const int Nodes = 32;                            // even, for Simpson
+            double h = exposureSeconds / Nodes;
+            double sum = 0.0;
+            for (int i = 0; i <= Nodes; i++)
+            {
+                double weight = (i == 0 || i == Nodes) ? 1.0 : (i % 2 == 1 ? 4.0 : 2.0);
+                sum += weight * FactorAt(startUt + i * h);
+            }
+            return sum * h / 3.0 / exposureSeconds;
+        }
+
+        /// <summary>True when this star is the one the transit belongs to.</summary>
+        public bool Matches(double raDeg, double decDeg)
+        {
+            double cosDec = Math.Cos(TargetDecDeg * Math.PI / 180.0);
+            double dRa = (raDeg - TargetRaDeg) * cosDec;
+            double dDec = decDeg - TargetDecDeg;
+            double sepArcsec = Math.Sqrt(dRa * dRa + dDec * dDec) * 3600.0;
+            return sepArcsec <= MatchRadiusArcsec;
+        }
+
+        /// <summary>Whether this instant is inside the event at all, for a caller labelling a curve.</summary>
+        public bool InTransit(double ut) => FactorAt(ut) < 1.0;
+
+        /// <summary>
+        /// FNV-1a over the defining numbers, so the same injection carries the same identifier in
+        /// any process - the same contract PwvSeries makes, and for the same reason: a frame's
+        /// header has to be able to name what was put into it.
+        /// </summary>
+        private static string HashOf(params double[] values)
+        {
+            ulong hash = 14695981039346656037UL;
+            foreach (char c in "transit") { hash ^= c; hash *= 1099511628211UL; }
+            foreach (double v in values)
+            {
+                ulong bits = (ulong)BitConverter.DoubleToInt64Bits(v);
+                for (int i = 0; i < 8; i++) { hash ^= (bits >> (i * 8)) & 0xFF; hash *= 1099511628211UL; }
+            }
+            return hash.ToString("x16")[..12];
+        }
+    }
+}

@@ -61,6 +61,9 @@ namespace ExoStudio.Simulation
         {
             Target = target;
             System = system;
+
+            // The instrument is re-seated at the site it is actually being used from; see AtSite.
+            instrument = AtSite(instrument, site);
             Instrument = instrument;
             Site = site;
             Clock = new SimulationClock(startUt);
@@ -87,6 +90,34 @@ namespace ExoStudio.Simulation
                         $"{instrument.DisplayName} uses {instrument.Method}, which this build does not drive. " +
                         "Radial velocity and transit photometry are the two ported paths.");
             }
+        }
+
+        /// <summary>
+        /// The instrument as it stands AT THIS SITE, rather than at the one mountain Core keys it
+        /// to. This is the same fault `DeepSkyCamera.AmbientAt` and `AtmosphereAltitudeMeters` fix
+        /// on the imaging path, in the half of the codebase that produces light curves.
+        ///
+        /// `InstrumentSpec.SiteAltitudeMeters` is the altitude of the observatory the instrument
+        /// belongs to in the mod, where each one stands in exactly one place. Studio lets a
+        /// campaign name any site, and every atmospheric term in the light curve reads that field:
+        /// `AtmosphericNoise.ScintillationExcessSigma` (via `LightCurveSimulator.TotalNoiseSigma`)
+        /// and the extinction and scintillation inside `TransitPhotometry`. Driving SuperWASP-North
+        /// (2400 m) from Mauna Kea (4205 m) therefore scheduled the epochs for Mauna Kea while
+        /// carrying exp(-2400/8000) = 0.741 of an atmosphere instead of exp(-4205/8000) = 0.591 -
+        /// about 25 % too much scintillation sigma on every point.
+        ///
+        /// A COPY, not a mutation: the roster's specs are shared, and writing the site into one
+        /// would leak into every other campaign that later used the same instrument. Null site
+        /// leaves the instrument exactly as it was.
+        /// </summary>
+        private static InstrumentSpec AtSite(InstrumentSpec instrument, ObservingSites.Site site)
+        {
+            if (instrument == null || site == null) return instrument;
+            if (instrument.SiteAltitudeMeters == site.AltitudeMeters) return instrument;
+
+            InstrumentSpec moved = instrument.ShallowCopy();
+            moved.SiteAltitudeMeters = site.AltitudeMeters;
+            return moved;
         }
 
         public int SampleCount
@@ -131,6 +162,19 @@ namespace ExoStudio.Simulation
             lock (gate) Clock.SetWarpRate(rate);
         }
 
+        /// <summary>
+        /// The most simulated time one tick may advance. This is what keeps ONE campaign at a huge
+        /// warp from monopolising the single ticker thread: Tick holds `gate` for the whole slice,
+        /// and a slice that advanced hours of simulated time processed hours of exposures under the
+        /// lock - so the campaign's own reads hung for 90 s and every other campaign waited behind
+        /// it in the ticker's foreach. Above this the effective warp is simply what the ticker can
+        /// deliver, and the campaign says so rather than stalling everyone.
+        /// </summary>
+        public const double MaxSimulatedSecondsPerTick = 3600.0;
+
+        /// <summary>The warp actually delivered on the last tick, once the cap above bites.</summary>
+        public double EffectiveWarpRate { get; private set; }
+
         /// <summary>Advance one real-time slice. Called only by the ticker.</summary>
         public void Tick(double wallSeconds)
         {
@@ -138,7 +182,14 @@ namespace ExoStudio.Simulation
             {
                 if (State != CampaignState.Running) return;
 
-                double ut = Clock.Advance(wallSeconds);
+                // BOUNDED WORK UNDER THE LOCK. Advance by the wall seconds the ticker gave us, or by
+                // whatever wall seconds would carry exactly MaxSimulatedSecondsPerTick at this warp,
+                // whichever is smaller.
+                double wanted = wallSeconds * Clock.WarpRate;
+                double allowed = wanted > MaxSimulatedSecondsPerTick && Clock.WarpRate > 0.0
+                    ? MaxSimulatedSecondsPerTick / Clock.WarpRate : wallSeconds;
+                EffectiveWarpRate = wallSeconds > 0.0 ? allowed * Clock.WarpRate / wallSeconds : Clock.WarpRate;
+                double ut = Clock.Advance(allowed);
                 if (rvSession != null) rvSession.Tick(ut);
                 else transitSession.Tick(ut);
 

@@ -311,7 +311,7 @@ namespace ExoInstruments.Core
                 ? ExtinctionTransmission(StellarPhotometry.JohnsonVWavelengthMeters, eBv) : 1.0;
             if (screenAtV <= 0.0) return 0.0;
 
-            int steps = filterTransmissionCurve != null ? CurveIntegrationSteps : IntegrationSteps;
+            int steps = NodesFor(start, end);
             double stepMeters = (end - start) / steps;
             double sum = 0.0;
             for (int i = 0; i <= steps; i++)
@@ -321,7 +321,7 @@ namespace ExoInstruments.Core
                 double shape = photonShape.At(lambda);
                 if (shape <= 0.0) continue;
                 if (eBv > 0.0) shape *= ExtinctionTransmission(lambda, eBv) / screenAtV;
-                sum += weight * shape * Integrand(lambda, 0.0, true, 0.0);
+                sum += weight * shape * Integrand(lambda, 0.0, true, 0.0, 0.5 * stepMeters);
             }
             return sum * stepMeters / 3.0 * 1e10;
         }
@@ -359,6 +359,22 @@ namespace ExoInstruments.Core
         /// Simpson's rule over the filter's top-hat support. Returns Angstrom, since that is the
         /// unit the V-band photon flux density (948 photons/cm^2/s/Angstrom) is quoted per.
         /// </summary>
+
+        /// <summary>
+        /// Quadrature nodes. A constant, and the reason it can stay one is that each node now
+        /// carries the MEAN of the filter curve over its own interval rather than a point sample -
+        /// see the Integrand call below and SpectralCurve.MeanOver.
+        ///
+        /// The water-vapour term multiplies a 0.05 nm line forest into the filter curve, and 257
+        /// nodes across a 265 nm passband point-sampled one place in every 21 of it: the integral
+        /// aliased, and moving a band edge by 0.01 nm swung the answer 30 %. Sizing the quadrature
+        /// to the curve fixed that and cost sixteen times the frame time - a wet capture went from
+        /// 24 s to over 400. Averaging into the node is exact for an integral linear in the curve,
+        /// which this is, and costs nothing.
+        /// </summary>
+        private int NodesFor(double start, double end) =>
+            filterTransmissionCurve != null ? CurveIntegrationSteps : IntegrationSteps;
+
         private double Integrate(double teffK, bool includeExtinction, double eBv = 0.0)
         {
             if (greyTransmission <= 0.0) return 0.0;
@@ -384,14 +400,14 @@ namespace ExoInstruments.Core
             if (start < 1e-9) start = 1e-9;
             if (end <= start) return 0.0;
 
-            int steps = filterTransmissionCurve != null ? CurveIntegrationSteps : IntegrationSteps;
+            int steps = NodesFor(start, end);
             double stepMeters = (end - start) / steps;
             double sum = 0.0;
             for (int i = 0; i <= steps; i++)
             {
                 double lambda = start + i * stepMeters;
                 double weight = (i == 0 || i == steps) ? 1.0 : (i % 2 == 1 ? 4.0 : 2.0);
-                sum += weight * Integrand(lambda, teffK, includeExtinction, eBv);
+                sum += weight * Integrand(lambda, teffK, includeExtinction, eBv, 0.5 * stepMeters);
             }
 
             double integralMeters = sum * stepMeters / 3.0;
@@ -402,7 +418,8 @@ namespace ExoInstruments.Core
         /// The integrand: the source's photon spectral shape normalised at Johnson V, times the
         /// system's response at this wavelength.
         /// </summary>
-        private double Integrand(double lambda, double teffK, bool includeExtinction, double eBv)
+        private double Integrand(double lambda, double teffK, bool includeExtinction, double eBv,
+                                 double halfNodeMeters = 0.0)
         {
             double shape = 1.0;
             if (teffK > 0.0)
@@ -424,7 +441,16 @@ namespace ExoInstruments.Core
 
             // With a measured curve the filter carries its own transmission at this wavelength;
             // with a top-hat it is flat across the band and already inside greyTransmission.
-            double filter = filterTransmissionCurve != null ? filterTransmissionCurve.At(lambda) : 1.0;
+            //
+            // AVERAGED OVER THE NODE'S INTERVAL, not sampled at its centre. The integral is linear
+            // in this curve, so the mean over the interval a node stands for gives the same answer
+            // exactly - and it is the only thing that makes a 0.05 nm water line forest integrable
+            // on a few hundred nodes. Point-sampling it aliased: a 0.01 nm move of a band edge, no
+            // physics at all, swung the result 30 %.
+            double filter = filterTransmissionCurve == null ? 1.0
+                : halfNodeMeters > 0.0
+                    ? filterTransmissionCurve.MeanOver(lambda - halfNodeMeters, lambda + halfNodeMeters)
+                    : filterTransmissionCurve.At(lambda);
 
             // Interstellar reddening enters as a SHAPE, normalised at V so the observed
             // magnitude stays the anchor; see ReddenedStarSpectrum for why that is not double

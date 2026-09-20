@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" width="760" height="500" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<title>required PWV accuracy per band</title>
+<rect width="760" height="500" fill="#ffffff"/>
+<text x="92.0" y="32.0" font-size="15" fill="#16181d" text-anchor="start" font-weight="600">How well must the water column be known?</text>
+<text x="92.0" y="50.0" font-size="11" fill="#6b7280" text-anchor="start" font-weight="400">2600 K target against 5800 K comparisons, airmass 1.5, around 2.5 mm, for a 100 ppm budget</text>
+<rect x="92.0" y="76.0" width="321.9" height="330.0" fill="#d62728" opacity="0.055"/>
+<line x1="278.7" y1="70.0" x2="278.7" y2="406.0" stroke="#6b7280" stroke-width="1.6" stroke-dasharray="5 4"/>
+<text x="278.7" y="65.0" font-size="10" fill="#6b7280" text-anchor="middle" font-weight="600">0.10 mm  goal</text>
+<line x1="413.9" y1="70.0" x2="413.9" y2="406.0" stroke="#d62728" stroke-width="1.6"/>
+<text x="413.9" y="65.0" font-size="10" fill="#d62728" text-anchor="middle" font-weight="600">0.53 mm  achieved by GNSS</text>
+<line x1="92.0" y1="94.3" x2="652.0" y2="94.3" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="94.3" x2="614.1" y2="94.3" stroke="#2ca02c" stroke-width="3.2"/>
+<circle cx="614.1" cy="94.3" r="5" fill="#2ca02c"/>
+<text x="82.0" y="98.3" font-size="12" fill="#6b7280" text-anchor="end" font-weight="500">g'</text>
+<text x="626.1" y="98.3" font-size="10.5" fill="#2ca02c" text-anchor="start" font-weight="600">6.27 mm</text>
+<line x1="92.0" y1="131.0" x2="652.0" y2="131.0" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="131.0" x2="465.1" y2="131.0" stroke="#2ca02c" stroke-width="3.2"/>
+<circle cx="465.1" cy="131.0" r="5" fill="#2ca02c"/>
+<text x="82.0" y="135.0" font-size="12" fill="#6b7280" text-anchor="end" font-weight="500">r'</text>
+<text x="477.1" y="135.0" font-size="10.5" fill="#2ca02c" text-anchor="start" font-weight="600">0.997 mm</text>
+<line x1="92.0" y1="167.7" x2="652.0" y2="167.7" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="167.7" x2="506.0" y2="167.7" stroke="#2ca02c" stroke-width="3.2"/>
+<circle cx="506.0" cy="167.7" r="5" fill="#2ca02c"/>
+<text x="82.0" y="171.7" font-size="12" fill="#6b7280" text-anchor="end" font-weight="500">i'</text>
+<text x="518.0" y="171.7" font-size="10.5" fill="#2ca02c" text-anchor="start" font-weight="600">1.65 mm</text>
+<line x1="92.0" y1="204.3" x2="652.0" y2="204.3" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="204.3" x2="249.6" y2="204.3" stroke="#d62728" stroke-width="3.2"/>
+<circle cx="249.6" cy="204.3" r="5" fill="#d62728"/>
+<text x="82.0" y="208.3" font-size="12" fill="#16181d" text-anchor="end" font-weight="700">z'</text>
+<text x="261.6" y="208.3" font-size="10.5" fill="#d62728" text-anchor="start" font-weight="600">0.070 mm</text>
+<line x1="92.0" y1="241.0" x2="652.0" y2="241.0" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="241.0" x2="182.8" y2="241.0" stroke="#d62728" stroke-width="3.2"/>
+<circle cx="182.8" cy="241.0" r="5" fill="#d62728"/>
+<text x="82.0" y="245.0" font-size="12" fill="#16181d" text-anchor="end" font-weight="700">I+z'</text>
+<text x="194.8" y="245.0" font-size="10.5" fill="#d62728" text-anchor="start" font-weight="600">0.031 mm</text>
+<line x1="92.0" y1="277.7" x2="652.0" y2="277.7" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="277.7" x2="373.0" y2="277.7" stroke="#d62728" stroke-width="3.2"/>
+<circle cx="373.0" cy="277.7" r="5" fill="#d62728"/>
+<text x="82.0" y="281.7" font-size="12" fill="#16181d" text-anchor="end" font-weight="700">Y</text>
+<text x="385.0" y="281.7" font-size="10.5" fill="#d62728" text-anchor="start" font-weight="600">0.320 mm</text>
+<line x1="92.0" y1="314.3" x2="652.0" y2="314.3" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="314.3" x2="340.2" y2="314.3" stroke="#d62728" stroke-width="3.2"/>
+<circle cx="340.2" cy="314.3" r="5" fill="#d62728"/>
+<text x="82.0" y="318.3" font-size="12" fill="#16181d" text-anchor="end" font-weight="700">YJ</text>
+<text x="352.2" y="318.3" font-size="10.5" fill="#d62728" text-anchor="start" font-weight="600">0.214 mm</text>
+<line x1="92.0" y1="351.0" x2="652.0" y2="351.0" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="351.0" x2="415.4" y2="351.0" stroke="#2ca02c" stroke-width="3.2"/>
+<circle cx="415.4" cy="351.0" r="5" fill="#2ca02c"/>
+<text x="82.0" y="355.0" font-size="12" fill="#6b7280" text-anchor="end" font-weight="500">J</text>
+<text x="427.4" y="355.0" font-size="10.5" fill="#2ca02c" text-anchor="start" font-weight="600">0.540 mm</text>
+<line x1="92.0" y1="387.7" x2="652.0" y2="387.7" stroke="#f1f3f5" stroke-width="30.066666666666663"/>
+<line x1="92.0" y1="387.7" x2="411.5" y2="387.7" stroke="#d62728" stroke-width="3.2"/>
+<circle cx="411.5" cy="387.7" r="5" fill="#d62728"/>
+<text x="82.0" y="391.7" font-size="12" fill="#16181d" text-anchor="end" font-weight="700">Hs</text>
+<text x="423.5" y="391.7" font-size="10.5" fill="#d62728" text-anchor="start" font-weight="600">0.515 mm</text>
+<text x="92.0" y="424.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">0.01</text>
+<line x1="92.0" y1="406.0" x2="92.0" y2="411.0" stroke="#6b7280" stroke-width="1"/>
+<text x="181.1" y="424.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">0.03</text>
+<line x1="181.1" y1="406.0" x2="181.1" y2="411.0" stroke="#6b7280" stroke-width="1"/>
+<text x="278.7" y="424.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">0.1</text>
+<line x1="278.7" y1="406.0" x2="278.7" y2="411.0" stroke="#6b7280" stroke-width="1"/>
+<text x="367.7" y="424.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">0.3</text>
+<line x1="367.7" y1="406.0" x2="367.7" y2="411.0" stroke="#6b7280" stroke-width="1"/>
+<text x="465.3" y="424.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">1</text>
+<line x1="465.3" y1="406.0" x2="465.3" y2="411.0" stroke="#6b7280" stroke-width="1"/>
+<text x="554.4" y="424.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">3</text>
+<line x1="554.4" y1="406.0" x2="554.4" y2="411.0" stroke="#6b7280" stroke-width="1"/>
+<text x="652.0" y="424.0" font-size="11" fill="#6b7280" text-anchor="middle" font-weight="400">10</text>
+<line x1="652.0" y1="406.0" x2="652.0" y2="411.0" stroke="#6b7280" stroke-width="1"/>
+<line x1="92.0" y1="406.0" x2="652.0" y2="406.0" stroke="#16181d" stroke-width="1.4"/>
+<text x="372.0" y="446.0" font-size="12" fill="#16181d" text-anchor="middle" font-weight="400">required accuracy on the water column  (mm, log scale)</text>
+<text x="92.0" y="472.0" font-size="10.5" fill="#6b7280" text-anchor="start" font-weight="400">red: the band needs the column known better than a low-cost GNSS delivers.  green: it does not.</text>
+<text x="92.0" y="488.0" font-size="10.5" fill="#16181d" text-anchor="start" font-weight="600">The verdict is per band. It is not a property of the observatory.</text>
+</svg>

@@ -171,6 +171,40 @@ namespace ExoInstruments.Core
                           + 0.50572 * Math.Pow(h + 6.07995, -1.6364));
         }
 
+        /// <summary>
+        /// The SMALLEST airmass this model can ever return: 0.999711952, at altitude 89.984 degrees.
+        ///
+        /// A PROPERTY OF THE FIT, NOT OF THE SKY. Kasten and Young's denominator carries a
+        /// 0.50572*(h+6.07995)^-1.6364 term that is still 2.9e-4 at h = 90, so the function dips
+        /// marginally below unity for every altitude above about 88.61 degrees. Physically that band
+        /// is one air mass; arithmetically it is a shade less.
+        ///
+        /// AND THE MINIMUM IS NOT AT THE ZENITH. The sine rises to 1 at h = 90 while the correction
+        /// term is still falling, so the sum turns over just short of overhead and the true minimum
+        /// sits at 89.984 degrees, 4e-8 BELOW the value straight up. Taking AirmassAt(90) as the
+        /// floor therefore left a 0.032-degree band of real sky that a table indexed from airmass 1
+        /// still refused - a smaller version of the very bug this constant was added to remove.
+        /// Scanned rather than hard-coded, so it stays true if the fit is ever changed.
+        ///
+        /// Published so that anything holding a table indexed FROM airmass 1 can tell the zenith
+        /// apart from an out-of-range request.
+        /// </summary>
+        public static readonly double ZenithAirmass = MinimumAirmass();
+
+        private static double MinimumAirmass()
+        {
+            // The turnover is within a degree of the zenith; a coarse sweep then a bisection on the
+            // derivative is exact to the last bit that matters here.
+            double best = double.PositiveInfinity;
+            for (int i = 0; i <= 20000; i++)
+            {
+                double h = 88.0 + 2.0 * i / 20000.0;
+                double v = AirmassAt(h);
+                if (v < best) best = v;
+            }
+            return best;
+        }
+
         /// <summary>Maximum altitude this declination ever reaches from this latitude (at meridian transit).</summary>
         public static double MaxTargetAltitudeDeg(double targetDecDeg, double observerLatitudeDeg)
         {

@@ -199,8 +199,18 @@ namespace ExoStudio.Simulation
 
         public static readonly Site[] All = { Ohp, LaSilla, Paranal, RoqueDeLosMuchachos, MaunaKea };
 
+        /// <summary>
+        /// The site with this id, or NULL. It used to end in `?? Ohp`, so a misspelled id, a display
+        /// name pasted back from /api/telescopes, or "atlantis" all quietly became Haute-Provence -
+        /// and the FITS header then asserted OBSERVAT = 'Observatoire de Haute-Provence' for a site
+        /// the caller never named. A dec +70 field asked for from La Silla, where it never rises,
+        /// came back as a French observation at an altitude Chile cannot produce. Callers refuse.
+        /// </summary>
         public static Site ById(string id) =>
-            All.FirstOrDefault(s => string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase)) ?? Ohp;
+            All.FirstOrDefault(s => string.Equals(s.Id, id, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>The valid ids, for a refusal message.</summary>
+        public static string KnownIds => string.Join(", ", All.Select(s => s.Id));
 
         /// <summary>
         /// The Moon, in the terms MoonlightPollution expects. It reads a moon's RA as

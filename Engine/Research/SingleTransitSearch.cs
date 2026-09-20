@@ -129,8 +129,28 @@ namespace ExoStudio.Research
             /// </summary>
             public double CentroidShiftPixels = double.NaN;
 
+            /// <summary>
+            /// How much the centroid wanders on its own outside the dip, in pixels, measured on
+            /// the same flanks the shift is measured against. NaN when no centroid was tested.
+            ///
+            /// KEPT BESIDE THE SHIFT BECAUSE THE SHIFT MEANS NOTHING WITHOUT IT. The concern
+            /// below fires when the shift is CentroidShiftSigma times this scatter, and a record
+            /// that stored the shift alone could not say afterwards whether 0.4 pixels was a
+            /// neighbour's eclipse or a quiet star jittering. The submission text used to read
+            /// the shift alone and called every value, including ones the search itself had
+            /// objected to, "consistent with the flux originating on the target".
+            /// </summary>
+            public double CentroidScatterPixels = double.NaN;
+
             public List<string> Concerns = new();
         }
+
+        /// <summary>
+        /// A centroid shift this many times the baseline scatter is a neighbour, not this star.
+        /// One constant, read by the search that raises the concern and by the submission text
+        /// that describes the result, so the two cannot disagree about where the line is.
+        /// </summary>
+        public const double CentroidShiftSigma = 3.0;
 
         /// <summary>
         /// Isolated dips, strongest first.
@@ -455,7 +475,8 @@ namespace ExoStudio.Research
                     e.CentroidShiftPixels = Math.Sqrt(dx * dx + dy * dy);
 
                     double spread = Math.Max(Scatter(outX.ToArray()), Scatter(outY.ToArray()));
-                    if (spread > 0 && e.CentroidShiftPixels > 3.0 * spread)
+                    e.CentroidScatterPixels = spread;
+                    if (spread > 0 && e.CentroidShiftPixels > CentroidShiftSigma * spread)
                         e.Concerns.Add(
                             $"the centre of light moved {e.CentroidShiftPixels:0.###} pixels during the dip, "
                             + $"against a baseline scatter of {spread:0.###}. The light that disappeared "

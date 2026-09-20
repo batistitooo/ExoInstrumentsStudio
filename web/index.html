@@ -32,6 +32,15 @@
     <!-- THE ONE MODE THAT IS NOT A SIMULATION. The other two compute frames and curves from
          catalogue parameters; this one fetches what a telescope actually recorded and searches
          it. Nothing here is generated. -->
+    <!-- THE MODE THAT MEASURES ACROSS TIME. The other three answer a question about one frame or
+         about one archive record; this one takes a batch of frames at a regular interval, reduces
+         each as it goes, and fits a depth out of the ratio. It is where the photometric sequence
+         belongs - a transit is not a picture - and it is where the water term becomes a number an
+         observer can act on rather than a curve to look at. -->
+    <button class="mode" id="modeLc" role="tab" aria-selected="false" data-mode="lc">
+      <span class="mode-name">Light curve</span>
+      <span class="mode-sub">time series, transit depth, the water term</span>
+    </button>
     <button class="mode" id="modeResearch" role="tab" aria-selected="false" data-mode="research">
       <span class="mode-name">Real exoplanet research</span>
       <span class="mode-sub">observed data from MAST, searched and vetted</span>
@@ -167,6 +176,158 @@
     <button id="observe" class="primary" disabled>Begin observing</button>
     <p class="err" id="startError" hidden></p>
 
+
+<!-- ==================== light curve: the chain, in order ==================== -->
+    <!--
+      FIVE STEPS, AND THEY ARE NOT DECORATION. This is the protocol that produces every
+      water-vapour number this project has published, and until now two of its five steps were
+      reachable only from a shell:
+
+        1  define the instrument          POST /api/instruments/custom   - no form existed
+        2  find a host star in the field  the photometry `matches` array - never surfaced here
+        3  run a sequence through water   POST /api/sequences            - reachable
+        4  inject a transit into it       the same call                  - reachable
+        5  fit the depth back out         /api/sequences/{id}/depth      - did not exist
+
+      A measurement that only exists as a tools/ script is not delivered. All five are here.
+    -->
+    <section class="block" id="lcChainBlock" hidden>
+      <label class="lbl">The measurement, in five steps<span class="q" tabindex="0" data-tip="This is the protocol behind every water-vapour number in this project. Until now two of its five steps could only be run from a shell: defining an instrument, and fitting the depth back out of the frames.">?</span></label>
+      <ol class="lcchain" id="lcChain">
+        <li data-step="1"><b>Instrument</b><span>pick one, or define your own</span></li>
+        <li data-step="2"><b>Field and host</b><span>a probe frame, then a real star</span></li>
+        <li data-step="3"><b>Predict</b><span>what the water will cost this pair</span></li>
+        <li data-step="4"><b>Run</b><span>frames at a regular interval</span></li>
+        <li data-step="5"><b>Fit</b><span>the depth, and the bias on it</span></li>
+      </ol>
+      <p class="hint dim" id="lcChainHint">Steps 1 and 3 answer in seconds. Steps 2 and 4 take pictures.</p>
+    </section>
+
+<!-- ==================== define an instrument (task C) ==================== -->
+    <!--
+      THE API HAS ALWAYS ACCEPTED THIS AND NOTHING IN THE BROWSER CALLED IT.
+      `grep -c "instruments/custom" web/app.js` returned 0, so an outside user could not define
+      their own instrument without writing HTTP by hand - which made step 1 of the chain above
+      reproducible from a shell and not from the site.
+    -->
+    <section class="block" id="lcInstrumentBlock" hidden>
+      <details id="lcInstFold">
+        <summary class="lbl">Define your own instrument</summary>
+        <p class="hint dim">Nothing is guessed.<span class="q" tabindex="0" data-tip="A quantity you do not give is derived from what you did give by a stated relation, or declared unmodelled, or refused with the reason. The instrument reports which of the three, so any figure made from it carries its own caveats.">?</span></p>
+
+        <div class="capgrid">
+          <label>Name<input id="ciName" type="text" placeholder="DUET blue arm"></label>
+          <label>Camera<input id="ciCamera" type="text" placeholder="Andor iKon-L 936"></label>
+          <label>Aperture m<input id="ciAperture" type="number" step="0.01" placeholder="1.0"></label>
+          <label>Focal length m<input id="ciFocal" type="number" step="0.01" placeholder="8.0"></label>
+          <label>Obstruction<input id="ciObstruction" type="number" step="0.01" min="0" max="0.99" placeholder="0.3"></label>
+          <label>Optics T<input id="ciOptics" type="number" step="0.01" min="0" max="1" placeholder="unmodelled"></label>
+          <label>Sensor px w<input id="ciWidth" type="number" step="1" placeholder="2048"></label>
+          <label>Sensor px h<input id="ciHeight" type="number" step="1" placeholder="2048"></label>
+          <label>Pixel µm<input id="ciPixel" type="number" step="0.01" placeholder="13.5"></label>
+          <label>QE flat<input id="ciQe" type="number" step="0.01" min="0" max="1" placeholder="0.90"></label>
+          <label>Full well e⁻<input id="ciWell" type="number" step="1" placeholder="66529"></label>
+          <label>Read noise e⁻<input id="ciRead" type="number" step="0.01" placeholder="5.96"></label>
+          <label>Dark e⁻/s/px<input id="ciDark" type="number" step="0.01" placeholder="0.2"></label>
+          <label>At °C<input id="ciTemp" type="number" step="1" placeholder="-60"></label>
+          <label>ADC bits<input id="ciBits" type="number" step="1" placeholder="16"></label>
+          <label>e⁻/ADU<input id="ciEpa" type="number" step="0.001" placeholder="derived"></label>
+          <label>Seeing ″<input id="ciSeeing" type="number" step="0.01" placeholder="site's own"></label>
+          <label>Site<select id="ciSite"></select></label>
+        </div>
+
+        <label class="lbl capmode-lbl">Detector QE curve<span class="q" tabindex="0" data-tip="CSV of wavelength_nm,value. Optional, and worth having: real silicon runs about 90 per cent in the green and half that at 400 nm, so a flat peak overstates every blue and narrowband exposure.">?</span></label>
+        <div class="calupload">
+          <input id="ciQeFile" type="file" accept=".csv,.txt,.tsv">
+          <span class="hint dim" id="ciQeHint">optional</span>
+        </div>
+
+        <label class="lbl capmode-lbl">Bands<span class="q" tabindex="0" data-tip="One per line: name, centre_nm, width_A, peak. Omitting the peak means the filter's own loss is unmodelled rather than invented. A measured curve can be attached to any band, however many the instrument has.">?</span></label>
+        <textarea id="ciBands" rows="6" spellcheck="false"
+          placeholder="g', 475, 1500, 0.95&#10;r', 625, 1500, 0.95&#10;I+z', 875, 2500"></textarea>
+        <div class="calupload">
+          <select id="ciCurveBand"></select>
+          <input id="ciCurveFile" type="file" accept=".csv,.txt,.tsv">
+        </div>
+        <ul class="calnotes" id="ciCurveList"></ul>
+
+        <div class="calrow">
+          <button id="ciSubmit" class="primary">Define it</button>
+          <button id="ciClear" class="ghost">Clear</button>
+        </div>
+        <p class="err" id="ciError" hidden></p>
+        <ul class="calnotes" id="ciNotes"></ul>
+      </details>
+    </section>
+
+<!-- ==================== light curve: field and band ==================== -->
+    <section class="block" id="lcFieldBlock" hidden>
+      <label class="lbl">Field and band</label>
+      <div class="capgrid">
+        <label>RA °<input id="lcRa" type="number" step="0.0001" value="252.5"></label>
+        <label>Dec °<input id="lcDec" type="number" step="0.0001" value="36.4613"></label>
+        <label>Band<select id="lcBand"></select></label>
+        <!-- No "Exposure s" here. One sat in this row for a while and nothing read it: the probe
+             frame has its own exposure two cells along, and the run's exposure is the sequence
+             block's seqExp, which is the one the request actually sends. A control that changes
+             nothing is a claim that it does. -->
+        <label>Binning<select id="lcBin">
+          <option>1</option><option selected>2</option><option>4</option><option>8</option>
+        </select></label>
+        <label>Probe exp s<input id="lcProbeExp" type="number" min="1" max="600" step="1" value="30"></label>
+      </div>
+      <p class="hint dim" id="lcBandHint"></p>
+      <button id="lcProbe" class="accent">Take a probe frame and list its stars</button>
+      <p class="hint dim">The transit needs a real star.<span class="q" tabindex="0" data-tip="One frame, reduced, so the field's own stars can be read off it. A transit aimed at empty sky is refused, and a host that is not measured in every frame makes the recovered depth meaningless: it has to be bright enough for signal-to-noise 100 and faint enough not to saturate.">?</span></p>
+      <p class="err" id="lcProbeError" hidden></p>
+    </section>
+
+<!-- ==================== light curve: the prediction ==================== -->
+    <section class="block" id="lcPredictBlock" hidden>
+      <label class="lbl">Predict the water term<span class="q" tabindex="0" data-tip="The passband integral run against the ESO telluric table. No frames and no exposure, so it answers in seconds. Every number comes from the server; nothing is computed in the browser.">?</span></label>
+      <div class="capgrid">
+        <label>Airmass<input id="lcX" type="number" min="1" max="3" step="0.05" value="1.5"></label>
+        <label>PWV mm<input id="lcPwv" type="number" min="0.6" max="19" step="0.1" value="2.5"></label>
+        <label>Step ± mm<input id="lcStep" type="number" min="0.05" max="5" step="0.05" value="0.5"></label>
+        <label>Budget ppm<input id="lcBudget" type="number" min="1" max="100000" step="1" value="100"></label>
+        <label>Target K<input id="lcTargetK" type="number" min="1500" max="50000" step="50" value="2600"></label>
+        <label>Comps K<input id="lcCompK" type="number" min="1500" max="50000" step="50" value="5800"></label>
+      </div>
+      <div class="capgrid">
+        <label>Goal line mm<input id="lcSpec" type="number" min="0" max="10" step="0.01" value="0.10"></label>
+        <label>Achieved mm<input id="lcAchieved" type="number" min="0" max="10" step="0.01" value="0.53"></label>
+      </div>
+
+      <label class="lbl capmode-lbl" for="lcBands">Bands to compare<span class="q" tabindex="0" data-tip="One per line: name, fromNm, toNm. Give the span for a band this instrument does not carry, which is how all nine DUET bands were measured before the instrument existed. A name on its own uses the instrument's real passband, measured curve included.">?</span></label>
+      <textarea id="lcBands" rows="9" spellcheck="false"></textarea>
+      <div class="chips">
+        <button class="chip" id="lcBandsDuet">DUET, nine bands</button>
+        <button class="chip" id="lcBandsInstrument">This instrument's own</button>
+      </div>
+      <button id="lcPredict" class="accent">Predict</button>
+      <p class="err" id="lcPredictError" hidden></p>
+      <p class="hint warn" id="lcStaleNote" hidden>The panels below answer the request BEFORE this
+        one. They were kept rather than cleared, but they do not describe what was just asked.</p>
+    </section>
+
+<!-- ==================== light curve: the transfer function ==================== -->
+    <section class="block" id="lcTransferBlock" hidden>
+      <label class="lbl">Does any of it reach the depth?<span class="q" tabindex="0" data-tip="The residual above is the amplitude of a perturbation on the light curve, not the error on a fitted depth. Every pipeline removes a baseline and that fit absorbs most of a water excursion. How much survives depends on the timescale the column moves on, which is what this measures.">?</span></label>
+      <div class="capgrid">
+        <label>Depth ppm<input id="lcTbDepth" type="number" min="10" max="200000" step="10" value="6920"></label>
+        <label>Duration h<input id="lcTbDur" type="number" min="0.1" max="12" step="0.1" value="1"></label>
+        <label>Baseline h<input id="lcTbBase" type="number" min="0.1" max="12" step="0.1" value="1"></label>
+        <label>Cadence s<input id="lcTbCad" type="number" min="10" max="1800" step="10" value="60"></label>
+        <label>PWV swing mm<input id="lcTbAmp" type="number" min="0.01" max="10" step="0.01" value="0.53"></label>
+        <label>Baseline<span class="q" tabindex="0" data-tip="Only the baselines without an airmass term are offered. The sweep holds the air column still so that the water timescale is the only thing varying, which leaves an airmass regressor nothing to fit against. The airmass cases are reported separately below, from a reading that moves the air on purpose.">?</span><select id="lcTbModel">
+          <option value="Time" selected>linear in time</option>
+          <option value="Flat">a constant only</option>
+        </select></label>
+      </div>
+      <button id="lcTransfer" class="accent">Measure the transfer function</button>
+      <p class="err" id="lcTransferError" hidden></p>
+    </section>
+
     <section class="block capturesetup" id="captureSetup" hidden>
       <label class="lbl">Astrograph capture</label>
       <div class="capgrid">
@@ -195,9 +356,128 @@
         <input id="capZoom" type="range" min="1" max="4" step="0.05" value="1">
         <p class="hint" id="zoomHint"></p>
       </div>
+      <div class="coolrow">
+        <div class="coolhead">
+          <label class="lbl" for="capSeed">Noise seed</label>
+          <output class="mono coolval" id="capSeedOut">drawn</output>
+        </div>
+        <input id="capSeed" type="number" min="1" step="1" placeholder="leave empty to draw one">
+        <p class="hint dim">Every noise draw in the frame comes from this one number, and it is written into
+          the FITS header as RANDSEED. Give the same request the same seed and the frame repeats byte for
+          byte. Leave it empty and one is drawn and reported back.</p>
+      </div>
       <button id="capture" class="primary">Capture</button>
       <p class="err" id="captureError" hidden></p>
+
+      <!-- MANY FRAMES, ONE DOWNLOAD. The single Capture above yields one FITS, and the store keeps
+           only 24 frames, so there was no way to walk away with twenty sub-exposures for stacking
+           or the three channels of a colour composite. The bundle never touches the store: each
+           frame is exposed, digitised and written straight into a ZIP, with a manifest of seeds,
+           instants and air columns so the set is reproducible from what is inside it. -->
+      <details class="bundle">
+        <summary>Several frames, as one FITS bundle for stacking</summary>
+        <div class="capgrid">
+          <label>Frames per filter<input id="bunCount" type="number" min="1" max="64" step="1" value="10"></label>
+          <label>Filters<select id="bunFilters">
+            <option value="this" selected>this filter only</option>
+            <option value="rgb">Red, Green, Blue</option>
+            <option value="all">every filter this instrument carries</option>
+          </select></label>
+        </div>
+        <p class="hint dim" id="bunCost"></p>
+        <button id="bundle" class="accent">Capture and download the bundle</button>
+        <p class="hint dim" id="bunStatus" hidden></p>
+        <p class="hint" id="bunLink"></p>
+        <p class="err" id="bundleError" hidden></p>
+      </details>
     </section>
+
+    <!-- ======================== water vapour, one control ==================== -->
+    <!-- ITS OWN BLOCK, AND ONLY ONE OF IT. This used to live inside the capture panel, and
+         pwvRequestBody() read it through that panel's ids - so the single capture and the
+         photometric sequence shared one control by accident of layout rather than by design.
+         The sequence now lives in another mode, and the tempting repair was a second copy of
+         the control. That is precisely the divergence this term has already suffered once: a
+         panel that parsed a pasted record itself and read a different column than the server,
+         so the plot showed water the frame was never exposed through. One block, shown in
+         whichever mode is asking, feeding one request builder. -->
+    <section class="block" id="waterBlock" hidden>
+      <div class="coolrow" id="pwvRow">
+        <div class="coolhead">
+          <label class="lbl" for="pwvMode">Water vapour</label>
+          <output class="mono coolval" id="pwvOut">absent</output>
+        </div>
+        <select id="pwvMode">
+          <option value="none" selected>not modelled</option>
+          <option value="constant">constant</option>
+          <option value="analytic">analytic: a mean, a daily sinusoid and a drift</option>
+          <option value="measured">measured: paste a real record</option>
+        </select>
+        <div class="capgrid" id="pwvConstant" hidden>
+          <label>PWV mm<input id="pwvMm" type="number" min="0.5" max="20" step="0.1" value="2.5"></label>
+        </div>
+        <div class="capgrid" id="pwvAnalytic" hidden>
+          <label>mean mm<input id="pwvMean" type="number" min="0.5" max="20" step="0.1" value="3"></label>
+          <label>amplitude mm<input id="pwvAmp" type="number" min="0" max="10" step="0.1" value="1.5"></label>
+          <label>period h<input id="pwvPeriod" type="number" min="0.1" step="0.5" value="24"></label>
+          <label>drift mm/day<input id="pwvDrift" type="number" step="0.1" value="0"></label>
+        </div>
+        <div id="pwvMeasured" hidden>
+          <textarea id="pwvSeries" rows="4" spellcheck="false"
+            placeholder="2026-08-27T22:00:00Z  2.1&#10;2026-08-27T23:00:00Z  2.6&#10;# an instant and a column in mm, per line"></textarea>
+        </div>
+        <p class="hint dim" id="pwvHint"></p>
+        <div id="pwvCurveBox" hidden>
+          <!-- Logical height in data-h, like every other chart on the page: setupCanvas sizes the
+               bitmap from the element's own width. This one used to be a fixed 640 by 180 bitmap
+               under a canvas rule of width 100 percent, so it was the one chart drawn squashed. -->
+          <canvas id="pwvCurve" data-h="180"></canvas>
+          <p class="hint dim" id="pwvCurveHint"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ photometric sequence =================== -->
+    <section class="block" id="seqSetup" hidden>
+      <label class="lbl">Photometric sequence</label>
+      <p class="hint dim">A transit is not a frame. It is a ratio of one star to several others, followed
+        across hours, and how stable that ratio is decides whether a planet is detectable. This takes many
+        sub-exposures of the field above as it descends through the air, reduces each one, and scores the
+        ratio against the photon limit.</p>
+      <div class="capgrid">
+        <label>Frames<input id="seqFrames" type="number" min="5" max="400" step="1" value="60"></label>
+        <label>Exposure s<input id="seqExp" type="number" min="1" max="3600" step="1" value="120"></label>
+        <label>Binning<select id="seqBin">
+          <option selected>1</option><option>2</option><option>4</option><option>8</option>
+        </select></label>
+        <label>Comparisons<input id="seqComps" type="number" min="2" max="12" step="1" value="4"></label>
+        <label>Airmass from<input id="seqXFrom" type="number" min="1" max="4.9" step="0.01" value="1.05"></label>
+        <label>Airmass to<input id="seqXTo" type="number" min="1.01" max="5" step="0.01" value="2"></label>
+        <label>Base seed<input id="seqSeed" type="number" min="1" step="1" placeholder="drawn"></label>
+        <label class="capcheck"><input id="seqCal" type="checkbox" checked> calibrate each frame</label>
+      </div>
+
+      <!-- AN INJECTED TRANSIT. The endpoint has always accepted one; nothing here sent it, so the
+           injection-recovery experiment could only be run with curl. Depth zero injects nothing,
+           which is the endpoint's own convention and not an error. -->
+      <label class="capcheck"><input id="seqTransit" type="checkbox"> inject a transit</label>
+      <div class="capgrid" id="seqTransitBox" hidden>
+        <label>Depth ppt<input id="seqTrDepth" type="number" min="0" max="500" step="0.1" value="6.4"></label>
+        <label>Duration h<input id="seqTrDur" type="number" min="0.05" max="24" step="0.05" value="1.2"></label>
+        <label>Period d<input id="seqTrPer" type="number" min="0.1" max="1000" step="0.1" value="3.5"></label>
+        <label>Host RA<input id="seqTrRa" type="number" step="0.00001" placeholder="field centre"></label>
+        <label>Host Dec<input id="seqTrDec" type="number" step="0.00001" placeholder="field centre"></label>
+        <label>Match "<input id="seqTrRad" type="number" min="0.5" max="120" step="0.5" value="3"></label>
+      </div>
+      <p class="hint dim" id="seqTransitHint" hidden>The host must be a real star from the star
+        list.<span class="q" tabindex="0" data-tip="A transit aimed at a position with no catalogue star is refused. The host also has to be measured in every frame: bright enough for signal-to-noise 100, and not saturated. Take a probe frame and use the star list.">?</span></p>
+
+      <p class="hint dim" id="seqCost"></p>
+      <button id="seqStart" class="accent">Run the sequence</button>
+      <button id="seqStop" class="ghost" hidden>Stop</button>
+      <p class="err" id="seqError" hidden></p>
+    </section>
+
   </aside>
 
   <!-- ============================ run column ============================== -->
@@ -373,6 +653,7 @@
         <button class="ghost calbtn" data-cal="Dark">Take dark</button>
         <button class="ghost calbtn" data-cal="Flat">Take flat</button>
         <label class="calcount">average <input id="calCount" type="number" min="1" max="256" step="1" value="16"> frames</label>
+        <label class="calcount">seed <input id="calSeed" type="number" min="1" step="1" placeholder="drawn"></label>
       </div>
 
       <table class="masters" id="masterTable" hidden>
@@ -394,6 +675,22 @@
       </div>
 
       <p class="err" id="calError" hidden></p>
+
+      <!-- The per-star measurements the reduction has always returned and the panel used to
+           throw away. A single number for a whole frame hides which stars carry it. -->
+      <details id="starFold" hidden>
+        <summary class="lbl">Every star this frame measured</summary>
+        <p class="hint dim" id="starNote"></p>
+        <div class="startablewrap">
+          <table class="signals mono" id="starTable">
+            <thead><tr>
+              <th>V</th><th>B−V</th><th>recovered</th><th>residual</th><th>S/N</th>
+              <th>flux e⁻</th><th>injected e⁻</th><th>RA</th><th>Dec</th>
+            </tr></thead>
+            <tbody id="starRows"></tbody>
+          </table>
+        </div>
+      </details>
       <ul class="calnotes" id="calNotes"></ul>
 
       <div class="calrow">
@@ -401,6 +698,67 @@
         <span class="hint" id="reduceHint">recovers each injected star's magnitude and reports the residual</span>
       </div>
       <p class="hint" id="reduceOut"></p>
+    </div>
+
+    <!-- ============================ photometric sequence =================== -->
+    <div class="panel chart" id="seqPanel" hidden>
+      <div class="chart-head">
+        <h3>Photometric sequence</h3>
+        <span class="chart-note mono" id="seqProgress"></span>
+      </div>
+      <p class="hint dim" id="seqSubtitle"></p>
+
+      <div class="verdict-box" id="seqVerdict" hidden>
+        <div class="vcell"><div class="vlbl">Floor</div><div class="vval mono" id="seqFloor">n/a</div>
+          <div class="vsub">after the colour drift is removed</div></div>
+        <div class="vcell"><div class="vlbl">Photon limit</div><div class="vval mono" id="seqPhoton">n/a</div>
+          <div class="vsub">what statistics alone allow</div></div>
+        <div class="vcell"><div class="vlbl">Ratio</div><div class="vval mono" id="seqRatio">n/a</div>
+          <div class="vsub" id="seqRatioSub">measured over predicted</div></div>
+      </div>
+
+      <canvas id="seqCurve" data-h="240"></canvas>
+      <p class="hint dim" id="seqCurveNote"></p>
+
+      <canvas id="seqSlopes" data-h="220"></canvas>
+      <p class="hint dim" id="seqSlopeNote"></p>
+
+      <div class="kv" id="seqNumbers"></div>
+      <ul class="calnotes" id="seqNotes"></ul>
+
+      <!-- The two noise models, subtracted on this sequence's own stars. -->
+      <details id="bridgeFold" hidden>
+        <summary class="lbl">Check the light-curve model against these frames</summary>
+        <p class="hint dim">Two independent noise models, compared on these frames.<span class="q" tabindex="0" data-tip="The imaging path deposits photons and reduces the frame back; that is the one cross-validated against POPPY and GalSim. The light-curve path predicts one number per epoch and draws a Gaussian from it, and every radial-velocity and transit detection here runs on it. A model that under-predicts noise calls planets detectable that are not.">?</span></p>
+        <button id="bridgeRun" class="ghost">Compare</button>
+        <p class="err" id="bridgeError" hidden></p>
+        <div class="verdict-box" id="bridgeVerdict" hidden>
+          <div class="vcell"><div class="vlbl">Light-curve model</div><div class="vval mono" id="bridgeCurve">n/a</div>
+            <div class="vsub">predicted over measured</div></div>
+          <div class="vcell"><div class="vlbl">Imaging error bar</div><div class="vval mono" id="bridgeImaging">n/a</div>
+            <div class="vsub">predicted over measured</div></div>
+          <div class="vcell"><div class="vlbl">Stars</div><div class="vval mono" id="bridgeStars">n/a</div>
+            <div class="vsub">measured in every frame</div></div>
+        </div>
+        <p class="hint dim" id="bridgeNote"></p>
+        <div class="startablewrap">
+          <table class="signals mono" id="bridgeTable" hidden>
+            <thead><tr>
+              <th>V</th><th>B−V</th><th>measured</th><th>imaging</th><th>light curve</th>
+              <th>curve / meas</th><th>imag / meas</th>
+            </tr></thead>
+            <tbody id="bridgeRows"></tbody>
+          </table>
+        </div>
+      </details>
+
+      <div id="seqPreviewWrap" hidden>
+        <p class="hint dim">One frame out of the run, so the measurement can be looked at rather than
+          taken on trust. The frames themselves are not kept: a hundred sub-exposures is gigabytes of
+          pixels and a few hundred kilobytes of measurements, and only the measurements answer the
+          question. Take a single capture at an epoch of interest if you want its FITS.</p>
+        <img id="seqPreview" alt="one frame from the sequence">
+      </div>
     </div>
 
     <!-- ================= REAL EXOPLANET RESEARCH ================= -->
@@ -552,6 +910,293 @@
         stars were ever searched. Export first.
       </p>
     </details>
+
+
+    <!-- ==================== light curve: the analytic half ==================== -->
+    <!--
+      SEVEN FIGURES, AND THE ORDER IS THE ARGUMENT.
+        1  the band being integrated, drawn        - what the integral actually sees
+        2  loss against column, per temperature    - the figure Peter already had
+        3  the differential                        - the part his figure does not have
+        4  absorbed against differential, by band  - and they are uncorrelated
+        5  the requirement, per band               - so, is our GNSS good enough
+        6  the comparison ensemble's colour        - the one lever that costs nothing
+        7  the transfer function                   - and does any of it reach the depth
+      Every one of them is drawn from numbers the server returned. Nothing is computed here.
+    -->
+
+    <div class="panel chart" id="lcBandPanel" hidden>
+      <div class="chart-head">
+        <h3>The band being integrated<span class="q" tabindex="0" data-tip="Grey is the band, blue the water, white their product, which is what the passband integral actually sees. Where no measured curve was supplied the band is a rectangle, and for a band near 940 nm that is the largest approximation in the answer: moving I+z' red flank from 900 to 1100 nm swings the differential by a factor of 17.5.">?</span></h3>
+        <span class="chart-note mono" id="lcBandNote"></span>
+      </div>
+      <canvas id="lcBandCurve" data-h="220"></canvas>
+      <p class="hint dim" id="lcBandCaption"></p>
+    </div>
+
+    <div class="panel chart" id="lcLossPanel" hidden>
+      <div class="chart-head">
+        <h3>What the column costs, against what survives<span class="q" tabindex="0" data-tip="Left is what a single star loses, which is the figure that already existed. Right is what survives the ratio against the comparison ensemble, and only that one limits a transit: everything grey divides out. Both are measured against the table's own driest column, not against vacuum, because the library carries ozone and molecular oxygen too and those do not vary with the water.">?</span></h3>
+        <span class="chart-note mono" id="lcLossNote"></span>
+      </div>
+      <div class="lcpair">
+        <div>
+          <canvas id="lcLossCurve" data-h="250"></canvas>
+          <p class="hint dim">Absorbed: what a star of each temperature loses on its own.</p>
+        </div>
+        <div>
+          <canvas id="lcDiffCurve" data-h="250"></canvas>
+          <p class="hint dim">Differential: that minus what the comparison ensemble loses. Only
+            this one limits a transit.</p>
+        </div>
+      </div>
+      <p class="hint dim" id="lcLossCaption"></p>
+    </div>
+
+    <div class="panel chart" id="lcBandsPanel" hidden>
+      <div class="chart-head">
+        <h3>Band by band<span class="q" tabindex="0" data-tip="Absorbed against differential. They are uncorrelated, and that is the finding: z' absorbs more water than I+z' and suffers less than half as much of it in the ratio. Choosing a filter to minimise absorption optimises the wrong variable.">?</span></h3>
+        <span class="chart-note mono" id="lcBandsNote"></span>
+      </div>
+      <canvas id="lcBandsChart" data-h="270"></canvas>
+      <p class="hint dim" id="lcBandsCaption"></p>
+      <div class="startablewrap">
+        <table class="signals mono" id="lcReqTable">
+          <thead><tr>
+            <th data-sort="band">band</th>
+            <th data-sort="fromNm">span nm</th>
+            <th data-sort="absorbedUmagPerMm">absorbed µmag/mm</th>
+            <th data-sort="differentialUmagPerMm">differential µmag/mm</th>
+            <th data-sort="residualAtAchievedPpm">residual @ achieved</th>
+            <th data-sort="requiredSigmaMm">σ_PWV needed</th>
+          </tr></thead>
+          <tbody id="lcReqRows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel chart" id="lcReqPanel" hidden>
+      <div class="chart-head">
+        <h3>The requirement, derived rather than assumed<span class="q" tabindex="0" data-tip="A constant water error is harmless: differential photometry normalises on the out-of-transit baseline, so a bias common to the night divides out. What survives is the error on the change across the event, so the requirement is set by the derivative of the differential loss. The two dashed lines are a stated goal of 0.1 mm and the 0.53 mm four low-cost GNSS receivers achieved at Paranal.">?</span></h3>
+        <span class="chart-note mono" id="lcReqNote"></span>
+      </div>
+      <canvas id="lcReqChart" data-h="300"></canvas>
+      <p class="hint dim" id="lcReqCaption"></p>
+      <ul class="calnotes" id="lcReqNotes"></ul>
+    </div>
+
+    <div class="panel chart" id="lcColourPanel" hidden>
+      <div class="chart-head">
+        <h3>The comparison ensemble's colour</h3>
+        <span class="chart-note mono" id="lcColourNote"></span>
+      </div>
+      <div class="lcdepthbar">
+        <label class="lbl" for="lcColourPick">Band</label>
+        <select id="lcColourPick"></select>
+        <span class="hint dim">Chosen as the widest differential.<span class="q" tabindex="0" data-tip="The matrix is a property of one band, so the panel picks the band where the requirement actually bites: the one with the largest differential term. Change it here to move the matrix to another band.">?</span></span>
+      </div>
+      <div class="startablewrap">
+        <table class="signals mono lcgrid" id="lcColourTable">
+          <thead><tr id="lcColourHead"></tr></thead>
+          <tbody id="lcColourRows"></tbody>
+        </table>
+      </div>
+      <p class="hint dim" id="lcColourCaption"></p>
+    </div>
+
+    <div class="panel chart" id="lcTransferPanel" hidden>
+      <div class="chart-head">
+        <h3>How much of it reaches the fitted depth<span class="q" tabindex="0" data-tip="Every pipeline removes a baseline fitted on the out-of-transit points, and that fit absorbs most of a water excursion. Only a column moving on the visit's own timescale survives it. There is no photon noise here: this is the deterministic response of the depth estimator to a known systematic, so you supply the excursion your site has and multiply.">?</span></h3>
+        <span class="chart-note mono" id="lcTransferNote"></span>
+      </div>
+      <canvas id="lcTransferChart" data-h="280"></canvas>
+      <p class="hint warn" id="lcTransferStale" hidden></p>
+      <p class="hint dim" id="lcTransferCaption"></p>
+      <div class="verdict-box" id="lcTransferVerdict" hidden>
+        <div class="vcell"><div class="vlbl">Worst timescale</div><div class="vval mono" id="lcTfWorst">n/a</div>
+          <div class="vsub">where the baseline cannot absorb it</div></div>
+        <div class="vcell"><div class="vlbl">Peak transfer</div><div class="vval mono" id="lcTfPeak">n/a</div>
+          <div class="vsub">ppm of depth per mm of column</div></div>
+        <div class="vcell"><div class="vlbl">At 12 h and slower</div><div class="vval mono" id="lcTfSlow">n/a</div>
+          <div class="vsub">what the detrend takes out</div></div>
+      </div>
+      <div class="startablewrap">
+        <table class="signals mono" id="lcTfBaselines">
+          <thead><tr><th>baseline model</th><th>depth ppm</th><th>bias ppm</th>
+            <th>corr(profile, regressor)</th></tr></thead>
+          <tbody id="lcTfBaselineRows"></tbody>
+        </table>
+      </div>
+      <ul class="calnotes" id="lcTransferNotes"></ul>
+    </div>
+
+    <!-- ==================== light curve: the field's own stars ==================== -->
+    <!--
+      THE ARRAY THE PAGE USED TO IGNORE. /api/captures/{id}/photometry has always served every
+      matched star with its position, colour, magnitude and signal-to-noise, and choosing a
+      transit host out of it was a scripting job. Sorted, and with one button per row, it is two
+      clicks.
+    -->
+    <div class="panel chart" id="lcStarsPanel" hidden>
+      <div class="chart-head">
+        <h3>Stars in this field<span class="q" tabindex="0" data-tip="Every star the probe frame matched to the catalogue. A transit host has to be a real star, unsaturated, and above signal-to-noise 100 or the run cannot measure it in every frame. Pick the reddest usable one to make the water term as large as it gets: the effect lives in the colour difference between the host and its comparisons, and the ensemble is formed from the bluest stars in the field.">?</span></h3>
+        <span class="chart-note mono" id="lcStarsNote"></span>
+      </div>
+      <div class="chips" id="lcStarChips" role="group" aria-label="Filter stars">
+        <button class="chip on" data-starfilter="usable">Usable as a host</button>
+        <button class="chip" data-starfilter="all">All</button>
+        <button class="chip" data-starfilter="saturated">Saturated</button>
+      </div>
+      <p class="hint warn" id="lcStarsStale" hidden></p>
+      <div class="startablewrap">
+        <table class="signals mono" id="lcStarTable">
+          <thead><tr>
+            <th data-sort="trueMagnitude">V</th>
+            <th data-sort="colourBv">B−V</th>
+            <th data-sort="snr">S/N</th>
+            <th data-sort="fluxElectrons">flux e⁻</th>
+            <th data-sort="raDeg">RA</th>
+            <th data-sort="decDeg">Dec</th>
+            <th>state</th>
+            <th></th>
+          </tr></thead>
+          <tbody id="lcStarRows"></tbody>
+        </table>
+      </div>
+      <p class="hint dim" id="lcStarsCaption"></p>
+    </div>
+
+
+    <!-- ==================== light curve: the run itself ==================== -->
+    <!--
+      TWO THINGS THE PANEL COULD NOT SHOW, AND HAD TO.
+      A run that produces no analysis produced no picture either, so a reader whose frames were
+      refused saw a summary line and nothing else. And the summary GUESSED why they were refused
+      ("the field was down or the sky was not dark") when every frame carries its own reason.
+    -->
+    <div class="panel chart" id="lcCurvePanel" hidden>
+      <div class="chart-head">
+        <h3>The light curve<span class="q" tabindex="0" data-tip="The target divided by the summed comparison ensemble, normalised, against time. In this ratio the zero point, the exposure and the collecting area cancel, and so does scintillation, which is one draw shared by every star in a frame. What does not cancel is anything depending on colour, because the target and its comparisons are different colours and the atmosphere is not grey.">?</span></h3>
+        <span class="chart-note mono" id="lcCurveNote"></span>
+      </div>
+      <div class="chips" id="lcCurveAxis" role="group" aria-label="Horizontal axis">
+        <button class="chip on" data-axis="time">against time</button>
+        <button class="chip" data-axis="airmass">against airmass</button>
+        <button class="chip" data-axis="pwv">against water</button>
+      </div>
+      <canvas id="lcCurve" data-h="280"></canvas>
+      <p class="hint dim" id="lcCurveCaption"></p>
+      <p class="err" id="lcCurveError" hidden></p>
+    </div>
+
+    <div class="panel chart" id="lcFramesPanel" hidden>
+      <div class="chart-head">
+        <h3>Every frame<span class="q" tabindex="0" data-tip="One row per sub-exposure, with the conditions it was taken under and the number of stars measured in it. A refused frame carries its own reason and is absent from the measurement rather than counted as zero. The frames themselves are not kept: a hundred sub-exposures is gigabytes of pixels and a few hundred kilobytes of measurements, and only the measurements answer the question.">?</span></h3>
+        <span class="chart-note mono" id="lcFramesNote"></span>
+      </div>
+      <ul class="calnotes" id="lcFrameReasons"></ul>
+      <div class="startablewrap">
+        <table class="signals mono" id="lcFrameTable">
+          <thead><tr>
+            <th>#</th><th>UTC</th><th>airmass</th><th>PWV mm</th>
+            <th>transit</th><th>seeing &Prime;</th><th>FWHM px</th><th>stars</th><th>state</th>
+          </tr></thead>
+          <tbody id="lcFrameRows"></tbody>
+        </table>
+      </div>
+      <img id="lcFramePreview" alt="one frame from the run" hidden>
+      <p class="hint dim" id="lcFramesCaption"></p>
+    </div>
+
+    <!-- ==================== light curve: the fitted depth ==================== -->
+    <div class="panel chart" id="lcDepthPanel" hidden>
+      <div class="chart-head">
+        <h3>The recovered depth<span class="q" tabindex="0" data-tip="The depth is the coefficient on the injected profile, fitted jointly with the baseline. Averaging the in-transit points instead measures how much of the event is ramp: the injected event has a tenth of its duration in ingress at each end. Fitting the baseline first treats it as independent of the transit, and it is not: an event at culmination sits at the airmass minimum, so an airmass regressor can eat the signal. Fitted together, that degeneracy widens the error bar instead of moving the answer.">?</span></h3>
+        <span class="chart-note mono" id="lcDepthNote"></span>
+      </div>
+
+      <div class="lcdepthbar">
+        <label class="lbl" for="lcDepthModel">Baseline removed</label>
+        <select id="lcDepthModel">
+          <option value="Time">linear in time</option>
+          <option value="TimeAirmass" selected>time and airmass</option>
+          <option value="TimeAirmassQuadratic">plus airmass²</option>
+          <option value="Flat">a constant only</option>
+        </select>
+        <label class="capcheck"><input id="lcDepthCorrect" type="checkbox"> correct for the water</label>
+        <button id="lcDepthFit" class="accent">Fit</button>
+      </div>
+
+      <div class="verdict-box" id="lcDepthVerdict" hidden>
+        <div class="vcell"><div class="vlbl">Recovered</div><div class="vval mono" id="lcDepthVal">n/a</div>
+          <div class="vsub" id="lcDepthErr">± formal error</div></div>
+        <div class="vcell"><div class="vlbl">Injected</div><div class="vval mono" id="lcDepthTruth">n/a</div>
+          <div class="vsub">the truth this program put there</div></div>
+        <div class="vcell"><div class="vlbl">Bias</div><div class="vval mono" id="lcDepthBias">n/a</div>
+          <div class="vsub" id="lcDepthSig">recovered minus injected</div></div>
+      </div>
+
+      <p class="hint dim" id="lcDepthCaption"></p>
+      <div class="kv" id="lcDepthNumbers"></div>
+      <ul class="calnotes" id="lcDepthNotes"></ul>
+
+      <!-- Hidden, and the links disabled, until a fit has actually come back. The row used to
+           appear with the panel, so a refused fit showed two download buttons pointing at "#" or
+           at whichever run had been fitted before. lcExportLinks in app.js owns both states. -->
+      <div id="lcExportBox" hidden>
+        <div class="calrow">
+          <label class="lbl">Export</label>
+          <span class="fcactions">
+            <a class="ghost" id="lcExportCsv" href="#" download aria-disabled="true">CSV of the series</a>
+            <a class="ghost" id="lcExportJson" href="#" target="_blank" rel="noopener" aria-disabled="true">JSON of the run</a>
+          </span>
+        </div>
+        <p class="hint dim">The same rows the fit above uses.<span class="q" tabindex="0" data-tip="Every column a correction needs: the instant, the air column, the water column the frame was exposed through, the injected truth, the measured ratio and its photon prediction. The run's provenance rides in comment lines above the header, so a file that has been emailed twice still says which instrument, which night and which seed made it.">?</span></p>
+      </div>
+    </div>
+
+    <!-- ==================== light curve: two conditions, subtracted ==================== -->
+    <div class="panel chart" id="lcPairPanel" hidden>
+      <div class="chart-head">
+        <h3>Two conditions, subtracted</h3>
+        <span class="chart-note mono" id="lcPairNote"></span>
+      </div>
+      <p class="hint dim">The same baseline on both, subtracted.<span class="q" tabindex="0" data-tip="One run's recovered depth carries the whole photon error of that run, thousands of ppm, and the water term under test is smaller. What the experiment asks is how much the condition moved the answer, so both runs are fitted identically and the difference is taken. A shared seed does not cancel the noise: the water changes the Poisson mean of every pixel and the sampler is a rejection method, so the two streams desynchronise.">?</span></p>
+      <div class="lcdepthbar">
+        <select id="lcPairA"></select>
+        <span class="hint dim">against</span>
+        <select id="lcPairB"></select>
+        <button id="lcPairRun" class="accent">Compare</button>
+      </div>
+      <div class="verdict-box" id="lcPairVerdict" hidden>
+        <div class="vcell"><div class="vlbl">Difference</div><div class="vval mono" id="lcPairDiff">n/a</div>
+          <div class="vsub">of recovered depths</div></div>
+        <div class="vcell"><div class="vlbl">Error</div><div class="vval mono" id="lcPairErr">n/a</div>
+          <div class="vsub">added in quadrature, not cancelled</div></div>
+        <div class="vcell"><div class="vlbl">Significance</div><div class="vval mono" id="lcPairSig">n/a</div>
+          <div class="vsub" id="lcPairVerdictSub"></div></div>
+      </div>
+      <ul class="calnotes" id="lcPairNotes"></ul>
+      <p class="err" id="lcPairError" hidden></p>
+    </div>
+
+    <!-- ==================== light curve: predicted against recovered ==================== -->
+    <div class="panel chart" id="lcClosurePanel" hidden>
+      <div class="chart-head">
+        <h3>Predicted against recovered</h3>
+        <span class="chart-note mono" id="lcClosureNote"></span>
+      </div>
+      <p class="hint dim">The predicted bias against the recovered one.<span class="q" tabindex="0" data-tip="The analytic half predicts a bias in ppm per mm of column from the passband integral. The measured half recovers a depth out of real frames with real photon noise. Neither has anything to be compared against on its own; on the same field, instrument and stars, they do.">?</span></p>
+      <div class="verdict-box" id="lcClosureVerdict" hidden>
+        <div class="vcell"><div class="vlbl">Predicted</div><div class="vval mono" id="lcClosurePred">n/a</div>
+          <div class="vsub" id="lcClosurePredSub">from the transfer function</div></div>
+        <div class="vcell"><div class="vlbl">Recovered</div><div class="vval mono" id="lcClosureMeas">n/a</div>
+          <div class="vsub" id="lcClosureMeasSub">from the frames</div></div>
+        <div class="vcell"><div class="vlbl">Agreement</div><div class="vval mono" id="lcClosureRatio">n/a</div>
+          <div class="vsub" id="lcClosureSub"></div></div>
+      </div>
+      <ul class="calnotes" id="lcClosureNotes"></ul>
+    </div>
 
     <div class="panel chart" id="seriesPanel" hidden>
       <div class="chart-head">

@@ -65,7 +65,7 @@ namespace ExoStudio.Data
         /// column mean now, from there. The altitude refresh mutates the shared index rows
         /// (the same design the mod uses), hence the lock.
         /// </summary>
-        public (List<Row> Rows, int Total) Query(string text, ObservingSites.Site site, double ut, int max)
+        public (List<Row> Rows, int Total, List<string> Unrecognised) Query(string text, ObservingSites.Site site, double ut, int max)
         {
             lock (gate)
             {
@@ -80,7 +80,12 @@ namespace ExoStudio.Data
                         : SkyCoordinates.EquatorialToHorizontal(t.RaDeg, t.DecDeg, meridianRa, site.LatitudeDeg).AltitudeDeg;
                 }
 
-                List<SearchResult> hits = index.Query(TargetQuery.Parse(text), max, out int total);
+                // The parsed query is kept so its Unrecognised list can go back with the rows: a
+                // filter Core could not apply is left out of the search, which widens it, and the
+                // caller has to be able to say which token did that. Dropping the list here was
+                // how "typ:nebula" listed the whole index under a count line that read like a hit.
+                TargetQuery parsed = TargetQuery.Parse(text);
+                List<SearchResult> hits = index.Query(parsed, max, out int total);
                 var rows = hits.Select(h => new Row
                 {
                     DisplayName = h.Target.DisplayName,
@@ -94,7 +99,7 @@ namespace ExoStudio.Data
                     MajorArcmin = Finite(h.Target.MajorArcmin),
                     AltitudeDeg = Finite(h.Target.AltitudeDeg),
                 }).ToList();
-                return (rows, total);
+                return (rows, total, new List<string>(parsed.Unrecognised));
             }
         }
 

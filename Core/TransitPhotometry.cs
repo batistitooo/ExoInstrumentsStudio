@@ -78,6 +78,13 @@ namespace ExoInstruments.Core
             public double DarkElectronsPerPixel;
             /// <summary>Signal-to-noise from the CCD equation alone, before scintillation.</summary>
             public double SignalToNoise;
+            /// <summary>
+            /// The fraction of the source's light inside the photometric aperture, integrated from
+            /// the instrument's own annular-pupil-times-Kolmogorov profile rather than assumed
+            /// Gaussian. Reported because it is the term the two noise models used to disagree on.
+            /// </summary>
+            public double EncircledEnergy;
+
             /// <summary>Fractional flux sigma from the CCD equation alone.</summary>
             public double PhotometricSigma;
             /// <summary>Young (1967) scintillation sigma at this airmass and exposure.</summary>
@@ -154,8 +161,27 @@ namespace ExoInstruments.Core
 
             budget.AperturePixels = CcdEquation.AperturePixels(apertureRadiusArcsec, plateScale);
 
-            // Encircled energy at whichever radius was chosen, in units of this PSF's own FWHM.
-            double enclosed = CcdEquation.GaussianEnclosedEnergy(apertureRadiusArcsec / budget.PsfFwhmArcsec);
+            // Encircled energy at whichever radius was chosen, FROM THE REAL PROFILE.
+            //
+            // `CcdEquation.GaussianEnclosedEnergy` returns 0.7226 at the optimal radius and its own
+            // comment says why that is optimistic: a long-exposure profile is an annular pupil
+            // convolved with Kolmogorov seeing, whose wings fall as theta^(-11/3) and carry more
+            // flux outside any radius than a Gaussian does. That comment ends "left as a refinement
+            // rather than done here, so that this file stays a statement of the published equation
+            // alone" - which is right for CcdEquation and wrong to inherit here, because THIS file
+            // knows the instrument and can build the profile.
+            //
+            // What it cost, measured. Studio's imaging path deposits photons through that same real
+            // kernel and reduces the frame back, and a curve of growth on 100 RC20 frames gives
+            // 0.5685 where the Gaussian claims 0.7226. Carrying the Gaussian made this model
+            // predict 0.679 of the scatter those frames actually show - optimistic by a third,
+            // which on a yield map is planets called detectable that are not. With the real profile
+            // it lands on 0.860, which is the imaging path's own CCD-equation error bar to within
+            // 1.4 %: the assumption WAS the whole disagreement between Studio's two noise models.
+            // See MILESTONE_0C.md.
+            double enclosed = EncircledEnergyFor(detector, instrument, budget.PsfFwhmArcsec,
+                                                 apertureRadiusArcsec, plateScale);
+            budget.EncircledEnergy = enclosed;
             budget.ApertureSourceElectrons = budget.TotalSourceElectrons * enclosed;
 
             // --- 4. Sky -----------------------------------------------------
@@ -330,8 +356,22 @@ namespace ExoInstruments.Core
         /// </summary>
         private const double AirmassGridStep = 0.1;
 
-        private static readonly Dictionary<PhotometricDetector, SystemResponse[]> responseGrids
-            = new Dictionary<PhotometricDetector, SystemResponse[]>();
+        /// <summary>
+        /// Keyed by the detector AND the site altitude, because each entry BAKES the site's
+        /// atmosphere: `SystemResponse` integrates `ExtinctionTransmissionAt(airmass, lambda,
+        /// siteAltitudeMeters)` through the passband.
+        ///
+        /// In the mod an instrument stands on exactly one mountain, so the detector alone
+        /// identified the air above it and this key was sound. A program that re-seats the same
+        /// spec at another site - ExoStudio's `Campaign.AtSite`, which shares the Detector by
+        /// reference - hands this method two altitudes behind one detector, and whichever one
+        /// first touched a given airmass cell was then frozen into it for the life of the process.
+        /// Measured before the fix: the same magnitude-12 star at the same site and airmass came
+        /// back at 721.28 ppm or 720.77 ppm depending only on which campaign had run first, which
+        /// breaks the documented invariant that target + instrument + site + date + seed repeats.
+        /// </summary>
+        private static readonly Dictionary<(PhotometricDetector Detector, double SiteAltitudeMeters), SystemResponse[]> responseGrids
+            = new Dictionary<(PhotometricDetector, double), SystemResponse[]>();
         private static readonly object cacheLock = new object();
 
         /// <summary>
@@ -352,12 +392,13 @@ namespace ExoInstruments.Core
 
             lock (cacheLock)
             {
+                var cacheKey = (detector, instrument.SiteAltitudeMeters);
                 SystemResponse[] grid;
-                if (!responseGrids.TryGetValue(detector, out grid))
+                if (!responseGrids.TryGetValue(cacheKey, out grid))
                 {
                     int count = (int)Math.Round((MaxSeeingAirmass - 1.0) / AirmassGridStep) + 1;
                     grid = new SystemResponse[count];
-                    responseGrids[detector] = grid;
+                    responseGrids[cacheKey] = grid;
                 }
                 if (index >= grid.Length) index = grid.Length - 1;
 
@@ -377,5 +418,93 @@ namespace ExoInstruments.Core
                 return grid[index];
             }
         }
+
+        // ------------------------------------------------------------------ encircled energy
+
+        /// <summary>
+        /// Encircled energy inside the photometric aperture, integrated from the instrument's own
+        /// delivered profile: the annular pupil's diffraction pattern convolved with the
+        /// long-exposure Kolmogorov seeing of this airmass, which is the same kernel
+        /// `OpticalPsf.BuildKernel` hands the imaging path.
+        ///
+        /// This replaces `CcdEquation.GaussianEnclosedEnergy`, and the substitution is the
+        /// refinement that function's own summary names and declines to make, on the correct
+        /// grounds that CcdEquation is a statement of the published equation. Here the instrument
+        /// is in hand, so the profile can be built.
+        ///
+        /// Cached on the geometry that determines it, because a campaign asks for this once per
+        /// exposure and the kernel is a two-dimensional pupil sum. Falls back to the Gaussian only
+        /// where the profile cannot be built at all - a detector with no aperture figure, or a
+        /// plate scale that makes the kernel degenerate - rather than refusing, since a slightly
+        /// optimistic aperture correction is still better than no light curve.
+        /// </summary>
+        private static double EncircledEnergyFor(PhotometricDetector detector, InstrumentSpec instrument,
+                                                 double psfFwhmArcsec, double apertureRadiusArcsec,
+                                                 double plateScaleArcsecPerPixel)
+        {
+            double radiusInFwhm = psfFwhmArcsec > 0.0 ? apertureRadiusArcsec / psfFwhmArcsec : 0.0;
+            double aperture = detector.ApertureMeters ?? 0.0;
+            double lambda = (detector.FilterCentralWavelengthNm ?? 0.0) * 1e-9;
+            if (!(aperture > 0.0) || !(lambda > 0.0) || !(psfFwhmArcsec > 0.0)
+                || !(plateScaleArcsecPerPixel > 0.0) || !(radiusInFwhm > 0.0))
+                return CcdEquation.GaussianEnclosedEnergy(radiusInFwhm);
+
+            // The atmospheric term only: the delivered FWHM already carries diffraction, and
+            // BuildKernel convolves the two, so handing it the delivered width would count
+            // diffraction twice. Zero or negative leaves a purely diffraction-limited profile.
+            double atmosphericFwhm = Math.Sqrt(Math.Max(0.0,
+                psfFwhmArcsec * psfFwhmArcsec
+                - OpticalPsf.AiryFwhmArcsec(aperture, detector.CentralObstructionFraction ?? 0.0, lambda)
+                * OpticalPsf.AiryFwhmArcsec(aperture, detector.CentralObstructionFraction ?? 0.0, lambda)));
+
+            // The kernel is sampled on a pixel grid, so a plate scale that puts the whole profile
+            // inside one pixel cannot resolve an aperture at all. Sample it finely enough that the
+            // integral means something, independently of the detector's own sampling.
+            const double SamplesPerFwhm = 6.0;
+            double scale = Math.Min(plateScaleArcsecPerPixel, psfFwhmArcsec / SamplesPerFwhm);
+            var cacheKey = (aperture, detector.CentralObstructionFraction ?? 0.0, lambda,
+                            Math.Round(atmosphericFwhm, 4), Math.Round(scale, 6),
+                            Math.Round(radiusInFwhm, 4));
+
+            lock (encircledLock)
+            {
+                if (encircledCache.TryGetValue(cacheKey, out double hit)) return hit;
+
+                float[] kernel = OpticalPsf.BuildKernel(
+                    scale, aperture, detector.CentralObstructionFraction ?? 0.0, lambda,
+                    atmosphericFwhm, 0.0, out int radiusPx);
+                if (kernel == null || radiusPx <= 0)
+                {
+                    double fallback = CcdEquation.GaussianEnclosedEnergy(radiusInFwhm);
+                    encircledCache[cacheKey] = fallback;
+                    return fallback;
+                }
+
+                double radiusPxAperture = apertureRadiusArcsec / scale;
+                int n = 2 * radiusPx + 1;
+                double inside = 0.0, all = 0.0;
+                for (int y = 0; y < n; y++)
+                    for (int xp = 0; xp < n; xp++)
+                    {
+                        double v = kernel[y * n + xp];
+                        all += v;
+                        double dx = xp - radiusPx, dy = y - radiusPx;
+                        inside += v * AperturePhotometry.PixelDiscOverlap(dx, dy, radiusPxAperture);
+                    }
+
+                // The kernel is truncated at its own support, so "all" is slightly under the true
+                // total and this ratio is slightly over. The support is many FWHM wide and the
+                // difference is far below the 0.15 the Gaussian assumption was wrong by.
+                double result = all > 0.0
+                    ? Math.Min(1.0, inside / all)
+                    : CcdEquation.GaussianEnclosedEnergy(radiusInFwhm);
+                encircledCache[cacheKey] = result;
+                return result;
+            }
+        }
+
+        private static readonly Dictionary<(double, double, double, double, double, double), double>
+            encircledCache = new Dictionary<(double, double, double, double, double, double), double>();
+        private static readonly object encircledLock = new object();
     }
 }

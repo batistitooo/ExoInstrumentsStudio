@@ -57,6 +57,43 @@ physics, vendored into this repository: clone it, run `./run.sh`, and nothing el
 on the machine. What that trade costs, and the check that stops the two copies drifting apart
 unnoticed, is in [CORE_PROVENANCE.md](CORE_PROVENANCE.md).
 
+## The light-curve mode
+
+The fourth mode is the only one that measures **across time** rather than within one frame, and it
+exists because a transit is not a picture: it is a ratio of one star to several others, followed
+across hours, and how stable that ratio is decides whether a planet is detectable.
+
+It runs the whole measurement, in five steps that used to need a shell for three of them:
+
+1. **Pick an instrument, or describe your own.** A form for the optics, the detector, the site and
+   as many bands as the instrument has, each with a top-hat or an uploaded CSV of measured
+   transmission. Nothing is guessed: an unsupplied quantity is derived by a stated relation,
+   declared unmodelled, or refused with the reason, and the instrument reports which. Definitions
+   survive a restart.
+2. **Take a probe frame and pick a host out of it.** The field's real stars, sortable by colour,
+   magnitude and signal-to-noise, with the ones too faint or saturated to serve marked as such.
+   One button puts a real star's position into the transit controls: the engine refuses a host
+   that is empty sky, and a host it cannot measure in every frame makes the recovered depth
+   meaningless.
+3. **Predict what the water will cost.** Loss against column per stellar temperature, the
+   differential that survives the target-over-ensemble ratio, absorbed against differential band by
+   band, the σ_PWV each band demands for a photometric budget you type in, and the comparison
+   ensemble's colour as a second axis: the one term an observer controls for free, and it moves
+   the requirement by a factor of four.
+4. **Run the sequence.** Frames at a regular interval down an airmass ladder, each reduced as it is
+   taken, through a water column you choose, with a transit of known depth injected into the star
+   you picked.
+5. **Fit the depth back out**, with the baseline and the transit fitted together rather than one
+   after the other, and export the series as CSV with every column a correction needs.
+
+The last panel puts the predicted bias and the recovered one side by side on the same field, the
+same instrument and the same stars: the only place either number can be checked against anything.
+
+The physics is all on the server. Not one quantity in that mode is computed in the browser: the
+page asks and the server answers, because the panel that once parsed a water record itself read a
+different column than the frame was exposed through. See
+[TECHNICAL_REFERENCE.md §5.10](TECHNICAL_REFERENCE.md).
+
 ## Accuracy
 
 Frames that look like photographs prove nothing. [**ACCURACY.md**](ACCURACY.md) is the evidence:
@@ -97,7 +134,7 @@ Point it at them with `EXOINSTRUMENTS_DATA=/path/to/PluginData`, or drop them in
 built by the mod's `tools/setup_data.py`; a KSP install that already has them is found
 automatically.
 
-## Star field depth, and the sky you cannot download
+## Star field depth, and the sky you can download after all
 
 The catalogue depth that matters is set by the instrument, not by taste. Ask Studio what the
 instrument can see:
@@ -111,88 +148,86 @@ G = 13, which is the depth most people build first, is nine magnitudes short of 
 that file holds 179 stars per square degree, so an RC20 frame of 0.0685 square degrees contains
 about twelve. A real 300 s sub holds hundreds.
 
-Depth all the way to the detection limit cannot be had for the whole sky. Gaia DR3 is 1.81 billion
-sources, essentially complete to G = 20; that is roughly 17 GB in this format, which a disk can
-hold, but no archive query delivers 1.2 billion rows in any useful time, and the bulk release is
-753 GB of gzipped CSV to extract the five columns this format keeps. Measured against a real
-target list, the depth is also wildly uneven, which is the part that makes an all-sky number
-misleading:
+The depth is also wildly uneven, which is the part an all-sky average hides:
 
-| field | stars per deg^2 at G < 20 | per RC20 frame | 0.5 deg patch |
-|---|---|---|---|
-| M51 (Whirlpool) | 1,696 | 116 | 19 kB |
-| M42 (Orion) | 4,907 | 336 | 53 kB |
-| M31 (Andromeda) | 12,549 | 860 | 135 kB |
-| Veil (Cygnus) | 58,134 | 3,982 | 0.6 MB |
-| Scutum star cloud | 92,399 | 6,329 | 1.0 MB |
-| Carina Nebula | 124,928 | 8,558 | 1.3 MB |
-| Omega Centauri | 261,843 | 17,936 | 2.7 MB |
-
-A hundred and fifty fold spread, and every one of those patches is small. So the arrangement is
-layered: a shallow catalogue over the whole sky so no pointing is ever empty, and deep patches over
-the fields actually being photographed.
-
-**A patch is not an approximation.** It holds exactly the rows an all-sky build of the same depth
-would hold over the same ground: same archive query, same conversions, same records. Nothing is
-sampled, thinned or interpolated. The M51 patch above is 1,332 stars, and `SELECT COUNT(*)` over
-the identical region returns 1,332.
-
-**What a patch can do wrong is not reach far enough**, and that failure is silent in the worst way:
-a frame half inside the patch comes out with stars on one side and bare sky on the other, which
-reads as data rather than as absence. `Simulation/StarFieldCatalogs.cs` removes it by construction.
-
-- **A patch serves a frame only if it covers all of it**, tested as exact spherical containment
-  against the same search cone the camera uses, trailing margin included. A frame that hangs over
-  the edge falls back to the all-sky catalogue, which is shallower but never partial, and the
-  capture says which patch fell short and by how much.
-- **Exactly one catalogue serves a frame.** Layers are never merged: two files over the same ground
-  hold the same bright stars, and depositing both would draw every shared star twice at twice its
-  flux.
-- **A patch that would lose stars is refused.** Replacement is only safe while the patch is a
-  superset, which it is when both come from the same archive with the same cut, since G < 20
-  contains G < 13. It is checked rather than assumed: every star the all-sky file has inside the
-  patch must be in the patch, or the patch is rejected and says which star it dropped.
-- **A patch that does not match its own manifest line is refused**, and so is one whose declination
-  index contradicts its records, checked exactly by reading them. That last one is the fault that
-  renders an empty sky while the file loads, counts and decodes perfectly.
-
-Measured on this machine, RC20, 300 s, binning 4, before and after installing G < 21 patches of
-0.6 degree radius:
-
-| field | with the G < 13 catalogue alone | with a patch |
+| field | stars per deg^2 at G < 20 | per RC20 frame |
 |---|---|---|
-| M51 | 3 stars | 594 |
-| M31 | 16 | 6,059 |
-| M42 | 68 | 1,435 |
-| Veil | 44 | 7,293 |
-| Carina | 178 | 15,050 |
-| Omega Centauri | 761 | 94,354 |
+| M51 (Whirlpool) | 1,696 | 116 |
+| M42 (Orion) | 4,907 | 336 |
+| M31 (Andromeda) | 12,549 | 860 |
+| Veil (Cygnus) | 58,134 | 3,982 |
+| Scutum star cloud | 92,399 | 6,329 |
+| Carina Nebula | 124,928 | 8,558 |
+| Omega Centauri | 261,843 | 17,936 |
 
-All six patches together are 9.1 MB.
+A hundred and fifty fold spread. Studio used to answer it with deep **patches**: a cone of stars
+around one pointing, used for a frame only when it covered the whole of that frame's search cone,
+with coverage tests, near-miss reporting and a superset check to keep a partial patch from putting
+stars on one side of a frame and bare sky on the other. It worked, and it was a tool you had to
+plan around, which is the wrong way round: the sky did something at the edge of a patch that the
+sky does not do.
 
-Build them with `tools/fetch_star_patch.py`, which writes the coverage line from the arguments it
-actually passed to the packer rather than leaving it to be typed in afterwards:
+**None of it is here any more.** `tools/build_allsky_catalog.py` builds the whole of Gaia DR3 at
+full depth, 1,806,254,432 sources in 25.3 GB, out of the bulk release rather than the query
+service that cannot deliver it. `RenderedStarCatalog` memory maps the file, so a frame's cost is
+the handful of declination bands its cone touches and not the file. Every pointing is served at
+that depth, so there is no edge left to fall off and nothing to plan around.
+
+Measured on this machine, the same M13 field, RC20, 120 s, binning 1, reduced by
+`Simulation/FrameReduction.cs`: **99 stars with the G < 13 catalogue, 1,642 with the full one.**
+
+### Two catalogues, because the chart and the camera read differently
+
+Both cover the whole sky. What differs is how they are read, and it is the reader that sets the
+size each can afford:
+
+- **The sky chart streams its catalogue in full on every render**, because a chart of the whole
+  sky needs every star once and `RenderedStarCatalog` only answers cones. That is
+  `GaiaStarCatalog.starcat`, of the order of a hundred megabytes.
+- **A frame reads one cone** out of a memory mapped file and never touches the rest, so it is
+  indifferent to the file's size and cares only about its depth. That is `GaiaAllSky.starcat`.
+
+`Simulation/StarFieldCatalogs.cs` holds the rule, which is now one line: frames come from the deep
+file when it is installed, from the chart's when it is not. **Exactly one catalogue serves a
+frame** — never both, because the two hold the same bright stars and depositing both would draw
+every shared star twice at twice its flux — and the capture names the one it used.
+
+The deep file is tens of gigabytes, so what can be checked at load is what can be checked without
+reading it:
+
+- **its declination index has the right shape**, which is the fault that renders an empty sky while
+  the file loads, counts and decodes perfectly;
+- **it holds more stars than the chart's catalogue**, or it cannot be the deeper of the two
+  whatever it is called;
+- **a sample of the chart catalogue's own stars, across two dozen fields spread over the sky, is
+  present in it.** A deeper catalogue contains every star a shallower one has; a file that is
+  systematically wrong fails this, and one wrong in a single record does not, which is the honest
+  limit of a check that has to be instant.
+
+The exhaustive pass happens once, where it belongs, in the builder: it verifies every record is
+reachable before it will write the file at all.
+
+### The download is the whole cost
 
 ```bash
-python3 tools/fetch_star_patch.py --name M51 --ra 202.4696 --dec 47.1952 --radius 0.5 --gmax 20 --fov-arcmin 19.0 13.0
+python3 tools/build_allsky_catalog.py --out data/GaiaAllSky.starcat --jobs 8
 ```
 
-### When the query service will not answer
+Gaia's bulk release is 3,386 static gzipped files on a CDN, 753 GB, and this streams them: fetch
+one, keep the five columns the format needs, throw it away, move on. Peak disk is the output plus
+one source file. Conversion overlaps with the download and costs about an hour on eight cores;
+everything else is transfer. Interrupt it whenever and run the same command again — it resumes,
+and it only writes the finished catalogue once all 3,386 files have been read, because a catalogue
+missing a wedge of sky is the same silent failure as a bad index.
 
-TAP has job queues and per account limits, and a burst of legitimate queries can leave it
-resetting connections for hours. `--via cdn` reads Gaia's bulk release instead, which is 3,386
-static gzipped files on a CDN with no queue to be stuck in. The release is cut on HEALPix level 8,
-so one file is a contiguous patch of sky and a field needs one or two of them rather than the
-whole 753 GB.
+The bulk route also exists because the query service is not always available: TAP has job queues
+and per account limits, and a burst of legitimate queries can leave it resetting connections for
+hours. `tools/gaia_bulk.py` is the reader both paths share.
 
-The two routes are not approximations of each other, and that is checked rather than asserted:
-the M51 field at G < 20 is 1,332 stars by `SELECT COUNT(*)` on `gaiadr3.gaia_source`, 1,332 read
-out of the bulk files, and the catalogues the two produce are byte for byte identical. Rows go
-into the mod's packer either way, so Gaia's photometric relations stay in the one place that owns
-them.
-
-Bulk files are kept in `tools/gaia_bulk_cache/` and reused, so a second field in the same patch of
-sky costs nothing. `--discard-bulk` throws them away instead.
+**What it does not give you** is every star, only every star Gaia has. DR3 is complete for
+isolated sources to about G = 20.7 and thins beyond, saturates near G = 3, and under-counts in
+crowded fields where images blend — which is exactly where a globular cluster core is. That is the
+edge of what has been measured, not an artefact of this pipeline.
 
 ### A fault this found
 
@@ -201,8 +236,7 @@ That is not hypothetical: the packer bands stars with `DEC_BAND_WIDTH_DEG = 0.1`
 that width as a 4 byte float which reads back as 0.100000001490116119384765625, and
 `RenderedStarCatalog` bands with the stored value. A star landing within a part in ten million of
 a band edge goes into a band no search reads, and is permanently invisible while the file loads,
-counts and decodes perfectly. Measured: 2 of 99,263 stars in the Veil patch, and 83 of 7,369,627
-in a G < 13 all sky catalogue.
+counts and decodes perfectly. Measured: 83 of 7,369,627 stars in a G < 13 all sky catalogue.
 
 The root fix is one line in the packer, banding on the float32 value it is about to write:
 
@@ -212,17 +246,8 @@ DEC_BAND_WIDTH_DEG = struct.unpack("<f", struct.pack("<f", 0.1))[0]
 
 That cannot recover files already built, which is what the repair tool is for. It re-files every
 record by the reader's own rule, changes no photometry or position, and verifies the result before
-replacing anything.
-
-`--gmax` is a cut, not a promise of completeness. Gaia DR3 is complete to about G = 20.7 for
-isolated sources and thins out beyond, so a patch cut at 21 holds every source the archive has
-under that magnitude while the archive no longer holds every star. That is still the right thing
-to ask for, since the missing ones are below what the instrument resolves anyway.
-
-`--fov-arcmin` is worth passing: it computes the radius the frame actually needs, which is half its
-diagonal times the camera's 1.3 search margin, and refuses anything smaller. Record the base's own
-depth once with `--allsky-limit 13`, or Studio cannot tell whether a patch is deeper than the file
-it would replace. Anonymous archive access is fine at this size; the M51 field took 16 seconds.
+replacing anything. `build_allsky_catalog.py` bands on the stored width from the start, so the
+question cannot arise for a file it wrote.
 
 ## Why a local server rather than WebAssembly
 
@@ -452,6 +477,18 @@ Ported from the mod, each stage validated before the next:
 cd Verify && dotnet run
 ```
 
+And the site itself, against a running server, because the harness above never issues an HTTP
+request nor loads a page:
+
+```bash
+python3 tools/smoke_site.py --port 5227 --sequence
+```
+
+It asks the server the questions the browser asks and checks the answers are shaped the way the
+browser reads them. That is not a hypothetical division of labour: a null in `/api/forecast` and an
+instrument stored under its display name where every lookup wanted its key both shipped past a
+fully green harness, and neither is a physics fault.
+
 97 checks: the boundary stub against the mod, the minimum-mass correction against the
 published K, warp invariance across five configurations, sky geometry on a real Earth,
 51 Peg b recovered end to end, the streaming Gaia reader against the mod's own cone search,
@@ -459,7 +496,7 @@ the detector cooler reaching a colder floor at a colder site, Hubble's orbit aga
 published period and the ISS's own −5.0°/day nodal regression, a campaign reproducing itself
 from its seed to 0.0 m/s, the CCD equation reproducing both of its own asymptotes, and a
 measured QE curve costing depth in blue while leaving green alone, the forward model agreeing with
-its own inverse to 12 mmag once the colour term is applied, and a flat removing exactly the
+its own inverse to 6 mmag once the colour term is applied, and a flat removing exactly the
 published photo-response non-uniformity and the illumination falloff with it.
 
 That harness checks Studio against **itself**. The physics is checked against **other people's
@@ -487,7 +524,31 @@ Surfaced in the interface, not buried here.
   `ImagingObserverContext`, an additive change to `Core`.
 - Orbital phases come from the catalogue's arbitrary `PlanetPhaseOffset01`, not a real epoch
   of periastron. Periods and amplitudes are real; absolute phase is not.
-- Weather is excluded by design, as in the mod.
+- **Water vapour is modelled**, when a series is supplied and the transmission table is installed:
+  `T(λ, PWV, airmass)` from ESO's own telluric library, multiplied into the passband integral per
+  wavelength. The column is a pure function of `ut`, the frame's PWV and its series identifier go
+  into the FITS header, and a column outside the table's range is refused rather than extrapolated.
+  Build the table with `python3 tools/fetch_pwv_grid.py`; without it the term is declared absent.
+  Measured across the roster, 1 → 10 mm of water costs anywhere from **0.05 mmag** (SII) to
+  **67 mmag** (VLT FORS2's red arm) — three orders of magnitude, decided by the filter far more than
+  by the water. On the small astrographs' broadband filters it is 2–3 mmag; on **Hα it is 9 mmag**,
+  because a 7 nm passband centred at 656 nm sits inside a water feature and has nowhere to hide; on
+  VLT SPHERE's 500–900 nm Luminance it is 18, and on FORS2's 330–1200 nm curves it is 67.
+  ESO's library is the whole molecular atmosphere at a given column, not the water alone, and there
+  is no species-resolved version: at airmass 1 it puts 0.98 at 550 nm and 0.68 at 760 nm, neither of
+  which moves with the water — ozone's Chappuis band and molecular oxygen's A band. Both are divided
+  out by **referencing the table to its driest column (0.5 mm)**, so what is applied is the water in
+  excess of it and anything independent of the column cancels exactly. Only ozone was a double
+  count: the extinction law is pinned at V to 0.20 mag/airmass, a typical *measured* coefficient,
+  and a measured coefficient contains its ozone — applying the library's on top would have dimmed
+  every frame that switched water on by 25 mmag, none of it water. Oxygen was not: Studio models
+  none anywhere, so removing it is a choice made because the band does not vary with the water
+  column. **Studio still has no molecular oxygen**, and says so.
+- The rest of the weather is excluded by design, as in the mod: no cloud, no transparency variation
+  beyond the water term, no seeing variation through a night.
+- Frames are laid out **north up**, a fixed sky orientation, which is what every instrument in the
+  roster delivers (equatorial mounts, or alt-az with a derotator). A **requested position angle** is
+  not modelled: a real visit is scheduled at an orientation the observer asks for.
 - Sessions construct `new Random()` unseeded, so a run is not reproducible. Epoch times are
   fully deterministic (which is what the warp invariant is asserted on), but the noise draw
   is not. For a tool aimed at people who publish, a seed on the session constructors is worth
@@ -608,11 +669,47 @@ accidentally satisfy: four times the exposure buys 1.495 mag where read noise do
 ## Bias, dark and flat
 
 Calibration frames, as an observer takes them, each downloadable as FITS with the right `IMAGETYP`.
+The **Calibration** panel under a captured frame takes all three, shows what each measured, and
+reduces with them; the same thing over HTTP:
 
 ```bash
 curl -s -X POST http://127.0.0.1:5227/api/captures/<id>/calibration \
   -H 'Content-Type: application/json' -d '{"kind":"Flat","count":16}'
 ```
+
+### Or bring your own master
+
+Every master built above comes out of the **same model that wrote the light**, which makes a
+reduction using them a check on the arithmetic and nothing else: a defect the forward model does not
+have cannot be found by a calibration frame the forward model wrote. That circularity is not fixed
+by making the forward model better.
+
+Uploading a real master breaks it. Send the FITS as the raw body:
+
+```bash
+curl -s -X POST --data-binary @masterflat.fits \
+  'http://127.0.0.1:5227/api/captures/<id>/masters?kind=Flat'
+```
+
+A flat off a real camera brings dust motes, accessory vignetting and tree rings — structure this
+model does not generate and, for the last two, [explicitly declines to
+invent](TECHNICAL_REFERENCE.md). Dividing a simulated frame by it is the one calibration here that
+is not marking its own homework.
+
+**What gets checked, because a wrong master fails silently.** The arithmetic succeeds either way and
+the photometry is quietly wrong, so each of these is one silent failure turned into a refusal or a
+warning:
+
+| | |
+|---|---|
+| shape against the frame | **refused**, naming the binning the frame was taken at |
+| the file's own `IMAGETYP` against the kind you loaded it as | warned — one of the two is wrong and only you know which |
+| `EXPTIME` on a dark against the light's | warned with the ratio: a 600 s dark under a 60 s light removes ten times the thermal signal |
+| level against the detector's pedestal | warned — a master from another camera and an already-calibrated one both look like this |
+| saturated pixels, near-zero flat pixels, `BLANK` | warned; undefined pixels are held at the neutral value so they calibrate to no change |
+
+A flat's *normalisation* is deliberately not checked and not corrected: the reduction divides by the
+flat's own mean, so a flat at 30,000 ADU and the same flat scaled to 1.0 give identical results.
 
 **They remove something now, which they could not before.** Every stochastic term here used to be
 temporal, so stacking averaged it down and no calibration frame could touch it: a bias measured one
@@ -627,6 +724,7 @@ in the detector, so a frame carries two **fixed** patterns:
 | cosine-fourth illumination | multiplies light, large scale | division by a flat | geometric, from focal length and off-axis distance |
 | field stop and image circle | hard edged | division by a flat | FORS2's 6.8 × 6.8 arcmin stop (ESO) |
 | non-linearity | curvature against signal | **nothing in the standard set** | 1.8 % at full well (FORS2) |
+| charge-transfer smear | adds each row's light to every row after it | a desmear, after the bias and before the flat | the transfer time, on a shutterless device |
 
 **FORS2 is the case that shows it.** ESO publishes a 6.8 arcmin stop against a detector spanning 8.6,
 so 62 % of the frame is lit and roughly a third sees no sky at all. A 2 s frame on M13 comes out with
@@ -676,13 +774,13 @@ detection, aperture photometry, and a zero point fitted from the field.
 curl -s "http://127.0.0.1:5227/api/captures/<id>/photometry"
 ```
 
-RC20 at Roque de los Muchachos, M13, 120 s, binning 1:
+RC20 at Roque de los Muchachos, North Galactic Pole, 120 s, binning 1:
 
 | | |
 |---|---|
-| **median &#124;recovered − injected&#124;** | **6.8 mmag** |
-| **zero point, from the pixels vs from the passband integral** | 22.0967 vs 22.1584, **0.062 mag apart** |
-| drift of that agreement over a factor 2 in exposure | **0.6 mmag**, so the gain enters once |
+| **median &#124;recovered − injected&#124;** | **11.6 mmag** |
+| **zero point, from the pixels vs from the passband integral** | **0.060 mag apart** |
+| drift of that agreement over a factor 2 in exposure | **2.5 mmag**, so the gain enters once |
 
 **It also measured something Core says is unknown.** `CcdEquation` assumes a Gaussian encircled
 energy of 0.7226 inside the photometric aperture, and its own comment says that is optimistic
@@ -713,7 +811,7 @@ practice rather than a fix for a fault (Bessell 2005). Measured from the field: 
 | **sum** | **0.067** against a measured **0.062** |
 | **with the colour term applied** | **−11.7 mmag** |
 
-So **the forward model and its inverse agree to 12 millimagnitudes**, and what looked like a
+So **the forward model and its inverse agree to better than 7 millimagnitudes**, and what looked like a
 discrepancy was two textbook effects plus a comparison made on the wrong scale. The endpoint now
 serves the colour term and the colour-matched zero point alongside the raw one.
 
@@ -730,7 +828,7 @@ instrument, site, start date and seed, and the run repeats epoch for epoch, to 0
 This closed a real gap rather than adding a convenience: both session constructors used an unseeded
 `new Random()`, so no radial-velocity or transit result could be reproduced by anyone, including the
 person who produced it. The imaging path never had the problem, since its seed goes into the FITS
-header as `RANDSEED`. The fix touches two vendored files and is recorded as a fork in
+header as `RANDSEED`. The fix touches two of the copied files and is recorded in
 [CORE_PROVENANCE.md](CORE_PROVENANCE.md); it is additive, so the mod can take it as a paste, and it
 should.
 
@@ -795,6 +893,54 @@ the orbit is circular and does not decay; the Sun is on the real ecliptic for th
 the ground path keeps Core's declination-0 Sun; one roll angle, where a real visit is
 scheduled at a requested ORIENT; and no South Atlantic Anomaly cosmic rays or IR-channel
 persistence.
+
+**Forty-six Studio bugs found while adding the water term**, none of them by reading the code. Five
+while building it. Six more when the finished term was handed to an adversarial audit told to prove
+the first five were not really fixed — the audit broke none of the five and found the *interface*
+around them wrong in six ways. Then nine more when a full twelve-agent audit went at all eleven and
+produced a hundred raw findings, and twenty-six more when that output was triaged in full against the
+tree. The sharpest of the lot: **the passband integral had never been converged** — 257 fixed
+quadrature nodes against a line forest sampled at 0.05 nm, so nudging a band edge by 0.01 nm swung
+the answer 30 % and every effective-width figure published here was a quadrature artefact (Luminance
+3.6 → 2.8 mmag, Red 3.8 → 3.2). Also: **the term was silently dropped
+whenever a passband ran past the table while the frame still recorded a water column** (VLT FORS2
+frames were bit-identical to dry ones and claimed 20 mm), and **the published conclusion that the
+term was small on this roster was false** — asserted from RC20 alone, when Hα costs 9 mmag on every
+instrument and FORS2's red arm costs 67. **(1)** The product curve was built over 1.5× the nominal bandwidth — the margin the
+chromatic sub-bands use — which widened Luminance from 685 to 751 nm, walked the band into a water
+feature, and made the *bluer* filter look more water-sensitive than the redder one. **(2)** The
+analytic water series was anchored to `DateTime.UtcNow`, the moment the request arrived, so the same
+booked night came back with a different column and a different identifier on every submission; every
+unit check passed, and it took a check that posts the same request twice over HTTP to see it.
+**(3)** ESO's library is the whole molecular atmosphere at a given water column, not the water
+alone, so applying it raw counted ozone and molecular oxygen a second time against a site extinction
+coefficient that was measured and already contained them — about 25 mmag in Luminance, none of it
+water. Referencing every slice to the driest column removes them exactly, because they do not vary
+with the column. **(4)** Asking the transmission endpoint for a span finer than the table's 0.02 nm
+bins averaged over no samples and returned a NaN, which reached the wire as a JSON *string* in a
+numeric field — nothing errored, and a plot would have drawn a break that looked like physics.
+**(5)** The interface plotted the transmission at a hardcoded airmass 1.5 while the frame would be
+exposed at whatever the scheduler picked; water scales with the air column, so the panel was showing
+a different night. `/api/forecast` now carries the airmass of every cell and the panel uses the one
+the frame will be taken at.
+
+Then, from the audit: **(6)** the panel parsed a pasted water record itself and took the **last**
+token of each line where `PwvSeries.Parse` takes the second — so the three-column GNSS record the
+panel's own placeholder advertises had its *uncertainty* column plotted while the frame was exposed
+through its water column, and a semicolon-separated record had its year harvested as 2026 mm. There
+is now one parser: `POST /api/pwv/series` resolves the series with the code that will drive the
+frame, and the panel plots what it returns. **(7)** The water control was never hidden for an
+orbital instrument, the request still carried the series, and the server dropped it while still
+stamping `PWVSRC` into the header — a water-vapour provenance card on photons that never crossed an
+atmosphere. Now refused, and the control is hidden. **(8)** The panel's stale-response guard was
+never taken by the paths that *hide* the panel, so an in-flight response re-opened it: a confident
+transmission plot under a control reading "not modelled". **(9)** A blank number box in constant
+mode fell through to the measured branch and plotted a hidden textarea. **(10)** `Dto.Sequence`
+never emitted `pwv`, so the panel's water line was dead and **every run, wet or dry, was captioned
+"no water-vapour term"** — a screenshot of a 20 mm run documented it as a control. **(11)** Kasten &
+Young returns 0.99971 straight overhead, so the water table refused every field within 1.39° of
+the zenith — the best-placed fields at any site — with a message that rounded the offending value to
+"1" and said 1 was outside 1 to 3.
 
 **A Studio bug found here:** `onInstrumentChange` called `refreshModeChips()`, which has never
 existed. Selecting *any* astrograph threw a `ReferenceError` on that line, so everything after

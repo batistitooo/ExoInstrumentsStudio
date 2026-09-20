@@ -47,9 +47,36 @@
     <!-- Bias, dark and flat, and the fixed patterns that give them something to remove. -->
     <Compile Include="$(StudioRoot)\Simulation\CalibrationFrames.cs" />
     <Compile Include="$(StudioRoot)\Simulation\ObservingPlan.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\PwvTransmission.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\PwvSeries.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\TransitInjection.cs" />
+    <!-- Section 19: the airmass ladder, and whether it is placed in darkness. -->
+    <Compile Include="$(StudioRoot)\Simulation\PhotometricSequence.cs" />
+    <!-- The water term as a programme meets it: the requirement, the transfer function
+         and the depth estimator that reads both. Section 17 checks them against the
+         library with no HTTP at all; tools/smoke_site.py checks the wire agrees. -->
+    <Compile Include="$(StudioRoot)\Simulation\PwvRequirement.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\PwvTransitBias.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\TransitDepthFit.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\Yield\Population.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\Yield\Programme.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\Yield\LightCurveSource.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\Yield\YieldMap.cs" />
     <Compile Include="$(StudioRoot)\Data\CatalogService.cs" />
     <Compile Include="$(StudioRoot)\Data\CatalogCrossReference.cs" />
     <Compile Include="$(StudioRoot)\Data\GaiaCatalogReader.cs" />
+    <!-- Section 20: the research record. Compiled here so the harness can save runs, assess a
+         CTOI and refuse a sector with no archive in reach; every network client is handed an
+         HttpClient whose handler refuses, and the checks never wait on the wire. -->
+    <Compile Include="$(StudioRoot)\Research\FitsBinaryTable.cs" />
+    <Compile Include="$(StudioRoot)\Research\TransitSearchPipeline.cs" />
+    <Compile Include="$(StudioRoot)\Research\SingleTransitSearch.cs" />
+    <Compile Include="$(StudioRoot)\Research\MastClient.cs" />
+    <Compile Include="$(StudioRoot)\Research\HlspDirect.cs" />
+    <Compile Include="$(StudioRoot)\Research\KnownObjects.cs" />
+    <Compile Include="$(StudioRoot)\Research\KnownHostRegister.cs" />
+    <Compile Include="$(StudioRoot)\Research\CtoiSubmission.cs" />
+    <Compile Include="$(StudioRoot)\Research\ResearchService.cs" />
 
     <!-- The vendored physics core, unchanged. -->
     <Compile Include="$(CoreRoot)Core\**\*.cs" />

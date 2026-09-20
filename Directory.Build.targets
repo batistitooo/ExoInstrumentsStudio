@@ -1,0 +1,17 @@
+<Project>
+
+  <!--
+    On a drive that cannot store extended attributes, macOS keeps each file's attributes in a
+    separate ._ file beside it. On exFAT - the format a drive shared with Windows has to use - nearly
+    every file gets one, and ._Program.cs is 4 KB of binary metadata that the **\*.cs includes pick
+    up exactly as they pick up Program.cs. MSBuild listed 171 of the Engine's 343 compile items as
+    such files the first time it evaluated the project from such a drive.
+
+    They are removed here rather than in Directory.Build.props because a Remove only reaches items
+    that already exist, and this file is imported after each project has declared its own.
+  -->
+  <ItemGroup>
+    <Compile Remove="$(MSBuildThisFileDirectory)**/._*" />
+  </ItemGroup>
+
+</Project>

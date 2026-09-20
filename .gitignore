@@ -10,6 +10,9 @@ validation-env/
 # machine from the surveys; together they run to hundreds of megabytes. data/ITSELF is tracked,
 # because the two small catalogues below live there.
 data/*.starcat
+# and the all-sky build's sidecars: proper motion, source ids, astrophysical parameters,
+# 32 GB between them, which git should never be offered.
+data/*.starcat.*
 data/*.dustmap
 data/*.emission
 data/*.patchset
@@ -18,6 +21,17 @@ data/*.galimg
 data/*.cache/
 # The patch manifest describes whichever local patch files exist, so it is local too.
 data/GaiaPatches.manifest
+# The water-vapour transmission grid and the ESO tarball it is built from: 7 MB and 180 MB,
+# somebody else's data, and rebuildable with tools/fetch_pwv_grid.py. Studio declares the term
+# absent at /api/capture/data when the grid is not there, the same as it does for the sky maps.
+data/PwvTransmission.grid
+# Instruments the observer defined, written back so they survive a restart. Somebody's own
+# telescope is their record and not this repository's: it names their site, their detector and
+# often an unpublished QE curve. Rebuildable by POSTing it again, and exportable from the
+# instrument panel when it IS meant to be shared.
+data/CustomInstruments.json
+data/CustomInstruments.json.tmp
+data/pwv_R60k.tar.gz
 # Bulk Gaia files, downloaded on demand and reused; gigabytes, and rebuildable.
 tools/gaia_bulk_cache/
 # The all sky build's scratch: per band buckets and in flight source files, tens of GB,

@@ -132,7 +132,12 @@ namespace ExoStudio.Simulation
             r.CollectingAreaCm2 = areaCm2;
 
             double wavelength = DeepSkyCamera.FilterCentralWavelengthMeters(spec, filter);
-            SystemResponse response = DeepSkyCamera.BuildSystemResponse(spec, filter, airmass);
+
+            // The site's air column, not the spec's home mountain, exactly as Prepare now
+            // evaluates it: a limit quoted through the wrong altitude would disagree with the
+            // frame taken afterwards for no physical reason.
+            double atmosphereAltM = DeepSkyCamera.AtmosphereAltitudeMeters(spec, site);
+            SystemResponse response = DeepSkyCamera.BuildSystemResponse(spec, filter, airmass, atmosphereAltM);
 
             // --- the delivered PSF -----------------------------------------------------
             // Measured off the real obstructed profile rather than quoted from 1.028 lambda/D,
@@ -192,7 +197,7 @@ namespace ExoStudio.Simulation
             {
                 double zenithDistance = Math.Acos(Math.Clamp(1.0 / airmass, -1.0, 1.0)) * 180.0 / Math.PI;
                 double transmission = AtmosphericImagingNoise.ExtinctionTransmissionAt(
-                    airmass, wavelength, spec.SiteAltitudeMeters);
+                    airmass, wavelength, atmosphereAltM);
 
                 // Astronomical night: the Sun deep enough that the twilight term has died away.
                 // Quoting a limiting magnitude in twilight would not be a limit.

@@ -77,6 +77,23 @@ namespace ExoInstruments.Visualization
             // exposure and nothing else, and no amount of later processing can recover them.
             /// <summary>Airmass at the field centre. NaN or non-finite when the target was below the horizon.</summary>
             public double Airmass;
+
+            /// <summary>
+            /// Precipitable water vapour above the telescope at DATE-OBS, millimetres, and the
+            /// identifier of the series it came from. NaN and null leave both cards out, which is
+            /// the honest statement that the term was not modelled for this frame - different from
+            /// writing zero, which would claim a dry sky was simulated.
+            ///
+            /// Real observatories put PWV in their headers, because a reduction that wants to
+            /// correct for it has to know what it was. So does this.
+            /// </summary>
+            /// <summary>
+            /// NaN when the term was not modelled. A struct cannot carry a field initialiser, so
+            /// every caller sets it explicitly - which is the right shape anyway: nothing should
+            /// inherit "no water" by forgetting to say so.
+            /// </summary>
+            public double PwvMm;
+            public string PwvSeriesId;
             /// <summary>
             /// The atmospheric FWHM (arcsec) the PSF was actually built with, and the instrument's
             /// diffraction-core FWHM at this filter. Written as two separate keywords rather than
@@ -292,6 +309,10 @@ namespace ExoInstruments.Visualization
         {
             if (IsFinite(info.Airmass) && info.Airmass >= 1.0)
                 AppendCard(sb, "AIRMASS", info.Airmass.ToString("F4", CultureInfo.InvariantCulture), "airmass at field centre");
+            if (IsFinite(info.PwvMm) && info.PwvMm >= 0.0)
+                AppendCard(sb, "PWV", info.PwvMm.ToString("F3", CultureInfo.InvariantCulture), "precipitable water vapour (mm)");
+            if (!string.IsNullOrEmpty(info.PwvSeriesId))
+                AppendCard(sb, "PWVSRC", "'" + info.PwvSeriesId + "'", "water-vapour series identifier");
             if (IsFinite(info.SeeingFwhmArcsec) && info.SeeingFwhmArcsec > 0.0)
                 AppendCard(sb, "SEEING", info.SeeingFwhmArcsec.ToString("F4", CultureInfo.InvariantCulture), "atmospheric FWHM used (arcsec)");
             if (IsFinite(info.DiffractionFwhmArcsec) && info.DiffractionFwhmArcsec > 0.0)
@@ -415,27 +436,27 @@ namespace ExoInstruments.Visualization
                 AppendCommentaryCard(sb, "HISTORY", "unguided: WCS valid at DATE-OBS; sources are trailed");
         }
 
-        /// <summary>Right ascension as hours, minutes and seconds: the sexagesimal form OBJCTRA carries by convention.</summary>
-        private static string FormatRaSexagesimal(double raDeg)
+        /// <summary>
+        /// Right ascension as hours, minutes and seconds: the sexagesimal form OBJCTRA carries by
+        /// convention. ROUNDED FIRST, in hundredths of a second, THEN split: the old float split
+        /// truncated the hours and minutes and rounded only the seconds, so 59.995 s printed as
+        /// "60.00" instead of carrying into the next minute. Public so the harness can pin it.
+        /// </summary>
+        public static string FormatRaSexagesimal(double raDeg)
         {
             double hours = ((raDeg % 360.0) + 360.0) % 360.0 / 15.0;
-            int h = (int)hours;
-            double remainderMinutes = (hours - h) * 60.0;
-            int m = (int)remainderMinutes;
-            double s = (remainderMinutes - m) * 60.0;
-            return string.Format(CultureInfo.InvariantCulture, "{0:00} {1:00} {2:00.00}", h, m, s);
+            long total = (long)Math.Round(hours * 360000.0) % (24L * 360000L);
+            long h = total / 360000L, m = (total / 6000L) % 60L, s = total % 6000L;
+            return string.Format(CultureInfo.InvariantCulture, "{0:00} {1:00} {2:00}.{3:00}", h, m, s / 100L, s % 100L);
         }
 
-        /// <summary>Declination as degrees, arcminutes and arcseconds, sign always explicit.</summary>
-        private static string FormatDecSexagesimal(double decDeg)
+        /// <summary>Declination as degrees, arcminutes and arcseconds, sign always explicit; same carry rule.</summary>
+        public static string FormatDecSexagesimal(double decDeg)
         {
             char sign = decDeg < 0.0 ? '-' : '+';
-            double absolute = Math.Abs(decDeg);
-            int d = (int)absolute;
-            double remainderMinutes = (absolute - d) * 60.0;
-            int m = (int)remainderMinutes;
-            double s = (remainderMinutes - m) * 60.0;
-            return string.Format(CultureInfo.InvariantCulture, "{0}{1:00} {2:00} {3:00.0}", sign, d, m, s);
+            long total = (long)Math.Round(Math.Abs(decDeg) * 36000.0);
+            long d = total / 36000L, m = (total / 600L) % 60L, s = total % 600L;
+            return string.Format(CultureInfo.InvariantCulture, "{0}{1:00} {2:00} {3:00}.{4}", sign, d, m, s / 10L, s % 10L);
         }
 
         private static bool IsFinite(double v) => !double.IsNaN(v) && !double.IsInfinity(v);
@@ -448,13 +469,28 @@ namespace ExoInstruments.Visualization
 
         private static void AppendStringCard(StringBuilder sb, string keyword, string value, string comment)
         {
-            string safe = (value ?? "unknown").Replace("'", "");
+            // A SINGLE QUOTE IS DOUBLED, NOT DELETED. The FITS standard escapes a quote inside a
+            // string by writing it twice, and a reader un-doubles it. This used to strip the
+            // character instead, which never produced an invalid card and never said anything -
+            // an instrument whose filter is labelled I+z' recorded FILTER = 'I+z', and the frame
+            // then claimed a band it was not taken in. Deleting a character from a value is the
+            // same class of fault as rounding one silently.
+            //
             // The card is truncated to 80 bytes at the end, so a long value would lose its own
             // CLOSING QUOTE and leave an unparseable card behind. Bounding the value here means an
             // over-long one costs its tail and the comment, never the syntax. 68 = 80 - 8 for the
-            // keyword - 2 for "= " - 2 for the quotes.
+            // keyword - 2 for "= " - 2 for the quotes. The budget is spent on the ESCAPED text and
+            // a doubled pair is never split, because half a pair is a lone quote and that ends the
+            // string early - exactly the breakage the old truncation was written to avoid.
             const int MaxValueLength = 68;
-            if (safe.Length > MaxValueLength) safe = safe.Substring(0, MaxValueLength);
+            var escaped = new StringBuilder();
+            foreach (char ch in value ?? "unknown")
+            {
+                string piece = ch == '\'' ? "''" : ch.ToString();
+                if (escaped.Length + piece.Length > MaxValueLength) break;
+                escaped.Append(piece);
+            }
+            string safe = escaped.ToString();
             string quoted = "'" + safe.PadRight(Math.Max(8, safe.Length)) + "'";
             string card = keyword.PadRight(8) + "= " + quoted + " / " + comment;
             sb.Append(FitCard(card));

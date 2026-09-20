@@ -39,7 +39,7 @@ recover numbers already on the disk is not a repair, it is a re-run.
 
 USAGE
 
-    python3 tools/reindex_starcat.py data/GaiaPatch-Veil.starcat
+    python3 tools/reindex_starcat.py data/GaiaStarCatalog.starcat
     python3 tools/reindex_starcat.py --check-only path/to/GaiaStarCatalog.starcat
 
 Without --check-only the file is rewritten in place, through a temporary file that is only moved

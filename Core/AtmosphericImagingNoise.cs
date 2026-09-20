@@ -65,9 +65,10 @@ namespace ExoInstruments.Core
         /// The SHAPE is physics: Rayleigh scattering above (an exact function of wavelength and
         /// of the air column over the site), plus an aerosol term following the Angstrom
         /// lambda^-alpha turbidity law. The AMPLITUDE of the aerosol term is not invented
-        /// either: it is whatever residual makes the total at Johnson V come out at this
-        /// site's own measured ExtinctionMagPerAirmass, since aerosol loading is precisely the
-        /// site-dependent part of extinction. Ozone's Chappuis band (~0.01-0.02 mag in the
+        /// either: it is whatever residual makes the total at Johnson V come out at
+        /// ExtinctionMagPerAirmass, a typical MEASURED coefficient for a good site. Note what that
+        /// is and is not: 0.20 is a single const shared by every site, not a per-site figure - this
+        /// comment used to say "this site's own measured" and there is no such value in the code. Ozone's Chappuis band (~0.01-0.02 mag in the
         /// visible) is not modelled separately; it is absorbed into that same residual.
         /// </summary>
         public static double ExtinctionMagPerAirmassAt(double wavelengthMeters, double siteAltitudeMeters)
