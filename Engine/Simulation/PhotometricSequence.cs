@@ -444,6 +444,16 @@ namespace ExoStudio.Simulation
 
             var ratio = new List<double>();
             var photon = new List<double>();
+            // WHICH FRAME EACH RATIO CAME FROM, and it has to be carried rather than assumed.
+            // A frame whose target or ensemble flux is not positive produces no ratio, so the
+            // ratio series is shorter than the frame list as soon as one is dropped. Everything
+            // downstream - the airmass fit, the detrended residual, the plotted curve and the
+            // fittable series - pairs a ratio with a frame, and pairing by position silently
+            // shifts every epoch after the first gap onto the wrong airmass, water column, time
+            // and injected transit factor. Fit's own Math.Min then trimmed the ends and nothing
+            // complained. The frames most likely to be dropped are the brightest, which is
+            // exactly where a saturation or non-linearity study looks.
+            var kept = new List<int>();
             var ens = new double[usable.Count];
             for (int i = 0; i < usable.Count; i++)
             {
@@ -451,32 +461,44 @@ namespace ExoStudio.Simulation
                 double fc = comps.Sum(c => flux[c][i]);
                 ens[i] = fc;
                 if (!(ft > 0.0) || !(fc > 0.0)) continue;
+                kept.Add(i);
                 ratio.Add(ft / fc);
                 double st = ft / snr[target][i];
                 double sc2 = comps.Sum(c => Math.Pow(flux[c][i] / snr[c][i], 2.0));
                 photon.Add(Math.Sqrt(st * st / (ft * ft) + sc2 / (fc * fc)));
             }
             if (ratio.Count < 5) { a.Notes.Add("Too few frames produced a usable ratio."); return a; }
+            if (kept.Count < usable.Count)
+                a.Notes.Add($"{usable.Count - kept.Count} of {usable.Count} frames produced no ratio, because "
+                          + "the target or the ensemble measured a flux that was not positive there. Those "
+                          + "frames are absent from the series rather than realigned onto their neighbours.");
+
+            // The airmass OF THE FRAMES THAT PRODUCED A RATIO, which is what the fit is entitled to.
+            double[] Xr = kept.Select(i => X[i]).ToArray();
 
             double m = ratio.Average();
             double[] norm = ratio.Select(r => r / m).ToArray();
             a.RawPpt = Rms(norm) * 1000.0;
             a.PhotonPpt = Math.Sqrt(photon.Select(p => p * p).Average()) * 1000.0;
 
-            Fit(X, norm, out double slope, out double intercept, out _);
-            double[] det = norm.Select((v, i) => v - (intercept + slope * X[i])).ToArray();
+            Fit(Xr, norm, out double slope, out double intercept, out _);
+            double[] det = norm.Select((v, i) => v - (intercept + slope * Xr[i])).ToArray();
             a.DetrendedPpt = Rms(det) * 1000.0;
-            a.DriftPpt = Math.Abs(slope) * (a.AirmassMax - a.AirmassMin) * 1000.0;
+            // Over the range the slope was actually fitted on, not the range of the whole run:
+            // extrapolating a fitted drift across frames that contributed nothing to the fit
+            // would report a drift that was never measured.
+            a.DriftPpt = Math.Abs(slope) * (Xr.Max() - Xr.Min()) * 1000.0;
             a.RawRatio = a.PhotonPpt > 0 ? a.RawPpt / a.PhotonPpt : double.NaN;
             a.Ratio = a.PhotonPpt > 0 ? a.DetrendedPpt / a.PhotonPpt : double.NaN;
-            for (int i = 0; i < norm.Length; i++) a.Curve.Add((X[i], norm[i]));
+            for (int i = 0; i < norm.Length; i++) a.Curve.Add((Xr[i], norm[i]));
 
             // The fittable form, carrying the frame's own conditions and the injected truth.
             a.EnsembleBv = comps.Average(c => bv[c]);
-            for (int i = 0; i < norm.Length && i < usable.Count; i++)
-                a.Series.Add((usable[i].Ut, usable[i].Airmass, usable[i].PwvMm,
-                              usable[i].TransitFactor, norm[i],
-                              i < photon.Count ? photon[i] * 1000.0 : double.NaN));
+            for (int i = 0; i < norm.Length; i++)
+            {
+                FrameRow f = usable[kept[i]];
+                a.Series.Add((f.Ut, f.Airmass, f.PwvMm, f.TransitFactor, norm[i], photon[i] * 1000.0));
+            }
 
             // The colour trend: every star's own drift against the same ensemble, then those
             // slopes against colour. The zero point of the slope-vs-colour line depends on the
@@ -524,11 +546,29 @@ namespace ExoStudio.Simulation
             return Math.Sqrt(v.Sum(x => (x - m) * (x - m)) / (v.Count - 1));
         }
 
+        /// <summary>
+        /// The line fit below, exposed so a harness can assert that it REFUSES a length mismatch.
+        /// That refusal is the guard against the misalignment described on the ratio loop above,
+        /// and a guard that nothing exercises is only a comment.
+        /// </summary>
+        public static void FitForTests(double[] x, double[] y,
+                                       out double slope, out double intercept, out double slopeError)
+            => Fit(x, y, out slope, out intercept, out slopeError);
+
         /// <summary>Least squares y = a + b x, with the standard error on b.</summary>
         private static void Fit(double[] x, double[] y, out double b, out double a, out double bErr)
         {
             b = a = bErr = double.NaN;
-            int n = Math.Min(x.Length, y.Length);
+            // A LENGTH MISMATCH IS A CALLER BUG, NOT A SHAPE TO ACCOMMODATE. This used to take
+            // Math.Min of the two and fit whatever overlapped, which turned a misalignment
+            // between a series and its abscissa into a slightly wrong slope instead of an error.
+            // Refusing is the behaviour that would have surfaced it the first time.
+            if (x.Length != y.Length)
+                throw new ArgumentException(
+                    $"Fit was given {x.Length} abscissae and {y.Length} ordinates. They index the same "
+                    + "frames, so a mismatch means the caller has lost track of which value belongs to "
+                    + "which frame, and any line through them would be meaningless.");
+            int n = x.Length;
             if (n < 3) return;
             double mx = x.Take(n).Average(), my = y.Take(n).Average();
             double sxx = 0.0, sxy = 0.0;

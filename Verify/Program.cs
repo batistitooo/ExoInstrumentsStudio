@@ -3653,6 +3653,114 @@ Section("20. The research record: ids that cannot collide, a readiness that read
     }
 }
 
+Section("21. A dropped frame leaves a gap in the differential series, it does not shift every epoch after it");
+{
+    // THE BUG THIS PINS. Analyse built the airmass array over every usable frame but appended a
+    // ratio only for frames where the target and the ensemble both measured a positive flux.
+    // Everything downstream then paired ratio[i] with airmass[i], so one dropped frame shifted
+    // every later epoch onto its neighbour's airmass, water column, time and injected transit
+    // factor. Fit's own Math.Min trimmed the overhang and nothing complained.
+    //
+    // It is not a theoretical case. The frames a reduction drops are the ones whose star ran into
+    // the well or the converter, which are the brightest - exactly the frames a saturation or a
+    // non-linearity study is looking at.
+    //
+    // The fixture makes the misalignment unmissable: the ratio is an exact linear function of
+    // airmass, so a correct pairing recovers the slope exactly, and any shift does not.
+    const double slope21 = -0.02;      // ratio per unit airmass, chosen large enough to be unmistakable
+    const double base21 = 1.0;
+    const int frames21 = 24;
+    const int dropAt21 = 5;            // one frame in the middle produces no ratio at all
+
+    PhotometricSequence.FrameRow Row21(int i, bool drop)
+    {
+        double x = 1.05 + 0.05 * i;                       // a rising airmass ladder
+        double ratio = base21 + slope21 * x;              // exactly linear in airmass
+        double target = drop ? 0.0 : 1.0e6 * ratio;       // a dropped frame measures nothing
+        var stars = new List<PhotometricSequence.StarPoint>
+        {
+            // The target: reddest, and the one the ratio is built from.
+            new() { RaDeg = 10.0, DecDeg = 20.0, ColourBv = 1.40, TrueMagnitude = 11.0,
+                    FluxElectrons = target, Snr = 500.0 },
+        };
+        // Four comparisons, bluer, each a quarter of the unit denominator so the sum is 1e6.
+        for (int c = 0; c < 4; c++)
+            stars.Add(new PhotometricSequence.StarPoint
+            {
+                RaDeg = 10.1 + 0.01 * c, DecDeg = 20.1, ColourBv = 0.40 + 0.01 * c,
+                TrueMagnitude = 11.5, FluxElectrons = 0.25e6, Snr = 500.0,
+            });
+
+        return new PhotometricSequence.FrameRow
+        {
+            Index = i, Ut = 1000.0 + i, Airmass = x, Reliable = true, Stars = stars,
+            // A distinct transit factor per frame, so a shift shows up in the truth column too.
+            TransitFactor = 1.0 - 0.001 * i,
+            PwvMm = 2.0 + 0.1 * i,
+        };
+    }
+
+    var seq21 = new PhotometricSequence { Comparisons = 4 };
+    for (int i = 0; i < frames21; i++) seq21.Add(Row21(i, drop: i == dropAt21));
+    PhotometricSequence.Analysis a21 = seq21.Analyse();
+
+    Check("the run is analysed and one frame is missing from the series",
+          a21.Series.Count == frames21 - 1,
+          $"{a21.Series.Count} epochs from {frames21} frames, one dropped");
+
+    Check("and the analysis says so rather than passing it over",
+          a21.Notes.Any(n => n.Contains("produced no ratio")),
+          a21.Notes.FirstOrDefault(n => n.Contains("produced no ratio")) ?? "no such note");
+
+    // EVERY EPOCH CARRIES ITS OWN FRAME'S CONDITIONS. This is the check that fails on the old
+    // code: from the gap onwards each ratio was stamped with the previous frame's airmass.
+    bool aligned21 = true;
+    string firstBad21 = null;
+    for (int j = 0; j < a21.Series.Count; j++)
+    {
+        int frame = j < dropAt21 ? j : j + 1;             // the frame this epoch must have come from
+        double wantX = 1.05 + 0.05 * frame;
+        double wantF = 1.0 - 0.001 * frame;
+        double wantUt = 1000.0 + frame;
+        if (Math.Abs(a21.Series[j].Airmass - wantX) > 1e-12 ||
+            Math.Abs(a21.Series[j].TransitFactor - wantF) > 1e-12 ||
+            Math.Abs(a21.Series[j].Ut - wantUt) > 1e-12)
+        {
+            aligned21 = false;
+            firstBad21 ??= $"epoch {j} should carry frame {frame} (airmass {wantX:F3}, factor {wantF:F4}) "
+                         + $"but carries airmass {a21.Series[j].Airmass:F3}, factor {a21.Series[j].TransitFactor:F4}";
+            break;
+        }
+    }
+    Check("each epoch carries the airmass, time and injected factor of the frame it came from",
+          aligned21, firstBad21 ?? $"all {a21.Series.Count} epochs check out");
+
+    // AND THE FIT IS THE FIT OF THE RIGHT PAIRS. The ratio is exactly linear in airmass, so after
+    // normalising by its own mean the recovered drift is |slope| * (Xmax - Xmin) / mean, in parts
+    // per thousand. A misaligned fit gives a visibly different number.
+    double mean21 = Enumerable.Range(0, frames21).Where(i => i != dropAt21)
+                              .Select(i => base21 + slope21 * (1.05 + 0.05 * i)).Average();
+    double xMin21 = 1.05, xMax21 = 1.05 + 0.05 * (frames21 - 1);
+    double wantDrift21 = Math.Abs(slope21) * (xMax21 - xMin21) / mean21 * 1000.0;
+    Check("the drift fitted against airmass is the drift that was put in",
+          Math.Abs(a21.DriftPpt - wantDrift21) < 1e-6 * wantDrift21,
+          $"{a21.DriftPpt:F6} parts per thousand against {wantDrift21:F6} injected");
+
+    // An exactly linear ratio detrends to nothing. On the old code the residual was dominated by
+    // the shift, so this is the summary statistic the bug corrupted.
+    Check("and an exactly linear ratio leaves no residual once it is removed",
+          a21.DetrendedPpt < 1e-9,
+          $"{a21.DetrendedPpt:E3} parts per thousand left over");
+
+    // THE GUARD. Fit used to accept mismatched lengths and quietly fit the overlap, which is what
+    // let the misalignment survive. It now refuses, so a future caller cannot reintroduce it.
+    Check("and a least-squares fit refuses arrays of different lengths instead of trimming them",
+          Refused(() => PhotometricSequence.FitForTests(new[] { 1.0, 2.0, 3.0, 4.0 },
+                                                        new[] { 1.0, 2.0, 3.0 },
+                                                        out _, out _, out _)),
+          "a mismatch means the caller has lost track of which value belongs to which frame");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

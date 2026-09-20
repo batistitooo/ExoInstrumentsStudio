@@ -79,6 +79,29 @@ namespace ExoInstruments.Core
         /// taking the root that tends to m as d tends to 0. The discriminant goes negative only
         /// above the curve's own maximum, which lies beyond full well for every real d, and is
         /// clamped rather than thrown for the pixels blooming has already ruined.
+        ///
+        /// WRITTEN THE OTHER WAY ROUND, AND WHY. That expression is correct algebra and poor
+        /// arithmetic. As d falls the discriminant approaches 1, so the numerator becomes the
+        /// difference of two nearly equal numbers and the significant digits lost grow as 1/d:
+        /// measured round trip error was 1.0e-12 at d = 0.018 but 2.7e-11 at d = 0.001, an order
+        /// of magnitude worse for a device ten times more linear, which is the wrong direction.
+        ///
+        /// Multiplying numerator and denominator by (1 + sqrt(...)) gives the algebraically
+        /// identical
+        ///
+        ///     Q = 2*m / (1 + sqrt(1 - 4*d*m/Q_fw))
+        ///
+        /// in which the sum of two positive quantities replaces the cancelling difference, so
+        /// there is no subtractive cancellation at any d and the small-d limit Q -> m falls out
+        /// directly. This is the standard remedy for the quadratic formula's unstable root; see
+        /// Higham, "Accuracy and Stability of Numerical Algorithms", 2nd ed. (SIAM 2002),
+        /// section 1.8, and Press et al., "Numerical Recipes", 3rd ed. (CUP 2007), section 5.6,
+        /// both of which give this rearrangement for exactly this case.
+        ///
+        /// Nothing in the imaging pipeline calls this: the frame path applies Measured and never
+        /// inverts it, which is why an uncorrected non-linearity survives into the photometry.
+        /// The form still matters, because the method is public and a reduction that wanted to
+        /// correct a curve would call it at whatever d the device has.
         /// </summary>
         public static double Correct(double measuredElectrons, double fullWellElectrons, double deviationAtFullWell)
         {
@@ -88,7 +111,16 @@ namespace ExoInstruments.Core
 
             double discriminant = 1.0 - 4.0 * deviationAtFullWell * measuredElectrons / fullWellElectrons;
             if (discriminant < 0.0) discriminant = 0.0;
-            return fullWellElectrons * (1.0 - Math.Sqrt(discriminant)) / (2.0 * deviationAtFullWell);
+
+            // Past the curve's own maximum the discriminant is clamped to zero and the stable
+            // form returns 2m, which is the vertex Q_fw/(2d) only when m is the maximum itself.
+            // Fall back to the direct form there so the clamped branch keeps returning the
+            // vertex, as it did before, rather than something that depends on how far past it
+            // the input was.
+            if (discriminant <= 0.0)
+                return fullWellElectrons / (2.0 * deviationAtFullWell);
+
+            return 2.0 * measuredElectrons / (1.0 + Math.Sqrt(discriminant));
         }
     }
 }
