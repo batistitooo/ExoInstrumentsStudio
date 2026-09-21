@@ -692,7 +692,20 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
     PwvSeries seqPwv = BuildPwvSeries(req.Pwv, seqStartUt, out string seqPwvError);
     // Mid-ladder by default: a transit at the end of the run has no baseline after it to normalise
     // against, and the whole measurement is the ratio of in-transit to out.
-    double seqMidUt = 0.5 * (seqStartUt + seqEndUt);
+    // THE MIDDLE OF THE RUN, measured the same way a frame's epoch is.
+    //
+    // seqStartUt and seqEndUt are the first and last exposure's START times, because that is
+    // what the ladder places. A frame's epoch, though, is the middle of its exposure: the flux
+    // it records is averaged over the whole of it. So the mean epoch of the run is not
+    // (start + end)/2, it is that plus half an exposure, and a transit centred on the former
+    // sits half an exposure early relative to the frames that measure it.
+    //
+    // Nothing recovers the depth wrongly because of it, since a fit that solves for mid-transit
+    // simply finds it where it is. What it does is put a fixed offset into every recovered T0,
+    // which looks like a timing error in the pipeline and is not: measured on this field with
+    // 180 s exposures it came out at -95 s, and it was exactly half an exposure every time.
+    // Half an exposure appearing twice in one chain of reasoning is once too often.
+    double seqMidUt = 0.5 * (seqStartUt + seqEndUt) + 0.5 * exp;
     TransitInjection seqTransient = BuildTransient(req.Transient, seqMidUt, req.RaDeg, req.DecDeg,
                                                    out string seqTransientError);
     if (seqTransientError != null) return Results.BadRequest(new { error = seqTransientError });
