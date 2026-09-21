@@ -651,6 +651,14 @@ namespace ExoStudio.Api
                 raDeg = s.Transient.TargetRaDeg,
                 decDeg = s.Transient.TargetDecDeg,
                 matchRadiusArcsec = s.Transient.MatchRadiusArcsec,
+
+                // A tabulated transit's depth is a CONSEQUENCE of the shape it was given, not a
+                // request, and the shape carries physics the depth alone does not. So the record
+                // says where the shape came from; without it a limb-darkened run and a trapezoid
+                // of the same central depth would be indistinguishable afterwards.
+                tabulated = s.Transient.IsTabulated,
+                profileSamples = s.Transient.ProfileOffsetsSeconds?.Count ?? 0,
+                profileProvenance = s.Transient.ProfileProvenance,
             },
 
             pwv = s.Pwv == null ? null : new
@@ -963,6 +971,32 @@ namespace ExoStudio.Api
 
         /// <summary>Share of the duration spent in ingress, and again in egress. 0.1 by default.</summary>
         public double? IngressFraction { get; set; }
+
+        /// <summary>
+        /// A TABULATED transit shape, replacing the trapezoid. Offsets in seconds from
+        /// mid-transit, strictly ascending, with the matching fraction of light in
+        /// ProfileFactors. Both ends must be out of transit, so the table brackets the event.
+        ///
+        /// This is how a limb-darkened transit gets in. The shape a real transit has is Mandel
+        /// and Agol (2002), and it is the shape that connects a measured depth to a radius
+        /// ratio: limb darkening makes the observed depth deeper than (Rp/R*)^2 by ten per cent
+        /// or more. Rather than carry a second implementation of a standard calculation here and
+        /// then have to prove it right, the caller computes the profile with the reference
+        /// implementation - batman, Kreidberg 2015, PASP 127, 1161 - and hands it over.
+        ///
+        /// Depth, DurationHours and IngressFraction are ignored when a profile is given; the
+        /// central depth is read off the table.
+        /// </summary>
+        public double[] ProfileOffsetsSeconds { get; set; }
+        public double[] ProfileFactors { get; set; }
+
+        /// <summary>
+        /// What generated the profile, recorded verbatim on the run. The study writes the radius
+        /// ratio, the scaled semi-major axis, the impact parameter and the limb-darkening
+        /// coefficients here, so a result records the physics it was given and not only the
+        /// numbers that came out of it.
+        /// </summary>
+        public string ProfileProvenance { get; set; }
     }
 
     /// <summary>What a yield run needs: a population to draw, and a programme to run it through.</summary>

@@ -3761,6 +3761,110 @@ Section("21. A dropped frame leaves a gap in the differential series, it does no
           "a mismatch means the caller has lost track of which value belongs to which frame");
 }
 
+Section("22. A transit whose shape came from outside, and the refusals that keep it honest");
+{
+    // WHY THIS EXISTS. The injector knew one shape, a trapezoid with a requested depth. A
+    // trapezoid has no radius ratio, and the quantity a transit paper reports is a radius ratio.
+    // The shape that connects the two is Mandel and Agol's, and rather than carry a second
+    // implementation of it here it is accepted as a table computed by the reference one.
+    //
+    // What this section pins is everything that is THIS file's business: the interpolation, the
+    // folding onto the period, the exposure averaging, and above all the refusals - because a
+    // table is supplied by a caller and a silently accepted bad one would inject a shape nobody
+    // asked for.
+
+    const double epoch22 = 1_000_000.0;
+    // A symmetric V, easy to integrate by hand: flat at 1 outside +/-1000 s, falling linearly to
+    // 0.99 at the centre. Deliberately NOT a shape the trapezoid path could make.
+    var off22 = new List<double>();
+    var fac22 = new List<double>();
+    for (int i = -100; i <= 100; i++)
+    {
+        double t = i * 10.0;                       // -1000 to +1000 s in 10 s steps
+        off22.Add(t);
+        fac22.Add(1.0 - 0.01 * (1.0 - Math.Abs(t) / 1000.0));
+    }
+    fac22[0] = 1.0; fac22[^1] = 1.0;
+
+    TransitInjection tab = TransitInjection.CreateFromProfile(
+        10.0, -25.0, 3.0, epoch22, 3.5, off22, fac22, "verify: a linear V");
+
+    Check("a tabulated transit reports itself as one, and keeps its provenance",
+          tab.IsTabulated && tab.ProfileProvenance == "verify: a linear V"
+          && tab.ProfileOffsetsSeconds.Count == 201,
+          $"{tab.ProfileOffsetsSeconds.Count} samples, \"{tab.ProfileProvenance}\"");
+
+    Check("its depth is read off the table rather than requested",
+          Math.Abs(tab.Depth - 0.01) < 1e-12, $"depth {tab.Depth:F6}");
+
+    // THE INTERPOLATION. Halfway between two samples of a piecewise-linear table is exact.
+    Check("the factor between two samples is the linear interpolation of them",
+          Math.Abs(tab.FactorAt(epoch22 + 505.0) - (1.0 - 0.01 * (1.0 - 505.0 / 1000.0))) < 1e-12,
+          $"at +505 s: {tab.FactorAt(epoch22 + 505.0):F9}");
+
+    Check("and outside the table the star is out of transit, not extrapolated",
+          tab.FactorAt(epoch22 + 5000.0) == 1.0 && tab.FactorAt(epoch22 - 5000.0) == 1.0,
+          "a table that did not bracket its own event is refused at construction, so beyond it "
+          + "there is genuinely nothing");
+
+    // THE FOLD. One period later must be the same instant of the same event.
+    Check("the shape repeats on the period",
+          Math.Abs(tab.FactorAt(epoch22 + 505.0)
+                   - tab.FactorAt(epoch22 + 505.0 + 3.5 * 86400.0)) < 1e-12,
+          "the same phase, one period on");
+
+    // THE EXPOSURE AVERAGE. Over a window symmetric about mid-transit the V's mean is exactly
+    // the midpoint of its own linear ramp, which is a closed form to check Simpson against.
+    double mean22 = tab.MeanFactorOver(epoch22 - 100.0, 200.0);
+    double exact22 = 1.0 - 0.01 * (1.0 - 100.0 / 2.0 / 1000.0);   // mean of |t|/1000 over [-100,100]
+    Check("the exposure average of a linear ramp is exact",
+          Math.Abs(mean22 - exact22) < 1e-9,
+          $"{mean22:F9} against {exact22:F9}");
+
+    // THE REFUSALS. Each of these would otherwise inject a shape the caller did not describe.
+    Check("a table whose ends are in transit is refused, not injected with a step at its edge",
+          Refused(() => TransitInjection.CreateFromProfile(
+              10.0, -25.0, 3.0, epoch22, 3.5,
+              new List<double> { -10.0, 0.0, 10.0 },
+              new List<double> { 0.99, 0.98, 0.99 }, "unbracketed")),
+          "the exposure average would integrate across the step and the depth would depend on "
+          + "where the table stopped");
+
+    Check("offsets that do not ascend are refused",
+          Refused(() => TransitInjection.CreateFromProfile(
+              10.0, -25.0, 3.0, epoch22, 3.5,
+              new List<double> { -10.0, 10.0, 0.0 },
+              new List<double> { 1.0, 0.99, 1.0 }, "unsorted")),
+          "an interpolation over them would be meaningless");
+
+    Check("mismatched offsets and factors are refused",
+          Refused(() => TransitInjection.CreateFromProfile(
+              10.0, -25.0, 3.0, epoch22, 3.5,
+              new List<double> { -10.0, 0.0, 10.0 },
+              new List<double> { 1.0, 0.99 }, "mismatched")),
+          "they index the same samples");
+
+    Check("a factor outside zero to one is refused",
+          Refused(() => TransitInjection.CreateFromProfile(
+              10.0, -25.0, 3.0, epoch22, 3.5,
+              new List<double> { -10.0, 0.0, 10.0 },
+              new List<double> { 1.0, 1.4, 1.0 }, "brightening")),
+          "a transit lets through between none and all of the star's light");
+
+    Check("a table too short to describe a shape is refused",
+          Refused(() => TransitInjection.CreateFromProfile(
+              10.0, -25.0, 3.0, epoch22, 3.5,
+              new List<double> { -10.0, 10.0 },
+              new List<double> { 1.0, 1.0 }, "two points")),
+          "two samples are a line, not a transit");
+
+    // AND THE TRAPEZOID STILL WORKS, because it is what every existing caller uses.
+    TransitInjection trap = TransitInjection.Create(10.0, -25.0, 3.0, epoch22, 3.5, 2.4, 0.01, 0.1);
+    Check("the trapezoid path is untouched",
+          !trap.IsTabulated && Math.Abs(trap.FactorAt(epoch22) - 0.99) < 1e-12,
+          $"depth at mid-transit {1.0 - trap.FactorAt(epoch22):F6}");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

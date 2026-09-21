@@ -3532,8 +3532,12 @@ static TransitInjection BuildTransient(TransientRequest req, double defaultEpoch
 {
     error = null;
     if (req == null) return null;
+
+    bool tabulated = req.ProfileOffsetsSeconds != null || req.ProfileFactors != null;
     double depth = req.Depth ?? 0.0;
-    if (depth <= 0.0) return null;                 // nothing to inject is not an error
+    // Nothing to inject is not an error - but a profile IS something to inject, whatever Depth
+    // says, because with a profile the depth is read off the table rather than requested.
+    if (!tabulated && depth <= 0.0) return null;
 
     double epoch = defaultEpochUt;
     if (!string.IsNullOrWhiteSpace(req.EpochUtc))
@@ -3551,6 +3555,22 @@ static TransitInjection BuildTransient(TransientRequest req, double defaultEpoch
 
     try
     {
+        if (tabulated)
+        {
+            if (req.ProfileOffsetsSeconds == null || req.ProfileFactors == null)
+            {
+                error = "A tabulated transit needs both profileOffsetsSeconds and profileFactors. "
+                      + "They index the same samples, so one without the other is a mistake rather "
+                      + "than a default.";
+                return null;
+            }
+            return TransitInjection.CreateFromProfile(
+                req.RaDeg ?? defaultRaDeg, req.DecDeg ?? defaultDecDeg,
+                req.MatchRadiusArcsec ?? 3.0, epoch,
+                req.PeriodDays ?? 3.5,
+                req.ProfileOffsetsSeconds, req.ProfileFactors, req.ProfileProvenance);
+        }
+
         return TransitInjection.Create(
             req.RaDeg ?? defaultRaDeg, req.DecDeg ?? defaultDecDeg,
             req.MatchRadiusArcsec ?? 3.0, epoch,

@@ -56,6 +56,38 @@ namespace ExoStudio.Simulation
         public string Description { get; private set; }
 
         /// <summary>
+        /// A TABULATED profile, when the transit shape came from outside rather than from the
+        /// trapezoid below. Offsets are seconds from mid-transit, ascending; factors are the
+        /// fraction of the star's light reaching the detector at each. Null for a trapezoid.
+        ///
+        /// WHY A TABLE RATHER THAN A MODEL IMPLEMENTED HERE. The shape a real transit has is
+        /// Mandel and Agol (2002), with limb darkening, an impact parameter and a scaled
+        /// semi-major axis, and it is the shape that connects a measured depth to a radius
+        /// ratio. Implementing it in this file would mean maintaining a second implementation of
+        /// a standard calculation and then having to prove it right. Accepting a table instead
+        /// lets the caller use the reference implementation - batman (Kreidberg 2015, PASP 127,
+        /// 1161), which is Mandel and Agol - and leaves this class doing what it is good at:
+        /// deciding which star, at which epoch, averaged over which exposure.
+        ///
+        /// The interpolation is linear, so the table has to be fine enough that linear
+        /// interpolation is not the largest error in the experiment. The caller controls that,
+        /// and the study's validation measures it rather than assuming it.
+        /// </summary>
+        public IReadOnlyList<double> ProfileOffsetsSeconds { get; private set; }
+        public IReadOnlyList<double> ProfileFactors { get; private set; }
+
+        /// <summary>
+        /// What generated the table, carried verbatim so a run records the physics it was given
+        /// rather than only the numbers. Free-form; the study writes the radius ratio, the
+        /// scaled semi-major axis, the impact parameter and the limb-darkening coefficients
+        /// here. Null for a trapezoid.
+        /// </summary>
+        public string ProfileProvenance { get; private set; }
+
+        /// <summary>True when the shape came from a table rather than from the trapezoid.</summary>
+        public bool IsTabulated => ProfileOffsetsSeconds != null;
+
+        /// <summary>
         /// A transit at a known ephemeris. <paramref name="ingressFraction"/> is the share of the
         /// total duration spent in ingress (and again in egress); 0 is a hard-edged box, and the
         /// default 0.1 is a shape a real grazing-to-central transit spans without pretending to be
@@ -95,6 +127,100 @@ namespace ExoStudio.Simulation
         }
 
         /// <summary>
+        /// A transit whose SHAPE is given as a table rather than assumed to be a trapezoid.
+        ///
+        /// offsetsSeconds are seconds from mid-transit, strictly ascending and spanning the whole
+        /// event on both sides; factors are the fraction of light at each. Outside the tabulated
+        /// range the factor is 1, so the table must reach out of transit at both ends or the
+        /// event will have a step at its edge.
+        ///
+        /// Depth is taken as the DEEPEST point of the table. For a limb-darkened profile that is
+        /// the central depth, which is NOT the squared radius ratio - limb darkening makes the
+        /// observed depth deeper than (Rp/R*)^2 by ten per cent or more, and that difference is
+        /// exactly why a study of depth bias has to keep the two apart. What connects them is
+        /// the provenance string, which records the parameters the table was generated from.
+        /// </summary>
+        public static TransitInjection CreateFromProfile(
+            double raDeg, double decDeg, double matchRadiusArcsec,
+            double epochUt, double periodDays,
+            IReadOnlyList<double> offsetsSeconds, IReadOnlyList<double> factors,
+            string provenance)
+        {
+            if (offsetsSeconds == null || factors == null)
+                throw new ArgumentException("A tabulated transit needs both offsets and factors.");
+            if (offsetsSeconds.Count != factors.Count)
+                throw new ArgumentException(
+                    $"The transit profile has {offsetsSeconds.Count} offsets and {factors.Count} "
+                    + "factors. They index the same samples.");
+            if (offsetsSeconds.Count < 3)
+                throw new ArgumentException(
+                    $"A transit profile of {offsetsSeconds.Count} samples cannot describe a shape. "
+                    + "Give it enough that linear interpolation between neighbours is not the "
+                    + "largest error in the measurement.");
+            if (!(periodDays > 0.0))
+                throw new ArgumentException($"Period {periodDays} days is not a period.");
+
+            for (int i = 1; i < offsetsSeconds.Count; i++)
+                if (!(offsetsSeconds[i] > offsetsSeconds[i - 1]))
+                    throw new ArgumentException(
+                        $"The transit profile's offsets are not strictly ascending at sample {i} "
+                        + $"({offsetsSeconds[i - 1]} then {offsetsSeconds[i]}). An interpolation "
+                        + "over them would be meaningless.");
+
+            double minFactor = double.PositiveInfinity, maxFactor = double.NegativeInfinity;
+            foreach (double f in factors)
+            {
+                if (double.IsNaN(f) || f < 0.0 || f > 1.0)
+                    throw new ArgumentException(
+                        $"The transit profile contains a factor of {f}. A transit lets through "
+                        + "between none and all of the star's light.");
+                if (f < minFactor) minFactor = f;
+                if (f > maxFactor) maxFactor = f;
+            }
+
+            // The event has to be bracketed by out-of-transit samples, or MeanFactorOver would
+            // integrate across a step at the table's edge and the depth would depend on where
+            // the table happened to stop.
+            const double OutOfTransitTolerance = 1e-9;
+            if (1.0 - factors[0] > OutOfTransitTolerance ||
+                1.0 - factors[factors.Count - 1] > OutOfTransitTolerance)
+                throw new ArgumentException(
+                    $"The transit profile starts at {factors[0]} and ends at {factors[factors.Count - 1]}; "
+                    + "both ends must be out of transit (factor 1) so that the event is bracketed. "
+                    + "Extend the table past fourth contact.");
+
+            double depth = 1.0 - minFactor;
+
+            // The duration, for the record and for InTransit: first to last sample below one.
+            int first = 0, last = factors.Count - 1;
+            while (first < factors.Count && 1.0 - factors[first] <= OutOfTransitTolerance) first++;
+            while (last >= 0 && 1.0 - factors[last] <= OutOfTransitTolerance) last--;
+            double duration = (first <= last)
+                ? offsetsSeconds[Math.Min(last + 1, offsetsSeconds.Count - 1)]
+                  - offsetsSeconds[Math.Max(first - 1, 0)]
+                : 0.0;
+
+            return new TransitInjection
+            {
+                TargetRaDeg = raDeg,
+                TargetDecDeg = decDeg,
+                MatchRadiusArcsec = matchRadiusArcsec > 0.0 ? matchRadiusArcsec : 3.0,
+                EpochUt = epochUt,
+                PeriodSeconds = periodDays * 86400.0,
+                DurationSeconds = duration,
+                IngressSeconds = 0.0,                 // meaningless for a tabulated shape
+                Depth = depth,
+                ProfileOffsetsSeconds = offsetsSeconds,
+                ProfileFactors = factors,
+                ProfileProvenance = provenance,
+                Id = Guid.NewGuid().ToString("N")[..10],
+                Description = $"tabulated transit, {offsetsSeconds.Count} samples, central depth "
+                            + $"{depth * 1e6:F0} ppm over {duration / 3600.0:F3} h"
+                            + (string.IsNullOrWhiteSpace(provenance) ? "" : $" ({provenance})"),
+            };
+        }
+
+        /// <summary>
         /// The fraction of the star's light reaching the detector at this instant. Pure: no state,
         /// no clock, no draw - the same property PwvSeries has, and for the same reason. A transit
         /// that remembered anything would make a run depend on how fast it was played.
@@ -106,6 +232,9 @@ namespace ExoStudio.Simulation
             // Phase measured from mid-transit, folded onto [-P/2, +P/2).
             double dt = ut - EpochUt;
             double phase = dt - Math.Floor(dt / PeriodSeconds + 0.5) * PeriodSeconds;
+
+            if (ProfileOffsetsSeconds != null) return TabulatedFactor(phase);
+
             double t = Math.Abs(phase);
 
             double half = 0.5 * DurationSeconds;
@@ -143,6 +272,35 @@ namespace ExoStudio.Simulation
                 sum += weight * FactorAt(startUt + i * h);
             }
             return sum * h / 3.0 / exposureSeconds;
+        }
+
+        /// <summary>
+        /// Linear interpolation into the tabulated profile, at a phase already folded onto
+        /// [-P/2, +P/2). Outside the table the star is out of transit.
+        ///
+        /// Binary search rather than a scan: MeanFactorOver evaluates this thirty-three times per
+        /// frame and a sweep renders a great many frames, so an O(log n) lookup against a table
+        /// that may hold thousands of samples is worth the six lines.
+        /// </summary>
+        private double TabulatedFactor(double phaseSeconds)
+        {
+            var x = ProfileOffsetsSeconds;
+            var y = ProfileFactors;
+            int n = x.Count;
+
+            if (phaseSeconds <= x[0] || phaseSeconds >= x[n - 1]) return 1.0;
+
+            int lo = 0, hi = n - 1;
+            while (hi - lo > 1)
+            {
+                int mid = (lo + hi) >> 1;
+                if (x[mid] <= phaseSeconds) lo = mid; else hi = mid;
+            }
+
+            double span = x[hi] - x[lo];
+            if (!(span > 0.0)) return y[lo];
+            double u = (phaseSeconds - x[lo]) / span;
+            return y[lo] + u * (y[hi] - y[lo]);
         }
 
         /// <summary>True when this star is the one the transit belongs to.</summary>
