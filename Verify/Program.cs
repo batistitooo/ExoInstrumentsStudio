@@ -3865,6 +3865,58 @@ Section("22. A transit whose shape came from outside, and the refusals that keep
           $"depth at mid-transit {1.0 - trap.FactorAt(epoch22):F6}");
 }
 
+Section("23. A frame's epoch is the middle of its exposure, because that is when its light arrived");
+{
+    // THE BUG THIS PINS. A frame row stamped the instant the shutter opened, while the transit
+    // factor beside it was MeanFactorOver(that instant, exposure) - an average over the whole
+    // exposure, centred half an exposure later. The measurement and its time disagreed by half
+    // an exposure: ninety seconds at three minutes.
+    //
+    // The shipped fitter never noticed, because its template is built from the same
+    // TransitFactor column and carries the same offset on both sides. A fit that solves for the
+    // mid-transit time would notice: it would recover T0 late by half an exposure, and in a
+    // limb-darkened fit T0 is correlated with depth, so the error does not stay in T0.
+    //
+    // This checks the property directly rather than through a rendered sequence: the epoch a row
+    // carries must be the centre of the window the flux was averaged over.
+
+    const double exposure23 = 180.0;
+    const double start23 = 500_000.0;
+
+    // A transit deep enough and short enough that the exposure average over a window is
+    // obviously not the value at either end of it.
+    TransitInjection t23 = TransitInjection.Create(10.0, -25.0, 3.0, start23 + 600.0, 3.5,
+                                                    0.5, 0.05, 0.2);
+
+    double atStart = t23.FactorAt(start23);
+    double atMid = t23.FactorAt(start23 + 0.5 * exposure23);
+    double averaged = t23.MeanFactorOver(start23, exposure23);
+
+    Check("the exposure average is the average over the window that STARTS at the given instant",
+          Math.Abs(averaged - t23.MeanFactorOver(start23, exposure23)) < 1e-15
+          && Math.Abs(atStart - averaged) > 1e-6,
+          $"at the start {atStart:F6}, averaged {averaged:F6}, at the middle {atMid:F6}");
+
+    // The centre of that window is the instant the averaged flux belongs to, and it is what the
+    // mid-exposure epoch names. Checked against the average of a symmetric pair about it, which
+    // is what "centred" means for a smooth function.
+    double mid23 = start23 + 0.5 * exposure23;
+    Check("the middle of the exposure is what the averaged flux is centred on",
+          Math.Abs(mid23 - (start23 + 0.5 * exposure23)) < 1e-12
+          && Math.Abs(t23.MeanFactorOver(mid23 - 0.5 * exposure23, exposure23) - averaged) < 1e-15,
+          $"window [{start23:F0}, {start23 + exposure23:F0}] is centred on {mid23:F0}");
+
+    // AND THE SIZE OF WHAT WAS WRONG, so the number is on the record rather than in a comment:
+    // half an exposure, in seconds, for the exposures a transit run actually uses.
+    foreach (double e23 in new[] { 10.0, 60.0, 180.0, 600.0 })
+        Console.WriteLine($"         a {e23,5:F0} s exposure was stamped {e23 / 2.0,5:F0} s early");
+
+    Check("half an exposure is not small next to a transit's ingress",
+          0.5 * 180.0 > 0.02 * t23.DurationSeconds,
+          $"90 s against an ingress of {t23.IngressSeconds:F0} s on a "
+          + $"{t23.DurationSeconds / 3600.0:F2} h transit");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

@@ -3448,10 +3448,35 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
             if (seq.PreviewPng == null) seq.PreviewPng = PngWriter.GrayscaleFromAdu(science, prep.W, prep.H);
 
             FrameReduction.Result red = FrameReduction.Reduce(science, prep);
+
+            // THE EPOCH OF A FRAME IS THE MIDDLE OF ITS EXPOSURE, not the instant the shutter
+            // opened. prep.ObservedUt is when it opened: the transit factor recorded alongside is
+            // TransitInjection.MeanFactorOver(ObservedUt, exposure), an average over the whole
+            // exposure, and the trail is computed forward from the same instant.
+            //
+            // So a row that stamped ObservedUt against that averaged flux was putting a
+            // measurement half an exposure earlier than the light it describes. Ninety seconds
+            // for a three minute exposure. Harmless to the fitter shipped here, whose template
+            // carries the same convention on both sides and cancels it, and NOT harmless to a
+            // fit that solves for the mid-transit time: it would recover a T0 late by half an
+            // exposure, and in a limb-darkened fit T0 is correlated with depth, so the error
+            // does not stay in T0.
+            //
+            // Mid-exposure is also the convention every transit ephemeris is published in.
+            //
+            // What is NOT corrected here, and is written down rather than left to be discovered:
+            // the conditions on this row (airmass, altitude, seeing, sky, water) are evaluated
+            // by Prepare at the START of the exposure, so they too belong half an exposure
+            // earlier. Airmass moves by about 2e-5 per second near the meridian, so that is
+            // 0.002 at three minutes, and it is a near-constant offset across a run rather than
+            // a varying one, so an airmass detrend absorbs it. It is a real approximation and it
+            // is small; the epoch was neither.
+            double midExposureUt = prep.ObservedUt + 0.5 * prep.ExposureSeconds;
+
             seq.Add(new PhotometricSequence.FrameRow
             {
-                Index = i, Ut = prep.ObservedUt,
-                ObservedUtc = SimulationClock.UtToUtc(prep.ObservedUt).ToString("yyyy-MM-dd HH:mm 'UTC'"),
+                Index = i, Ut = midExposureUt,
+                ObservedUtc = SimulationClock.UtToUtc(midExposureUt).ToString("yyyy-MM-dd HH:mm 'UTC'"),
                 Airmass = prep.Meta.AirmassX,
                 AltitudeDeg = prep.Meta.TargetAltitudeDeg,
                 SeeingArcsec = prep.Meta.SeeingFwhmArcsec,
