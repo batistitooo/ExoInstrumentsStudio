@@ -2344,6 +2344,17 @@ app.MapPost("/api/capture", (CaptureRequestDto req) =>
         airmass = r.AirmassX,
         targetAltitudeDeg = r.TargetAltitudeDeg,
         starsDrawn = r.StarsDrawn,
+        // WHERE THE TIME WENT, milliseconds. Published because a study built on this engine
+        // schedules itself by the cost of a frame, and a breakdown is the difference between
+        // optimising and guessing which phase to attack.
+        timing = new
+        {
+            totalMs = Math.Round(r.ComputeMs, 1),
+            starsMs = Math.Round(r.StarsMs, 1),
+            kernelMs = Math.Round(r.KernelMs, 1),
+            convolveMs = Math.Round(r.ConvolveMs, 1),
+            patternsMs = Math.Round(r.PatternsMs, 1),
+        },
         starCatalogUsed = r.StarCatalogUsed,
         galaxiesDrawn = r.GalaxiesDrawn,
         galaxiesFromImages = r.GalaxiesFromImages,
