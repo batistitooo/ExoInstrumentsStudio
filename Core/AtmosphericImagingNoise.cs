@@ -159,11 +159,23 @@ namespace ExoInstruments.Core
         /// </summary>
         public static double ScintillationSigma(double apertureMeters, double siteAltitudeMeters,
                                                  double airmass, double exposureSeconds,
-                                                 double angularDiameterRad = 0.0)
+                                                 double angularDiameterRad = 0.0,
+                                                 double siteCoefficient = double.NaN)
         {
             if (double.IsNaN(airmass) || double.IsInfinity(airmass) || airmass < 1.0) return 0.0;
             double effective = EffectiveAveragingAperture(apertureMeters, angularDiameterRad);
-            return AtmosphericNoise.YoungSigmaRaw(effective, siteAltitudeMeters, airmass, exposureSeconds);
+
+            // THE MEASURED RELATION, NOT THE CLASSICAL ONE. Osborn et al. (2015) equation (7)
+            // with the site's own median coefficient where one has been published, and C_Y = 1
+            // where none has - which is their equation (2), plain Young restated in SI, and is
+            // about a third low at every site where the median has actually been measured.
+            //
+            // This used to call YoungSigmaRaw, the classical Dravins form, for every site. The
+            // difference is not a scale factor: the airmass exponent is 3/2 here against 7/4
+            // there, and the two cross at airmass 1.31, so it reverses sign over an ordinary
+            // run. See AtmosphericNoise.OsbornSigma.
+            return AtmosphericNoise.OsbornSigma(effective, siteAltitudeMeters, airmass,
+                                                 exposureSeconds, siteCoefficient);
         }
 
         /// <summary>

@@ -60,9 +60,58 @@ namespace ExoInstruments.Core
         }
 
         /// <summary>
-        /// Raw Young scintillation formula, instrument-independent. Reused by
-        /// AtmosphericImagingNoise for the RC20 camera. Exposure floored at 0.01s
-        /// (sub-second imaging is valid here, unlike the photometric cadence).
+        /// THE MEASURED RELATION: Osborn, Foehring, Dhillon and Wilson 2015, MNRAS 452, 1707,
+        /// equation (7), the modified Young approximation with an empirical median site
+        /// coefficient.
+        ///
+        ///     sigma^2 = 10e-6 * C_Y^2 * D^(-4/3) * t^(-1) * (cos gamma)^(-3) * exp(-2h/H)
+        ///
+        /// All SI: D in metres, t in seconds, h in metres, gamma the zenith distance, so
+        /// (cos gamma)^(-3) = X^3 under X = sec(gamma) and the AMPLITUDE carries X^(3/2).
+        ///
+        /// WHY THIS AND NOT YoungSigmaRaw BELOW. The classical relation is known to be low.
+        /// Those authors measured the median scintillation at six observatories with MASS
+        /// instruments and found it underestimates the truth by roughly a factor 1.5; C_Y is the
+        /// factor, and it is 1.56 at Paranal. Setting C_Y = 1 recovers their own equation (2),
+        /// which is plain Young restated in SI - so this one expression covers both cases and a
+        /// site with no published coefficient is handled by the same code rather than by a
+        /// different relation.
+        ///
+        /// Note the exponents differ from the classical form in TWO places, not one: 3/2 against
+        /// 7/4 on the airmass, and a prefactor of 3.16228e-3 against 2.95389e-3. The two cross
+        /// at airmass 1.31, so the difference reverses sign over an ordinary run. That is
+        /// bibliography rather than physics and is measured in the study's validation.
+        ///
+        /// A MEDIAN IS NOT A NIGHT. Kornilov et al. 2012, A&amp;A 546, A41, from whose campaign five
+        /// of the six coefficients are derived, report interquartile ratios near 1.5 at every
+        /// site. This returns the median relation; any given night can be half it or twice it.
+        /// </summary>
+        public static double OsbornSigma(double apertureMeters, double siteAltitudeMeters,
+                                          double airmass, double exposureSeconds,
+                                          double siteCoefficient)
+        {
+            if (apertureMeters <= 0.0 || double.IsNaN(airmass) || double.IsInfinity(airmass) || airmass < 1.0)
+                return 0.0;
+
+            // An unpublished coefficient is 1, which is the classical relation restated, not an
+            // absence of scintillation. NaN must not propagate into a frame.
+            double cy = double.IsNaN(siteCoefficient) || siteCoefficient <= 0.0 ? 1.0 : siteCoefficient;
+            double exposure = Math.Max(0.01, exposureSeconds);
+
+            double variance = 10.0e-6
+                            * cy * cy
+                            * Math.Pow(apertureMeters, -4.0 / 3.0)
+                            / exposure
+                            * Math.Pow(airmass, 3.0)
+                            * Math.Exp(-2.0 * siteAltitudeMeters / AtmosphericScaleHeightMeters);
+            return Math.Sqrt(variance);
+        }
+
+        /// <summary>
+        /// The CLASSICAL relation, kept because it is what the ReferencePrecision path corrects
+        /// against and what most of the literature quotes: Dravins et al. 1998, PASP 110, 610,
+        /// equation (10). Instrument-independent. Exposure floored at 0.01s (sub-second imaging
+        /// is valid here, unlike the photometric cadence).
         /// </summary>
         public static double YoungSigmaRaw(double apertureMeters, double siteAltitudeMeters, double airmass, double exposureSeconds)
         {

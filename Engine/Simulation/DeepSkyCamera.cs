@@ -74,6 +74,18 @@ namespace ExoStudio.Simulation
             /// </summary>
             public OrbitalPlatforms.Platform Platform;
 
+            /// <summary>
+            /// The scintillation site coefficient C_Y to use, overriding the site's own. NaN
+            /// takes the site's, which is itself NaN where nobody has published one, and the
+            /// relation then reduces to the classical form. See
+            /// ObservingSites.Site.ScintillationSiteCoefficient and AtmosphericNoise.OsbornSigma.
+            ///
+            /// It is on the request rather than only on the site because the interquartile range
+            /// of measured scintillation is about a factor 1.5 at every site: a study that wants
+            /// to know how much its answer depends on a bad night has to be able to ask.
+            /// </summary>
+            public double ScintillationSiteCoefficient = double.NaN;
+
             public double Ut;
             public double RaDeg;
             public double DecDeg;
@@ -765,7 +777,13 @@ namespace ExoStudio.Simulation
             double scintSigma = space
                 ? 0.0
                 : AtmosphericImagingNoise.ScintillationSigma(
-                      spec.ApertureMeters, atmosphereAltM, airmass, req.ExposureSeconds);
+                      spec.ApertureMeters, atmosphereAltM, airmass, req.ExposureSeconds,
+                      angularDiameterRad: 0.0,
+                      // The request's value wins; otherwise the site's own, which is NaN where
+                      // none is published and makes OsbornSigma fall back to C_Y = 1.
+                      siteCoefficient: double.IsNaN(req.ScintillationSiteCoefficient)
+                                       ? (req.Site?.ScintillationSiteCoefficient ?? double.NaN)
+                                       : req.ScintillationSiteCoefficient);
             var rngScint = new Pcg32(req.Seed, Pcg32.StreamScintillation);
             double scint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
             double starScint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));

@@ -92,6 +92,27 @@ namespace ExoStudio.Simulation
             public double AmbientTemperatureCelsius { get; init; } = double.NaN;
 
             /// <summary>
+            /// The median scintillation site coefficient C_Y of Osborn, Foehring, Dhillon and
+            /// Wilson 2015, MNRAS 452, 1707, Table 1, in m^(2/3) s^(1/2). It multiplies the
+            /// amplitude in their equation (7), so 1 is the classical Young relation restated in
+            /// SI and about 1.5 is what they actually measured at most observatories.
+            ///
+            /// NaN WHERE NOBODY HAS PUBLISHED ONE, and it stays NaN rather than being filled in
+            /// with a neighbour's. Five of their six coefficients come from the MASS campaign of
+            /// Kornilov et al. 2012, A&amp;A 546, A41, which covers Armazones, Mauna Kea, Paranal,
+            /// San Pedro Martir and Tololo; the La Palma value is their own stereo-SCIDAR
+            /// measurement on the 2.5 m INT. Of the five sites here, three are in that list and
+            /// two are not. A borrowed coefficient would look like a measurement, which is the
+            /// same reason the instrument roster leaves unpublished detector figures unset.
+            ///
+            /// A run that wants one anyway can override it; the value used is then recorded.
+            /// </summary>
+            public double ScintillationSiteCoefficient { get; init; } = double.NaN;
+
+            /// <summary>Where that coefficient comes from, or why there is none.</summary>
+            public string ScintillationCoefficientSource { get; init; }
+
+            /// <summary>
             /// Where the figure above comes from, and WHAT IT ACTUALLY IS, because the two are not
             /// the same across these five sites and the difference is worth carrying rather than
             /// averaging away. Only Mauna Kea has a published NIGHT-TIME statistic; the rest are
@@ -113,6 +134,15 @@ namespace ExoStudio.Simulation
             LatitudeDeg = 43.9308,
             LongitudeDeg = 5.7133,
             AltitudeMeters = 650,
+            // No published scintillation coefficient. The MASS campaign behind Osborn et al.'s
+            // Table 1 covers five southern and Hawaiian sites and no European lowland one, and at
+            // 650 m this site's exp(-h/8000) term alone puts it far from any of them. The
+            // classical relation is used, which those authors measured to be about a third low at
+            // the sites they did cover.
+            ScintillationSiteCoefficient = double.NaN,
+            ScintillationCoefficientSource = "none published; the classical Young relation is used, "
+                                           + "and it is known to be low by roughly a factor 1.5 "
+                                           + "at the observatories where the median has been measured",
             Note = "Where 51 Peg b was found in 1995, with ELODIE on the 1.93 m. SOPHIE is its successor on the same telescope.",
             // The figure Core already carried for the RC20 and the RedCat, which stand here.
             AmbientTemperatureCelsius = 11.8,
@@ -129,6 +159,14 @@ namespace ExoStudio.Simulation
             LatitudeDeg = -29.2543,
             LongitudeDeg = -70.7346,
             AltitudeMeters = 2400,
+            // No published coefficient either. Cerro Tololo, 2200 m and 500 km north, is the
+            // nearest site in Osborn et al.'s Table 1 and has C_Y = 1.42; that number is NOT
+            // adopted here. La Silla has its own seeing and its own wind profile, and the whole
+            // point of a measured coefficient is that it was measured.
+            ScintillationSiteCoefficient = double.NaN,
+            ScintillationCoefficientSource = "none published; the nearest measured site is Cerro "
+                                           + "Tololo at C_Y = 1.42 (Osborn et al. 2015, Table 1), "
+                                           + "which is deliberately not borrowed",
             Note = "ESO 3.6 m, home of HARPS.",
             // DERIVED, AND THE ONE HERE THAT IS. No published mean for La Silla turned up, so this
             // is Paranal's measured 12.8 C carried down 235 m of altitude at 8 C/km, the middle of
@@ -149,6 +187,10 @@ namespace ExoStudio.Simulation
             LatitudeDeg = -24.6272,
             LongitudeDeg = -70.4042,
             AltitudeMeters = 2635,
+            ScintillationSiteCoefficient = 1.56,
+            ScintillationCoefficientSource = "Osborn, Foehring, Dhillon & Wilson 2015, MNRAS 452, "
+                                           + "1707, Table 1; derived by those authors from the MASS "
+                                           + "campaign of Kornilov et al. 2012, A&A 546, A41",
             Note = "The VLT. ESPRESSO feeds from all four unit telescopes; SPECULOOS-South sits on the same mountain.",
             // Lombardi et al. 2009, MNRAS 399, 783, Table 3: the 2 m sensor's average over the
             // 22-year database, 1985-2006. The paper's own choice of the 2 m over the 30 m sensor
@@ -167,6 +209,12 @@ namespace ExoStudio.Simulation
             LatitudeDeg = 28.7606,
             LongitudeDeg = -17.8814,
             AltitudeMeters = 2396,
+            // The one coefficient in that table the authors measured themselves, with a
+            // stereo-SCIDAR campaign on the 2.5 m Isaac Newton Telescope on this mountain.
+            ScintillationSiteCoefficient = 1.30,
+            ScintillationCoefficientSource = "Osborn, Foehring, Dhillon & Wilson 2015, MNRAS 452, "
+                                           + "1707, Table 1, from their own stereo-SCIDAR campaign "
+                                           + "on the 2.5 m INT",
             Note = "Northern-hemisphere counterpart to Paranal for bright-star spectroscopy.",
             // Same table, the Carlsberg Meridian Telescope's station at 10.5 m: 8.8 +/- 1.2 C over
             // 1985-2004. The paper's headline comparison is that ORM runs about 4 C colder than
@@ -185,6 +233,10 @@ namespace ExoStudio.Simulation
             LatitudeDeg = 19.8207,
             LongitudeDeg = -155.4681,
             AltitudeMeters = 4205,
+            ScintillationSiteCoefficient = 1.63,
+            ScintillationCoefficientSource = "Osborn, Foehring, Dhillon & Wilson 2015, MNRAS 452, "
+                                           + "1707, Table 1; derived by those authors from the MASS "
+                                           + "campaign of Kornilov et al. 2012, A&A 546, A41",
             Note = "Highest of the classical sites; the driest, and the best seeing of the list.",
             // THE ONLY GENUINELY NIGHT-TIME FIGURE IN THIS LIST. The CFHT Observatory Manual, Sect. 2,
             // publishes summit MEAN MINIMA of "around 0 C (summer) and -4 C (winter)", against
