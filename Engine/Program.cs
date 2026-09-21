@@ -681,7 +681,27 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
     // transit, and there was therefore no depth to fit and no curve to draw. See
     // PhotometricSequence.TryPlaceLadder, which also refuses the airmass range a field never
     // reaches - the case that previously produced a ladder of zero length.
-    double now = SimulationClock.UtcToUt(DateTime.UtcNow);
+    // THE INSTANT THE LADDER IS SEARCHED FORWARD FROM. The wall clock unless the request names
+    // one, because a seed alone does not reproduce a run when the window it lands in depends on
+    // when the request arrived. See SequenceRequest.SearchFromUtc.
+    double now;
+    if (string.IsNullOrWhiteSpace(req.SearchFromUtc))
+    {
+        now = SimulationClock.UtcToUt(DateTime.UtcNow);
+    }
+    else if (DateTime.TryParse(req.SearchFromUtc, CultureInfo.InvariantCulture,
+                               DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal,
+                               out DateTime searchFrom))
+    {
+        now = SimulationClock.UtcToUt(searchFrom);
+    }
+    else
+    {
+        return Results.BadRequest(new { error =
+            $"'{req.SearchFromUtc}' is not an instant this can read. Use an ISO 8601 UTC time "
+          + "such as 2026-09-22T00:00:00Z, or leave it out to search forward from now." });
+    }
+
     var seqCtx = ObservingSites.ContextFor(site);
     if (!PhotometricSequence.TryPlaceLadder(now, req.RaDeg, req.DecDeg, site, seqCtx,
                                             xFrom, xTo, frames,
@@ -811,6 +831,7 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         StartUt = seqStartUt,
         EndUt = seqEndUt,
         LadderNote = ladderNote,
+        SearchFromUt = now,
         DriftArcsecPerFrame = req.DriftArcsecPerFrame ?? 0.0,
         DriftPositionAngleDeg = req.DriftPositionAngleDeg ?? 45.0,
         // Recorded from the RESOLVED spec rather than from the request, so the record says what

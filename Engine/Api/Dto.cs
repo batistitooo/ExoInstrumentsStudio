@@ -678,6 +678,9 @@ namespace ExoStudio.Api
             // in darkness rather than in geometry alone, so it can be clipped or moved to a later
             // night. Null when the request was honoured as given.
             ladderNote = s.LadderNote,
+            // To the SECOND, and with the search anchor beside it, because these are what a
+            // rerun needs: the same seed and the same anchor give the same night.
+            searchFromUtc = SimulationClock.UtToUtc(s.SearchFromUt).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
             startUtc = SimulationClock.UtToUtc(s.StartUt).ToString("yyyy-MM-dd HH:mm 'UTC'"),
             endUtc = SimulationClock.UtToUtc(s.EndUt).ToString("yyyy-MM-dd HH:mm 'UTC'"),
             previewUrl = s.PreviewPng != null ? $"/api/sequences/{s.Id}/preview" : null,
@@ -900,6 +903,26 @@ namespace ExoStudio.Api
         /// exactly the noise a transit has to be found underneath.
         /// </summary>
         public PwvRequest Pwv { get; set; }
+
+        /// <summary>
+        /// The instant the airmass ladder is searched forward from, ISO UTC. Null means now.
+        ///
+        /// WHY A RUN NEEDS TO BE ABLE TO SAY. The ladder is placed by looking forward from an
+        /// instant for the next window where the field is at the right airmass in real darkness.
+        /// Anchored to the wall clock, that makes a seed insufficient to reproduce a run: the
+        /// same request submitted twenty seconds later finds a slightly different window, so the
+        /// frames sit at different airmasses, through different seeing, and the light curve
+        /// differs by some hundreds of parts per million. Measured, between two submissions of
+        /// one seed twenty-two seconds apart: 5e-4 in the differential ratio.
+        ///
+        /// That is the same failure the water series already carries a note about, and the same
+        /// remedy. A study that sweeps a parameter has to hold the night fixed, or the thing it
+        /// varies is not the only thing varying.
+        ///
+        /// Left null the behaviour is unchanged, which is what an observer opening the interface
+        /// wants: the next good window from now.
+        /// </summary>
+        public string SearchFromUtc { get; set; }
 
         /// <summary>Detector properties to override for this run. Null leaves the instrument as it is.</summary>
         public DetectorRequest Detector { get; set; }

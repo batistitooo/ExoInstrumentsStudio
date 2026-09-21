@@ -120,6 +120,14 @@ namespace ExoStudio.Simulation
         /// <summary>Why the ladder is not exactly what was asked for, or null when it is.</summary>
         public string LadderNote;
 
+        /// <summary>
+        /// The instant the ladder was searched forward from. Recorded because it is the one
+        /// input a seed does not carry: repeat a run with the same seed and the same
+        /// SearchFromUt and the frames land on the same night, at the same airmasses, through
+        /// the same seeing. Without it a request submitted a minute later is a different night.
+        /// </summary>
+        public double SearchFromUt;
+
         public string State = "running";      // running | finished | failed | cancelled
         public string StopReason;
         public int Done;
