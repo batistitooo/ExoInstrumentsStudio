@@ -94,6 +94,29 @@ namespace ExoStudio.Simulation
         public TransitInjection Transient;
         public int Comparisons = 4;
 
+        /// <summary>
+        /// How far the commanded pointing walks between consecutive frames, arcseconds, and the
+        /// direction it walks in, degrees east of north. Zero holds the pointing still, which is
+        /// what a tracked run did unconditionally before this existed.
+        ///
+        /// It matters because a star that never moves samples the same pixels in every frame, so
+        /// any fixed pattern in the pixel response divides out of the differential ratio exactly
+        /// and the coupling between pointing drift and pixel response cannot be seen at all.
+        /// </summary>
+        public double DriftArcsecPerFrame;
+        public double DriftPositionAngleDeg = 45.0;
+
+        /// <summary>
+        /// The detector figures this run was given, when they were overridden rather than taken
+        /// from the instrument. Recorded so that a result names the detector it came from: a
+        /// swept non-linearity is the whole point of some runs and must not be invisible in the
+        /// record of one.
+        /// </summary>
+        public double OverriddenLinearityDeviation = double.NaN;
+        public double OverriddenPhotoResponseNonUniformity = double.NaN;
+        public double OverriddenOffsetFixedPatternElectrons = double.NaN;
+        public int OverriddenSensorNativePixelsPerSide;
+
         /// <summary>Why the ladder is not exactly what was asked for, or null when it is.</summary>
         public string LadderNote;
 

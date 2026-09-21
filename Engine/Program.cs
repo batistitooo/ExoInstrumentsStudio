@@ -634,6 +634,20 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
     // THE RESOLVED SPEC IS WHAT THE WHOLE RUN USES. RunSequence takes it explicitly, so a named
     // band applies to every frame of the sequence and not only to the request that started it.
     var spec = seqSpec;
+
+    // DETECTOR OVERRIDES, onto a COPY. The roster's entries are static readonly singletons that
+    // every other request in this process shares, so writing to one would change the instrument
+    // for everybody; ShallowCopy exists for exactly this.
+    if (req.Detector != null)
+    {
+        spec = ApplyDetectorOverrides(spec, req.Detector, out string detectorError);
+        if (detectorError != null) return Results.BadRequest(new { error = detectorError });
+    }
+
+    if (req.DriftArcsecPerFrame is < 0.0 or > 60.0)
+        return Results.BadRequest(new { error = $"driftArcsecPerFrame {req.DriftArcsecPerFrame} is out of range. 0 to 60 arcseconds per frame." });
+    if (req.DriftPositionAngleDeg is < -360.0 or > 360.0)
+        return Results.BadRequest(new { error = $"driftPositionAngleDeg {req.DriftPositionAngleDeg} is out of range. -360 to 360 degrees." });
     if (OrbitalPlatforms.ForInstrument(spec) != null)
         return Results.BadRequest(new { error = $"{spec.Name} is an orbital instrument, and an airmass ladder has no meaning above the atmosphere. Pick a ground astrograph." });
 
@@ -784,6 +798,18 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         StartUt = seqStartUt,
         EndUt = seqEndUt,
         LadderNote = ladderNote,
+        DriftArcsecPerFrame = req.DriftArcsecPerFrame ?? 0.0,
+        DriftPositionAngleDeg = req.DriftPositionAngleDeg ?? 45.0,
+        // Recorded from the RESOLVED spec rather than from the request, so the record says what
+        // the detector actually was and not merely what was asked for.
+        OverriddenLinearityDeviation = req.Detector?.LinearityDeviationAtFullWell != null
+            ? spec.LinearityDeviationAtFullWell : double.NaN,
+        OverriddenPhotoResponseNonUniformity = req.Detector?.PhotoResponseNonUniformity != null
+            ? spec.PhotoResponseNonUniformity : double.NaN,
+        OverriddenOffsetFixedPatternElectrons = req.Detector?.OffsetFixedPatternElectrons != null
+            ? spec.OffsetFixedPatternElectrons : double.NaN,
+        OverriddenSensorNativePixelsPerSide = req.Detector?.SensorNativePixelsPerSide != null
+            ? spec.SensorNativePixelsPerSide : 0,
     };
     sequences.Add(seq);
 
@@ -793,6 +819,75 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
 
     return Results.Json(Dto.Sequence(seq, null));
 });
+
+// ----------------------------------------------------------------------------------------
+// DETECTOR OVERRIDES.
+//
+// The roster records only figures a manufacturer or an observatory has published and leaves
+// the rest NaN deliberately, because a borrowed number looks like a measurement. That is right
+// for simulating a real instrument and wrong for asking a question ABOUT an effect, which needs
+// the effect set to values no catalogue entry has and then swept.
+//
+// So a run may override them, onto a COPY. The roster's entries are static readonly singletons
+// shared by every request in this process; writing to one would change the instrument for
+// everybody, which is a bug that would be very hard to see from a light curve.
+//
+// Ranges are refused rather than clamped, with the bound named, because a silently clamped
+// sweep produces a flat region in a result and no explanation for it.
+static VisualTelescopeSpec ApplyDetectorOverrides(VisualTelescopeSpec spec, DetectorRequest d,
+                                                   out string error)
+{
+    error = null;
+
+    if (d.LinearityDeviationAtFullWell is { } lin)
+    {
+        // Above 0.5 the quadratic Q(1 - d Q/Q_fw) stops being monotonic below full well, so the
+        // readout would report LESS charge for MORE light and the model has stopped describing a
+        // detector. 0.4 keeps a margin; every published figure is two orders of magnitude below.
+        if (!(lin >= 0.0 && lin <= 0.4) || double.IsNaN(lin))
+        {
+            error = $"linearityDeviationAtFullWell {lin} is out of range. 0 to 0.4, where 0.018 "
+                  + "is the VLT FORS2 figure and 0 is a perfectly linear device.";
+            return spec;
+        }
+    }
+
+    if (d.PhotoResponseNonUniformity is { } prnu)
+    {
+        if (!(prnu >= 0.0 && prnu <= 0.2) || double.IsNaN(prnu))
+        {
+            error = $"photoResponseNonUniformity {prnu} is out of range. 0 to 0.2, where 0.0062 "
+                  + "is the ASI294MM Pro figure, quoted for the native pixel.";
+            return spec;
+        }
+    }
+
+    if (d.SensorNativePixelsPerSide is { } native)
+    {
+        if (native is < 1 or > 8)
+        {
+            error = $"sensorNativePixelsPerSide {native} is out of range. 1 to 8; the ASI294MM Pro "
+                  + "reads 2 and everything else on the roster reads 1.";
+            return spec;
+        }
+    }
+
+    if (d.OffsetFixedPatternElectrons is { } fpn)
+    {
+        if (!(fpn >= 0.0 && fpn <= 100.0) || double.IsNaN(fpn))
+        {
+            error = $"offsetFixedPatternElectrons {fpn} is out of range. 0 to 100 electrons RMS.";
+            return spec;
+        }
+    }
+
+    VisualTelescopeSpec copy = spec.ShallowCopy();
+    if (d.LinearityDeviationAtFullWell is { } l) copy.LinearityDeviationAtFullWell = l;
+    if (d.PhotoResponseNonUniformity is { } p2) copy.PhotoResponseNonUniformity = p2;
+    if (d.SensorNativePixelsPerSide is { } n2) copy.SensorNativePixelsPerSide = n2;
+    if (d.OffsetFixedPatternElectrons is { } f2) copy.OffsetFixedPatternElectrons = f2;
+    return copy;
+}
 
 app.MapGet("/api/sequences", () => Results.Json(sequences.All.Select(s => Dto.Sequence(s, null))));
 
@@ -2042,6 +2137,16 @@ bool TryCaptureOne(CaptureRequestDto req, out CaptureStore.Stored stored, out De
                                       out ExoInstruments.Visualization.CameraFilter filter,
                                       out string capBandErr))
         { refusal = Results.BadRequest(new { error = capBandErr }); return false; }
+    // DETECTOR OVERRIDES, onto a COPY, exactly as a sequence does. A single frame is how the
+    // effect of one of these is best SEEN: the per-star reduction gives a measured flux against
+    // the injected truth for every star in the field at once, so one frame with the effect on
+    // and one with it off show its whole magnitude dependence with no averaging and no waiting.
+    if (req.Detector != null)
+    {
+        capSpec = ApplyDetectorOverrides(capSpec, req.Detector, out string capDetectorError);
+        if (capDetectorError != null) { refusal = Results.BadRequest(new { error = capDetectorError }); return false; }
+    }
+
     // TryResolveBand already refused an unknown name against this instrument's own band list, so
     // the AvailableFilters check below only guards the roster path, where the enum is the list.
     var offered = capSpec.AvailableFilters;
@@ -3282,11 +3387,28 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
             double ut = seq.StartUt + span * i / Math.Max(1, seq.Frames - 1);
             ulong seed = seq.Seed + (ulong)i * PhotometricSequence.Stride;
 
+            // THE POINTING WALKS, when the run asked it to. The offset is cumulative in frame
+            // index so the field crosses the detector steadily rather than jittering about one
+            // spot, and it is applied to the COMMANDED coordinates, which is what a real mount
+            // error does: the sky has not moved, the telescope is looking somewhere slightly
+            // else. Everything downstream follows on its own, because the truth catalogue is
+            // reprojected per frame and the reduction matches measured centroids to it.
+            //
+            // Declination takes the north component directly; right ascension takes the east
+            // component divided by cos(dec), since a degree of RA subtends less sky away from
+            // the equator. At the pole that division diverges, so it is floored - a drift of a
+            // few arcseconds there is degenerate in RA anyway.
+            double driftDeg = seq.DriftArcsecPerFrame * i / 3600.0;
+            double driftPa = seq.DriftPositionAngleDeg * Math.PI / 180.0;
+            double cosDec = Math.Max(0.01, Math.Cos(seq.DecDeg * Math.PI / 180.0));
+            double frameDec = seq.DecDeg + driftDeg * Math.Cos(driftPa);
+            double frameRa = seq.RaDeg + driftDeg * Math.Sin(driftPa) / cosDec;
+
             var request = new DeepSkyCamera.Request
             {
                 Spec = spec, Site = site, Platform = null,
                 Ut = ut, RequestedUt = ut,
-                RaDeg = seq.RaDeg, DecDeg = seq.DecDeg,
+                RaDeg = frameRa, DecDeg = frameDec,
                 Filter = filter,
                 ExposureSeconds = seq.ExposureSeconds,
                 Binning = seq.Binning,

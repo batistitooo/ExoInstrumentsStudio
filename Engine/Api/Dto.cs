@@ -801,6 +801,57 @@ namespace ExoStudio.Api
     /// light came through, and an observer plans in airmass. The epochs are computed from the
     /// field's own culmination at the site.
     /// </summary>
+    /// <summary>
+    /// Detector properties the observer overrides for one run, on top of whatever the chosen
+    /// instrument ships with.
+    ///
+    /// WHY THIS EXISTS. The roster records only what a device's manufacturer or observatory has
+    /// actually published, and leaves the rest NaN on purpose: a borrowed figure is worse than
+    /// none, because it looks like a measurement. The consequence is that no catalogue
+    /// instrument carries both a photo-response non-uniformity and a non-linearity, and only
+    /// VLT FORS2 carries a non-linearity at all.
+    ///
+    /// That is right for simulating a real instrument and wrong for asking a question ABOUT an
+    /// effect, which needs the effect turned to values the roster does not have and swept. So
+    /// these override a copy of the spec for the duration of one run; the roster itself is never
+    /// touched, and the values used are echoed back in the sequence so that a result always
+    /// names the detector it came from.
+    ///
+    /// An instrument built this way is a CHIMERA - one device's non-linearity on another's
+    /// pixel response - and anything published from it has to say so.
+    /// </summary>
+    public sealed class DetectorRequest
+    {
+        /// <summary>
+        /// Relative deviation from linearity at full well, dimensionless: 0.018 is the FORS2
+        /// figure and 1.8 per cent. Zero means a perfectly linear device, which is the control
+        /// arm rather than the absence of a setting. Range 0 to 0.4; above 0.5 the quadratic
+        /// stops being monotonic over the well and the model no longer describes a detector.
+        /// </summary>
+        public double? LinearityDeviationAtFullWell { get; set; }
+
+        /// <summary>
+        /// Pixel-to-pixel photo-response non-uniformity, as a fraction of the mean response and
+        /// quoted for the NATIVE pixel: 0.0062 is the ASI294MM Pro figure. It is divided by
+        /// SensorNativePixelsPerSide times the binning before it reaches a read-out pixel, so
+        /// the two settings belong together. Range 0 to 0.2.
+        /// </summary>
+        public double? PhotoResponseNonUniformity { get; set; }
+
+        /// <summary>
+        /// How many native photosites make up one read-out pixel along a side, for instruments
+        /// that bin in silicon. The ASI294MM Pro reads 2; everything else reads 1. Set it
+        /// whenever PhotoResponseNonUniformity is set onto a different instrument's spec, or the
+        /// pixel response silently changes by that factor. Range 1 to 8.
+        /// </summary>
+        public int? SensorNativePixelsPerSide { get; set; }
+
+        /// <summary>
+        /// Additive readout fixed-pattern noise, electrons RMS per native pixel. Range 0 to 100.
+        /// </summary>
+        public double? OffsetFixedPatternElectrons { get; set; }
+    }
+
     public sealed class SequenceRequest
     {
         public string Telescope { get; set; }
@@ -841,6 +892,32 @@ namespace ExoStudio.Api
         /// exactly the noise a transit has to be found underneath.
         /// </summary>
         public PwvRequest Pwv { get; set; }
+
+        /// <summary>Detector properties to override for this run. Null leaves the instrument as it is.</summary>
+        public DetectorRequest Detector { get; set; }
+
+        /// <summary>
+        /// How far the commanded pointing walks between consecutive frames, in arcseconds.
+        ///
+        /// WHY A RUN NEEDS THIS. A tracked sequence holds one pointing for the whole night, so
+        /// every star lands on the same pixels in every frame and a fixed pattern in the pixel
+        /// response cancels out of the differential ratio exactly. Real telescopes drift:
+        /// flexure, polar misalignment, guiding error. A star that walks across the detector
+        /// samples pixels of different sensitivity, so its well-fill fraction changes through
+        /// the night even at constant airmass, and a signal-dependent effect like non-linearity
+        /// is modulated by it. That coupling cannot be studied with a run that never moves.
+        ///
+        /// Null or zero holds the pointing still, exactly as before. Range 0 to 60 arcseconds
+        /// per frame.
+        /// </summary>
+        public double? DriftArcsecPerFrame { get; set; }
+
+        /// <summary>
+        /// Which way the drift goes, degrees east of north. Zero walks the field in declination.
+        /// Defaults to 45 so that a drift moves in both pixel axes rather than along a column,
+        /// which is the degenerate case for a column-wise fixed pattern.
+        /// </summary>
+        public double? DriftPositionAngleDeg { get; set; }
     }
 
     /// <summary>
@@ -935,6 +1012,14 @@ namespace ExoStudio.Api
 
     public sealed class CaptureRequestDto
     {
+        /// <summary>
+        /// Detector properties to override for this frame only, applied to a copy of the
+        /// instrument. Null leaves it as the roster has it. See DetectorRequest: the roster
+        /// records only published figures, which is right for simulating an instrument and
+        /// wrong for asking a question about an effect.
+        /// </summary>
+        public DetectorRequest Detector { get; set; }
+
         /// <summary>A copy differing only in filter and seed, for the bundle's frame loop. A class,
         /// not a record, so `with` is not available; this is the one place a copy is needed.</summary>
         public CaptureRequestDto With(string filter, ulong seed)
