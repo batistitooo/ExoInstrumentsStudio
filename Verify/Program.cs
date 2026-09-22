@@ -4615,6 +4615,219 @@ Section("30. The kernel this program builds is the profile the atmosphere makes"
           $"{kolm1:F4} at one FWHM against a Gaussian's {gauss1:F4}: "
           + $"{(1.0 - kolm1) / (1.0 - gauss1):F1} times as much light still outside");
 }
+
+Section("31. A frame rendered without the dice, and the detection that still has to work on it");
+{
+    // THIS SECTION NEEDS PIXELS. Everything it asserts is about what Digitise does to a prepared
+    // plane and what FrameReduction then makes of it, so there is no arithmetic fixture that would
+    // stand in: the plane has to come from Prepare, on the route section 12 renders its round trip
+    // through. RC20 at the North Galactic Pole is that route's own fixture, and the long comment
+    // there is why it is that pointing rather than M13.
+    var data31 = new DeepSkyData(DeepSkyDirs());
+    var req31 = new DeepSkyCamera.Request
+    {
+        Spec = Observatories.All.First(i => i.Name == "RC20").VisualTelescope,
+        Site = ObservingSites.RoqueDeLosMuchachos,
+        Ut = SimulationClock.UtcToUt(new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc)),
+        RequestedUt = SimulationClock.UtcToUt(new DateTime(2026, 4, 1, 1, 0, 0, DateTimeKind.Utc)),
+        RaDeg = 193.1600, DecDeg = 27.1284,
+        Filter = CameraFilter.Luminance,
+        ExposureSeconds = 120.0,
+        Binning = 1,
+        Seed = 1,
+        Noiseless = true,
+    };
+    DeepSkyCamera.PreparedExposure prep31 = DeepSkyCamera.Prepare(req31, data31);
+
+    if (prep31.Meta.Error != null)
+    {
+        Console.WriteLine($"    skipped: {prep31.Meta.Error}");
+    }
+    else
+    {
+        int n31 = prep31.W * prep31.H;
+
+        // TWO DIGITISATIONS UNDER DIFFERENT SEEDS. The same seed twice would prove only that the
+        // generator is a function of its seed, which was never in doubt; different seeds is the
+        // statement that there is nothing left for a seed to drive.
+        float[] quiet31 = DeepSkyCamera.Digitise(prep31, 1, out _);
+        float[] quietAgain31 = DeepSkyCamera.Digitise(prep31, 7919, out _);
+        int differ31 = 0;
+        for (int i = 0; i < n31; i++) if (quiet31[i] != quietAgain31[i]) differ31++;
+        Check("two noiseless digitisations of one plane give the same pixels under different seeds",
+              differ31 == 0, $"{differ31} of {n31} pixels differ");
+
+        // THE SAME PLANE WITH THE DICE BACK IN. Noiseless is a flag on the PREPARED exposure, so
+        // the noisy twin carries the identical signal plane, sky, dark and fixed patterns, and
+        // everything separating the two frames is the three draws and nothing else.
+        prep31.Noiseless = false;
+        float[] noisy31 = DeepSkyCamera.Digitise(prep31, 1, out _);
+        prep31.Noiseless = true;
+
+        int moved31 = 0;
+        for (int i = 0; i < n31; i++) if (quiet31[i] != noisy31[i]) moved31++;
+        Console.WriteLine($"    {prep31.W} x {prep31.H} at 120 s: {100.0 * moved31 / n31:F1} per cent of the pixels "
+                        + "differ between the noiseless frame and the noisy twin off the same plane");
+        Check("and the noisy twin is not that frame, so the flag is doing something",
+              moved31 > n31 / 2, $"{moved31} of {n31} pixels moved");
+
+        // THE LEVEL, WHICH IS NOT THE SAME STATEMENT AS EITHER OF THOSE. A frame could be perfectly
+        // repeatable and perfectly quiet and still sit at the wrong place: the mean of a Poisson
+        // draw is its rate, so replacing the draw by the rate has to leave the EXPECTATION alone.
+        // Scored against the noisy frame's own standard error on its mean, because that is the
+        // precision that frame has to offer and therefore the only scale a bias is visible on.
+        double meanQuiet31 = 0.0, meanNoisy31 = 0.0;
+        for (int i = 0; i < n31; i++) { meanQuiet31 += quiet31[i]; meanNoisy31 += noisy31[i]; }
+        meanQuiet31 /= n31; meanNoisy31 /= n31;
+
+        double sq31 = 0.0;
+        for (int i = 0; i < n31; i++) { double d = noisy31[i] - meanNoisy31; sq31 += d * d; }
+        double se31 = Math.Sqrt(sq31 / (n31 - 1)) / Math.Sqrt(n31);
+
+        Console.WriteLine($"    mean level {meanQuiet31:F4} ADU noiseless against {meanNoisy31:F4} noisy, "
+                        + $"{(meanQuiet31 - meanNoisy31) * prep31.ElectronsPerAdu:+0.0000;-0.0000} e- apart, against "
+                        + $"the noisy frame's own standard error of {se31 * prep31.ElectronsPerAdu:F4} e-");
+        Check("the noiseless frame sits at the noisy frame's mean, inside that frame's standard error",
+              Math.Abs(meanQuiet31 - meanNoisy31) < se31,
+              $"{Math.Abs(meanQuiet31 - meanNoisy31) / se31:F2} standard errors, so the expectation is "
+              + "unbiased rather than merely quiet");
+    }
+
+    // ---- and the reduction that has to survive such a frame ------------------------------------
+    //
+    // WHY THIS HALF RENDERS A SECOND FRAME THROUGH A DIFFERENT INSTRUMENT, and it is the thing the
+    // guard in FrameReduction is easiest to be wrong about. The stand-in engages only when the
+    // frame carries NO measurable background scatter, and a noiseless frame off the RC20 carries
+    // 2.4 e- of it: the offset fixed pattern is not a draw, so it survives into a frame taken
+    // without the dice, and quantising a background that is therefore no longer constant puts
+    // another 1.2 e- on top of it. That frame detects against a real scatter and never reaches the
+    // fallback at all - it detects against a scatter four times smaller than its noisy twin's,
+    // which is a different problem and not this one.
+    //
+    // The frame that does reach the fallback is one whose detector publishes no fixed pattern, and
+    // the observer-defined instrument of section 10 is exactly that: VisualTelescopeSpec leaves
+    // both non-uniformities NaN unless a datasheet supplies them, and a builder that invented one
+    // would be the dishonesty section 10 exists to prevent. A 1 m at 0.29 arcsec per pixel is also
+    // well sampled in the Roque's seeing, so the reduction it feeds is a reliable one.
+    var custom31 = new CustomInstruments.Request
+    {
+        Name = "Verify noiseless 1m",
+        ApertureMeters = 1.0,
+        FocalLengthMeters = 6.5,
+        SecondaryObstructionFraction = 0.30,
+        SensorWidthPx = 1024,
+        SensorHeightPx = 1024,
+        PixelSizeMicrons = 9.0,
+        QuantumEfficiency = 0.90,
+        FullWellElectrons = 90000,
+        ReadNoiseElectrons = 1.2,
+        DarkCurrentElectronsPerSecond = 0.002,
+        DetectorTemperatureCelsius = -40,
+        AdcBits = 16,
+        SiteId = "orm",
+        ZenithSeeingFwhmArcsec = 1.0,
+        Filters = new List<CustomInstruments.FilterRequest>
+        {
+            new() { Position = "Luminance", CentralWavelengthNm = 550.0, BandwidthAngstrom = 890.0 },
+        },
+    };
+    CustomInstruments.Built built31 = CustomInstruments.Build(custom31, out string buildError31);
+    Check("an instrument whose datasheet publishes no fixed patterns builds", built31 != null, buildError31);
+
+    if (built31 != null)
+    {
+        // THE FIELD SITS 19 DEG OFF THE NORTH GALACTIC POLE RATHER THAN ON IT, and that is not
+        // cosmetic. EstimateBackground clips three times, and three clips land on the background
+        // EXACTLY only when no star in frame is bright enough to hold the window open past them;
+        // at this scale the pole itself has one that is, and the estimate stops at 0.23 e- rather
+        // than at zero. Nineteen degrees away the sky is as empty and the estimate reaches nothing.
+        var flatReq31 = new DeepSkyCamera.Request
+        {
+            Spec = built31.Spec,
+            Site = ObservingSites.RoqueDeLosMuchachos,
+            Ut = SimulationClock.UtcToUt(new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc)),
+            RequestedUt = SimulationClock.UtcToUt(new DateTime(2026, 4, 1, 1, 0, 0, DateTimeKind.Utc)),
+            RaDeg = 200.0, DecDeg = 45.0,
+            Filter = CameraFilter.Luminance,
+            ExposureSeconds = 120.0,
+            Binning = 1,
+            Seed = 1,
+            Noiseless = true,
+        };
+        DeepSkyCamera.PreparedExposure flatPrep31 = DeepSkyCamera.Prepare(flatReq31, data31);
+
+        if (flatPrep31.Meta.Error != null)
+        {
+            Console.WriteLine($"    skipped: {flatPrep31.Meta.Error}");
+        }
+        else
+        {
+            float[] flatQuiet31 = DeepSkyCamera.Digitise(flatPrep31, 1, out _);
+            FrameReduction.Result quietRed31 = FrameReduction.Reduce(flatQuiet31, flatPrep31);
+
+            flatPrep31.Noiseless = false;
+            float[] flatNoisy31 = DeepSkyCamera.Digitise(flatPrep31, 1, out _);
+            FrameReduction.Result noisyRed31 = FrameReduction.Reduce(flatNoisy31, flatPrep31);
+            flatPrep31.Noiseless = true;
+
+            if (quietRed31.InjectedInFrame == 0)
+            {
+                Console.WriteLine("    skipped: no deep star catalogue on this machine, so the frame "
+                                + "has no stars in it to be detected");
+            }
+            else
+            {
+                Console.WriteLine($"    {flatPrep31.W} x {flatPrep31.H}, {quietRed31.FwhmPx:F1} px per FWHM, "
+                                + $"{quietRed31.InjectedInFrame} stars injected: noiseless measures "
+                                + $"{quietRed31.BackgroundRmsElectrons:F2} e- of background scatter, the noisy "
+                                + $"twin {noisyRed31.BackgroundRmsElectrons:F2} e-");
+
+                // THE FRAME BEFORE THE FALLBACK SEES IT, which is the whole reason the fallback is
+                // there: handed the scatter this frame actually measures, the detector returns
+                // nothing at all, and a frame full of perfectly sharp stars reduces to an empty
+                // list. Same call the reduction makes, same threshold, same separation.
+                var quietElectrons31 = new float[flatPrep31.W * flatPrep31.H];
+                for (int i = 0; i < quietElectrons31.Length; i++)
+                    quietElectrons31[i] = (float)((flatQuiet31[i] - flatPrep31.BiasAdu) * flatPrep31.ElectronsPerAdu);
+
+                int withoutStandIn31 = AperturePhotometry.FindSources(
+                    quietElectrons31, flatPrep31.W, flatPrep31.H,
+                    quietRed31.BackgroundElectrons, quietRed31.BackgroundRmsElectrons,
+                    FrameReduction.DefaultThresholdSigma,
+                    minSeparationPx: Math.Max(2, (int)Math.Round(quietRed31.FwhmPx))).Count;
+                Check("detection against the scatter a noiseless frame measures finds nothing at all",
+                      withoutStandIn31 == 0,
+                      $"{withoutStandIn31} sources at {quietRed31.BackgroundRmsElectrons:F2} e- of scatter");
+
+                Check("so the reduction stands the expected noise in, and says in its notes that it did",
+                      quietRed31.Notes.Any(t => t.Contains("no measurable background scatter")),
+                      string.Join(" | ", quietRed31.Notes.Where(t => t.Contains("background scatter"))));
+
+                // AND WHAT IT STANDS IN IS THE RIGHT NUMBER. The sky and dark shot noise the frame
+                // would have carried plus the read noise, in quadrature, computed here rather than
+                // read off the reduction, and scored against what the noisy twin actually measures
+                // on its own pixels. Agreement is the statement that the two frames are detected at
+                // the same depth, which is what makes them comparable at all.
+                double predicted31 = Math.Sqrt(Math.Max(0.0, flatPrep31.SkyElectronsPerPixel)
+                                             + Math.Max(0.0, flatPrep31.Meta.DarkElectronsPerPixel)
+                                             + flatPrep31.Spec.ReadNoiseElectrons * flatPrep31.Spec.ReadNoiseElectrons);
+                Console.WriteLine($"    the noise it would have had: {predicted31:F2} e- per pixel against the "
+                                + $"{noisyRed31.BackgroundRmsElectrons:F2} e- the noisy twin measures");
+                Check("and the noise it stands in is the noise the noisy twin measures, so both detect at one depth",
+                      Math.Abs(predicted31 - noisyRed31.BackgroundRmsElectrons) < 0.05 * noisyRed31.BackgroundRmsElectrons,
+                      $"{100.0 * (predicted31 - noisyRed31.BackgroundRmsElectrons) / noisyRed31.BackgroundRmsElectrons:+0.0;-0.0} per cent apart");
+
+                Console.WriteLine($"    the reduction: {quietRed31.SourcesFound} detected and {quietRed31.Matched} matched "
+                                + $"noiseless, {noisyRed31.SourcesFound} and {noisyRed31.Matched} on the noisy twin");
+                Check("and the noiseless frame reduces to its stars rather than to nothing",
+                      quietRed31.Matched > 0 && quietRed31.Matched >= noisyRed31.Matched - 1,
+                      $"{quietRed31.Matched} of {quietRed31.InjectedInFrame} injected matched, "
+                      + $"against {noisyRed31.Matched} on the noisy twin");
+            }
+        }
+    }
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"
