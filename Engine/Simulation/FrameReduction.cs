@@ -258,29 +258,59 @@ namespace ExoStudio.Simulation
             r.BackgroundElectrons = background;
             r.BackgroundRmsElectrons = backgroundRms;
 
-            // THE THRESHOLD IS A SCALE, AND ON A NOISELESS FRAME THE MEASURED SCATTER IS ZERO.
+            // THE SCATTER A NOISELESS FRAME MEASURES IS NOT THE NOISE IT WOULD HAVE HAD.
             //
             // Detection works by asking which pixels stand a given number of sigma above the
             // background, and sigma has always been the scatter measured on the frame. That is
-            // right for a frame with noise in it and undefined for one without: the scatter is
-            // exactly zero, AperturePhotometry.FindSources returns on it, and a perfectly good
-            // frame full of perfectly sharp stars reduces to nothing at all.
+            // right for a frame with noise in it and wrong for one rendered without the dice, and
+            // it is wrong in two different ways depending on the detector.
             //
-            // The expected noise is still perfectly well defined, so it is what stands in: the
-            // photon and dark shot noise the sky WOULD have carried, plus the read noise, in
-            // quadrature. A noiseless frame is then detected at the same effective depth as its
-            // noisy twin, which is what makes the two comparable.
+            // ON A DETECTOR THAT PUBLISHES NO FIXED PATTERN the measured scatter is exactly zero,
+            // AperturePhotometry.FindSources returns on it, and a perfectly good frame full of
+            // perfectly sharp stars reduces to nothing at all. That is the loud failure and it was
+            // the one this guard was first written for.
+            //
+            // ON EVERY OTHER DETECTOR IT IS THE QUIET ONE, and the quiet one is worse because the
+            // frame still reduces and the numbers still look like numbers. The offset fixed
+            // pattern is not a draw, so it survives into a frame taken without the dice, and
+            // quantising a background that is therefore no longer constant puts more on top of it:
+            // a noiseless RC20 frame measures 2.41 e- per pixel where its noisy twin measures
+            // 10.89. Detecting at 2.41 is detecting four times deeper than the twin, and it showed
+            // up as 610 sources against the twin's 101 on the same sky, the reduction calling
+            // itself UNRELIABLE for fragmenting stars it had every right to find. Comparing a
+            // noiseless run with a noisy one is the entire reason the mode exists, and this was
+            // the thing that stopped them being comparable.
+            //
+            // SO THE TWO ARE ADDED IN QUADRATURE RATHER THAN ONE REPLACING THE OTHER. What a
+            // noiseless frame measures is its fixed patterns and its quantisation, which are in
+            // the noisy twin too; what it is missing is the draws, whose size is known exactly
+            // from the sky, the dark and the read noise. The twin's own scatter is those two
+            // combined, so combining them is not an approximation of it - measured on the frames
+            // above, 2.41 with 10.64 expected gives 10.91 against the 10.89 the twin measures.
+            //
+            // The condition is the FLAG and not the measurement, because "the scatter came out
+            // zero" is a symptom of one detector rather than the thing that is true. The zero case
+            // is kept for a frame that is not noiseless and measures nothing anyway, where the
+            // quadrature reduces to the expected noise on its own and nothing changes.
             double detectionRms = backgroundRms;
-            if (!(detectionRms > 0.0))
             {
                 double sky = Math.Max(0.0, prep.SkyElectronsPerPixel);
                 double dark = Math.Max(0.0, prep.Meta.DarkElectronsPerPixel);
                 double rn = Math.Max(0.0, prep.Spec.ReadNoiseElectrons);
-                detectionRms = Math.Sqrt(sky + dark + rn * rn);
-                if (detectionRms > 0.0)
-                    r.Notes.Add($"The frame carries no measurable background scatter, so detection "
-                              + $"used the noise it would have had, {detectionRms:F2} e- per pixel, "
-                              + "rather than the scatter it does not have.");
+                double expected = Math.Sqrt(sky + dark + rn * rn);
+
+                if ((prep.Noiseless || !(detectionRms > 0.0)) && expected > 0.0)
+                {
+                    detectionRms = Math.Sqrt(backgroundRms * backgroundRms + expected * expected);
+                    r.Notes.Add(prep.Noiseless
+                        ? $"This frame was rendered without the dice, so the {backgroundRms:F2} e- per "
+                        + "pixel it measures is its fixed patterns and its quantisation rather than its "
+                        + $"noise. Detection used {detectionRms:F2} e-, the {expected:F2} e- of shot and "
+                        + "read noise it would have carried added in quadrature to what is there."
+                        : $"The frame carries no measurable background scatter, so detection "
+                        + $"used the noise it would have had, {detectionRms:F2} e- per pixel, "
+                        + "rather than the scatter it does not have.");
+                }
             }
 
             // The aperture geometry is Core's own convention, so the measurement and the limiting

@@ -4691,21 +4691,62 @@ Section("31. A frame rendered without the dice, and the detection that still has
               Math.Abs(meanQuiet31 - meanNoisy31) < se31,
               $"{Math.Abs(meanQuiet31 - meanNoisy31) / se31:F2} standard errors, so the expectation is "
               + "unbiased rather than merely quiet");
+
+        // AND THE REDUCTION, WHICH IS WHAT THE MODE EXISTS FOR. A study measures an amplitude by
+        // differencing a noiseless run against a noisy one, and that is only worth anything if
+        // the two were detected at the same depth. The scatter this frame measures is 2.4 e- of
+        // fixed pattern and quantisation, a quarter of what the twin measures, and detection
+        // against it found 610 sources against the twin's 101 and reported itself UNRELIABLE for
+        // fragmenting stars it had every right to find.
+        //
+        // The depth is rebuilt here from the same two pieces FrameReduction adds, and scored
+        // against what the noisy twin measures on its OWN pixels. That is the independent number:
+        // nothing in the twin's reduction consults this frame, so the agreement is a statement
+        // about the physics rather than about the arithmetic being copied correctly.
+        prep31.Noiseless = true;
+        FrameReduction.Result rcQuiet31 = FrameReduction.Reduce(quiet31, prep31);
+        prep31.Noiseless = false;
+        FrameReduction.Result rcNoisy31 = FrameReduction.Reduce(noisy31, prep31);
+        prep31.Noiseless = true;
+
+        double expected31 = Math.Sqrt(Math.Max(0.0, prep31.SkyElectronsPerPixel)
+                                    + Math.Max(0.0, prep31.Meta.DarkElectronsPerPixel)
+                                    + prep31.Spec.ReadNoiseElectrons * prep31.Spec.ReadNoiseElectrons);
+        double depth31 = Math.Sqrt(rcQuiet31.BackgroundRmsElectrons * rcQuiet31.BackgroundRmsElectrons
+                                 + expected31 * expected31);
+
+        Console.WriteLine($"    the noiseless frame measures {rcQuiet31.BackgroundRmsElectrons:F2} e- of scatter and "
+                        + $"detects at {depth31:F2}, its {expected31:F2} e- of absent noise in quadrature; the noisy "
+                        + $"twin measures {rcNoisy31.BackgroundRmsElectrons:F2} e-");
+        Check("a noiseless frame detects at the depth its noisy twin measures, fixed patterns and all",
+              Math.Abs(depth31 - rcNoisy31.BackgroundRmsElectrons) < 0.02 * rcNoisy31.BackgroundRmsElectrons,
+              $"{100.0 * (depth31 - rcNoisy31.BackgroundRmsElectrons) / rcNoisy31.BackgroundRmsElectrons:+0.00;-0.00} per cent apart");
+
+        if (rcQuiet31.InjectedInFrame > 0)
+        {
+            Console.WriteLine($"    the reduction: {rcQuiet31.SourcesFound} detected and {rcQuiet31.Matched} matched "
+                            + $"noiseless, {rcNoisy31.SourcesFound} and {rcNoisy31.Matched} on the noisy twin, "
+                            + $"against {rcQuiet31.InjectedInFrame} injected");
+            Check("so it does not detect far deeper than the twin and fragment what it finds",
+                  rcQuiet31.SourcesFound < 3 * rcNoisy31.SourcesFound / 2,
+                  $"{rcQuiet31.SourcesFound} sources against the twin's {rcNoisy31.SourcesFound}");
+            Check("and it reduces reliably, rather than calling itself fragmented on a perfect frame",
+                  rcQuiet31.Reliable,
+                  string.Join(" | ", rcQuiet31.Notes.Where(t => t.StartsWith("UNRELIABLE"))));
+        }
     }
 
     // ---- and the reduction that has to survive such a frame ------------------------------------
     //
-    // WHY THIS HALF RENDERS A SECOND FRAME THROUGH A DIFFERENT INSTRUMENT, and it is the thing the
-    // guard in FrameReduction is easiest to be wrong about. The stand-in engages only when the
-    // frame carries NO measurable background scatter, and a noiseless frame off the RC20 carries
-    // 2.4 e- of it: the offset fixed pattern is not a draw, so it survives into a frame taken
-    // without the dice, and quantising a background that is therefore no longer constant puts
-    // another 1.2 e- on top of it. That frame detects against a real scatter and never reaches the
-    // fallback at all - it detects against a scatter four times smaller than its noisy twin's,
-    // which is a different problem and not this one.
+    // WHY THIS HALF RENDERS A SECOND FRAME THROUGH A DIFFERENT INSTRUMENT. The frame above is the
+    // QUIET failure: it measures a scatter of its own, so it reduces, and the only symptom of
+    // having detected at a quarter of the twin's depth is numbers that still look like numbers.
+    // The LOUD one needs a detector that publishes no fixed pattern at all, and there the measured
+    // scatter is exactly zero, FindSources returns on it, and a frame full of perfectly sharp
+    // stars reduces to nothing whatsoever. One guard answers both, and a fix that cured only the
+    // failure it was written for would have left the other standing.
     //
-    // The frame that does reach the fallback is one whose detector publishes no fixed pattern, and
-    // the observer-defined instrument of section 10 is exactly that: VisualTelescopeSpec leaves
+    // The observer-defined instrument of section 10 is that detector: VisualTelescopeSpec leaves
     // both non-uniformities NaN unless a datasheet supplies them, and a builder that invented one
     // would be the dishonesty section 10 exists to prevent. A 1 m at 0.29 arcsec per pixel is also
     // well sampled in the Roque's seeing, so the reduction it feeds is a reliable one.
@@ -4800,8 +4841,8 @@ Section("31. A frame rendered without the dice, and the detection that still has
                       $"{withoutStandIn31} sources at {quietRed31.BackgroundRmsElectrons:F2} e- of scatter");
 
                 Check("so the reduction stands the expected noise in, and says in its notes that it did",
-                      quietRed31.Notes.Any(t => t.Contains("no measurable background scatter")),
-                      string.Join(" | ", quietRed31.Notes.Where(t => t.Contains("background scatter"))));
+                      quietRed31.Notes.Any(t => t.Contains("rendered without the dice")),
+                      string.Join(" | ", quietRed31.Notes.Where(t => t.Contains("without the dice"))));
 
                 // AND WHAT IT STANDS IN IS THE RIGHT NUMBER. The sky and dark shot noise the frame
                 // would have carried plus the read noise, in quadrature, computed here rather than

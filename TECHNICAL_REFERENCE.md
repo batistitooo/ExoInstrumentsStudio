@@ -1365,12 +1365,27 @@ comes out at 3.3e-4 of the flux. Noise belongs in the injection-recovery half of
 what a real night can measure IS the question, and nowhere else.
 
 ONE THING HAD TO CHANGE DOWNSTREAM. Detection asks which pixels stand a given number of sigma above
-the background, and sigma was always the scatter measured on the frame. On a noiseless frame that
-scatter is exactly zero, `AperturePhotometry.FindSources` returns on it, and a perfectly good frame
-full of perfectly sharp stars reduces to nothing at all. The EXPECTED noise is still well defined,
-so it stands in: the photon and dark shot noise the sky would have carried, plus the read noise, in
-quadrature. The frame then detects at the same effective depth as its noisy twin, which is what
-makes the two comparable, and the reduction says in its notes when it had to do this.
+the background, and sigma was always the scatter measured on the frame. On a frame rendered without
+the dice that scatter is not the noise, and it fails in two different ways depending on the
+detector.
+
+On one that publishes no fixed pattern the scatter is exactly zero, `AperturePhotometry.FindSources`
+returns on it, and a perfectly good frame full of perfectly sharp stars reduces to nothing at all.
+On every other detector the failure is quiet, and worse for being quiet: the offset fixed pattern is
+not a draw, so it survives into a noiseless frame, and quantising a background that is therefore no
+longer constant adds more on top. A noiseless RC20 frame measures 2.41 e- per pixel where its noisy
+twin measures 10.89, and detecting at 2.41 found 610 sources against the twin's 101 on the same sky,
+the reduction reporting itself UNRELIABLE for fragmenting stars it had every right to find.
+
+So the EXPECTED noise is added in quadrature to whatever the frame does measure, rather than
+replacing it: what a noiseless frame measures is its fixed patterns and its quantisation, which the
+noisy twin carries too, and what it is missing is the draws, whose size the sky, the dark and the
+read noise fix exactly. The twin's own scatter is those two combined, so the sum is not an
+approximation of it: 2.41 with 10.64 expected gives 10.91 against the 10.89 the twin measures, and
+0.13 per cent is the agreement at bin 1, 0.33 per cent at bin 4. The frame then detects at the same
+effective depth as its noisy twin, which is what makes the two comparable, and the reduction says in
+its notes when it had to do this. The condition is the `Noiseless` flag rather than a scatter that
+came out zero, because the zero was a symptom of one detector and not the thing that is true.
 
 ## 5.9 Water vapour
 
