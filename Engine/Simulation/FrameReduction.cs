@@ -402,12 +402,48 @@ namespace ExoStudio.Simulation
                 (Math.Floor(Math.Min(prep.MaxAdu, wellCeilingAdu)) - 0.5 - prep.BiasAdu)
                 * prep.ElectronsPerAdu;
 
+            // MEASURED TWICE, THE SECOND TIME ON ITS OWN CENTROID.
+            //
+            // FindSources returns the INTEGER pixel a source peaks on, and the first pass places
+            // the aperture there. A star's real centre is somewhere inside that pixel, up to 0.71
+            // px away, so the aperture is mis-centred by a sub-pixel amount that depends on where
+            // the star happened to fall on the grid. A circular aperture loses flux at second
+            // order in that offset, which is invisible to ordinary photometry and is NOT invisible
+            // to a differential measurement: the offset is different for every star and it changes
+            // when the seeing does, because the peak pixel itself can move.
+            //
+            // Measure already computes the centroid from the background-subtracted first moment
+            // and it simply was not fed back, so feeding it back is right on its own terms.
+            //
+            // IT DOES NOT, HOWEVER, FIX THE FLOOR IT WAS ADDED FOR, and that is worth recording
+            // rather than quietly leaving as an improvement. A differential ratio of one star
+            // against six, on NOISELESS frames, with every star given the same temperature and a
+            // single shared kernel, should be exactly invariant when the seeing changes: every
+            // profile is the same shape and only its scale moves. Measured, it is not. The null
+            // comes back at 0.78 mmag rms over apertures from 0.75 to 3 FWHM, 1.8 mmag at the
+            // tightest, and re-centring on the centroid changed it by less than a per cent.
+            //
+            // The remaining suspect is that this centroid is itself quantised: it is a
+            // flux-weighted mean of integer pixel INDICES, as the note further down in this file
+            // says, so it carries the same grid it is meant to escape. Until that floor is under
+            // about 0.1 mmag, no colour effect of the size this program was extended to measure
+            // can be recovered from rendered frames, and anything that looks like one is this.
             var measured = new List<AperturePhotometry.Source>(peaks.Count);
             foreach ((int px, int py) in peaks)
             {
-                AperturePhotometry.Source s = AperturePhotometry.Measure(
+                AperturePhotometry.Source first = AperturePhotometry.Measure(
                     electrons, w, h, px, py, apertureRadiusPx, inner, outer,
                     prep.Spec.ReadNoiseElectrons, saturationElectrons);
+                if (!(first.Flux > 0.0)) continue;
+
+                // A centroid that ran away is a blend or an edge, not a better centre; keep the
+                // first pass rather than chase it off the star.
+                double moved = Math.Sqrt((first.X - px) * (first.X - px) + (first.Y - py) * (first.Y - py));
+                AperturePhotometry.Source s = moved <= 1.5
+                    ? AperturePhotometry.Measure(
+                        electrons, w, h, first.X, first.Y, apertureRadiusPx, inner, outer,
+                        prep.Spec.ReadNoiseElectrons, saturationElectrons)
+                    : first;
                 if (s.Flux > 0.0) measured.Add(s);
             }
 
@@ -637,7 +673,7 @@ namespace ExoStudio.Simulation
                 // Windowed at the sky annulus's inner edge, which is where the star's light is
                 // taken to stop; see MeasureFwhmPx on why the window is part of the definition.
                 double starFwhm = AperturePhotometry.MeasureFwhmPx(
-                    electrons, w, h, s.X, s.Y, s.Background, inner);
+                    electrons, w, h, s.X, s.Y, s.Background, inner, fwhmPx);
 
                 var m = new Match
                 {

@@ -45,57 +45,102 @@ namespace ExoInstruments.Core
         }
 
         /// <summary>
-        /// The width of one star as MEASURED ON THE PIXELS, in pixels, from the second moments of
-        /// its background-subtracted light inside a window.
+        /// The width of one star as MEASURED ON THE PIXELS, in pixels, from ITERATIVE
+        /// GAUSSIAN-WEIGHTED second moments of its background-subtracted light.
         ///
         /// WHY A MEASURED WIDTH IS A DIFFERENT QUANTITY FROM THE SEEING. A pipeline detrending a
         /// light curve regresses against the width it measured on the field, not against the
         /// seeing that was commanded: it has no access to the second. The two differ by the
         /// diffraction core, by the detector's sampling, and star by star by colour, which is the
-        /// whole subject here. Anything claiming to reproduce what a pipeline does has to measure.
+        /// whole subject this was added for. Anything claiming to reproduce what a pipeline does
+        /// has to measure.
         ///
-        /// SECOND MOMENTS, AND THE WINDOW IS PART OF THE DEFINITION. For a Gaussian the moment
-        /// width and the half-maximum width agree exactly through the 2*sqrt(2*ln 2) below. For a
-        /// real profile with Kolmogorov wings they do not: the wings carry moment out of
-        /// proportion to their height, so a wider window returns a wider star. That is not an
-        /// error to be corrected, it is what the estimator means, and it is why the window is an
-        /// argument rather than a constant. Report the window with the width.
+        /// WHY THE WEIGHT, AND WHAT THE UNWEIGHTED VERSION DID. The first version of this took
+        /// plain second moments inside a window, which is the textbook formula and is wrong on a
+        /// real frame. Every pixel in the window carries dx^2 into the sum, so the far ones
+        /// dominate it, and on a frame with a fixed pattern the far ones are not the star: they
+        /// are sensor structure standing above the local background. On a bright star that is
+        /// negligible and on a faint one it is the whole measurement.
         ///
-        /// Pixels below the background are clipped to zero rather than allowed to contribute
-        /// negative moment, which on a faint star is the difference between a width and a NaN.
+        /// Measured on 76 stars of one field, ALL GIVEN THE SAME TEMPERATURE so that their true
+        /// widths are identical by construction: the unweighted estimator returned 4.91 px down to
+        /// V = 17, then 5.61 px at V 17 to 19 and 6.41 px beyond 19. Thirty per cent of inflation
+        /// with no physics behind it, on the very quantity a study uses as its regressor.
+        ///
+        /// A Gaussian weight of the current width suppresses the far pixels whatever their level,
+        /// which is what SExtractor's windowed parameters do and for the same reason. The weight
+        /// narrows the measured profile by a known amount: the product of two Gaussians of widths
+        /// s and w has 1/p^2 = 1/s^2 + 1/w^2, so taking w equal to the current estimate makes the
+        /// fixed point s = sqrt(2) p. That is the iteration below, damped and capped.
+        ///
+        /// It is still an estimator with a convention, not a truth: on a profile with Kolmogorov
+        /// wings the weighted width is smaller than the half-maximum width, because the weight
+        /// deliberately discards the wings. What it no longer is, is a function of how bright the
+        /// star happens to be.
         /// </summary>
+        /// <param name="windowPx">Hard outer limit on the pixels considered, beyond the weight.</param>
+        /// <param name="initialFwhmPx">A starting width. NaN begins at a third of the window.</param>
         public static double MeasureFwhmPx(float[] frame, int width, int height,
                                            double centreX, double centreY,
-                                           double background, double windowPx)
+                                           double background, double windowPx,
+                                           double initialFwhmPx = double.NaN)
         {
             if (frame == null || !(windowPx > 0.0)) return double.NaN;
+
+            double sigma = double.IsFinite(initialFwhmPx) && initialFwhmPx > 0.0
+                ? initialFwhmPx / 2.3548200450309493
+                : windowPx / 3.0;
+            if (!(sigma > 0.0)) return double.NaN;
 
             int r0 = Math.Max(0, (int)Math.Floor(centreY - windowPx));
             int r1 = Math.Min(height - 1, (int)Math.Ceiling(centreY + windowPx));
             int c0 = Math.Max(0, (int)Math.Floor(centreX - windowPx));
             int c1 = Math.Min(width - 1, (int)Math.Ceiling(centreX + windowPx));
-
-            double sum = 0.0, mxx = 0.0, myy = 0.0;
             double w2 = windowPx * windowPx;
-            for (int y = r0; y <= r1; y++)
-            {
-                double dy = y - centreY;
-                for (int x = c0; x <= c1; x++)
-                {
-                    double dx = x - centreX;
-                    double d2 = dx * dx + dy * dy;
-                    if (d2 > w2) continue;
-                    double v = frame[y * width + x] - background;
-                    if (!(v > 0.0)) continue;
-                    sum += v;
-                    mxx += v * dx * dx;
-                    myy += v * dy * dy;
-                }
-            }
-            if (!(sum > 0.0)) return double.NaN;
 
-            double sigma2 = 0.5 * (mxx / sum + myy / sum);
-            return sigma2 > 0.0 ? 2.3548200450309493 * Math.Sqrt(sigma2) : double.NaN;
+            // FIFTY, NOT TWELVE. The step is damped by a half for stability on an undersampled
+            // star, so the error also halves each time, and twelve steps only cover a factor of
+            // four thousand in nothing: from a starting guess off by 2.5x it had not arrived, and
+            // the width returned still depended on where the iteration began. Fifty covers any
+            // starting point this is ever handed.
+            for (int iteration = 0; iteration < 50; iteration++)
+            {
+                double twoSigmaSq = 2.0 * sigma * sigma;
+                double sum = 0.0, mxx = 0.0, myy = 0.0;
+                for (int y = r0; y <= r1; y++)
+                {
+                    double dy = y - centreY;
+                    for (int x = c0; x <= c1; x++)
+                    {
+                        double dx = x - centreX;
+                        double d2 = dx * dx + dy * dy;
+                        if (d2 > w2) continue;
+                        double v = frame[y * width + x] - background;
+                        if (!(v > 0.0)) continue;
+                        double weighted = v * Math.Exp(-d2 / twoSigmaSq);
+                        sum += weighted;
+                        mxx += weighted * dx * dx;
+                        myy += weighted * dy * dy;
+                    }
+                }
+                if (!(sum > 0.0)) return double.NaN;
+
+                double measured = 0.5 * (mxx / sum + myy / sum);
+                if (!(measured > 0.0)) return double.NaN;
+
+                // The fixed point of weighting a Gaussian by a Gaussian of its own width.
+                double next = Math.Sqrt(2.0 * measured);
+                if (!(next > 0.0) || double.IsNaN(next)) return double.NaN;
+
+                // Damped, because an undersampled star can otherwise oscillate between two widths
+                // rather than settle on one.
+                double stepped = 0.5 * (sigma + next);
+                bool converged = Math.Abs(stepped - sigma) < 1e-5 * sigma;
+                sigma = stepped;
+                if (converged) break;
+            }
+
+            return 2.3548200450309493 * sigma;
         }
 
         // ------------------------------------------------------------------ aperture geometry

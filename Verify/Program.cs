@@ -4454,29 +4454,65 @@ Section("29. A star's width measured on its own pixels, and an aperture that car
                 frame[y * W + x] = (float)(SKY + 1e6 * Math.Exp(-(dx*dx + dy*dy) / (2*sigma*sigma)));
             }
 
-        // Windowed generously: for a Gaussian the moment width and the half-maximum width agree
-        // exactly, so a wide window costs nothing and the check is on the arithmetic.
-        double measured = AperturePhotometry.MeasureFwhmPx(frame, W, H, CX, CY, SKY, 6.0 * sigma);
+        double measured = AperturePhotometry.MeasureFwhmPx(frame, W, H, CX, CY, SKY, 6.0 * sigma, fwhmIn);
         Check($"a {fwhmIn:F0} px Gaussian measures back as {fwhmIn:F0} px",
               Math.Abs(measured - fwhmIn) / fwhmIn < 0.02,
               $"{measured:F4} px against {fwhmIn:F4}, {100*(measured-fwhmIn)/fwhmIn:+0.00;-0.00} per cent");
     }
 
-    // A WIDER WINDOW RETURNS A WIDER STAR ON A PROFILE WITH WINGS, which is why the window is an
-    // argument and not a constant, and why it has to be reported with the width.
-    var wings = new float[W * H];
-    for (int y = 0; y < H; y++)
-        for (int x = 0; x < W; x++)
+    // AND IT FINDS THE SAME WIDTH FROM A BAD STARTING GUESS, which is what makes the iteration a
+    // measurement rather than a restatement of its input.
+    {
+        double sigma5 = 5.0 / 2.3548200450309493;
+        var frame = new float[W * H];
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+            {
+                double dx = x - CX, dy = y - CY;
+                frame[y * W + x] = (float)(SKY + 1e6 * Math.Exp(-(dx*dx + dy*dy) / (2*sigma5*sigma5)));
+            }
+        double lo = AperturePhotometry.MeasureFwhmPx(frame, W, H, CX, CY, SKY, 25.0, 2.0);
+        double hi = AperturePhotometry.MeasureFwhmPx(frame, W, H, CX, CY, SKY, 25.0, 15.0);
+        Check("and it converges to the same width from either side of the answer",
+              Math.Abs(lo - hi) < 0.02 && Math.Abs(lo - 5.0) < 0.15,
+              $"{lo:F4} px from a 2 px guess, {hi:F4} px from a 15 px guess");
+    }
+
+    // THE CHECK THE UNWEIGHTED ESTIMATOR FAILED, and the reason this one exists.
+    //
+    // One profile, one true width, laid down at amplitudes spanning a factor of a thousand, on a
+    // background carrying a fixed pattern of the kind a real sensor has. An estimator that takes
+    // plain moments returns a width that grows as the star fades, because the far pixels of its
+    // window are pattern rather than star and they carry the most dx^2. Measured on a rendered
+    // field where every star had been given the same temperature, and therefore the same true
+    // width: 4.91 px down to V = 17, 5.61 at V 17 to 19, 6.41 beyond 19.
+    {
+        double sigma6 = 6.0 / 2.3548200450309493;
+        var pattern = new double[W * H];
+        var rng29 = new Pcg32(20260922UL, 1);
+        for (int i = 0; i < pattern.Length; i++) pattern[i] = SKY * (1.0 + 0.02 * NoiseSampler.Gaussian(rng29, 1.0));
+
+        var measured29 = new List<double>();
+        foreach (double peak in new[] { 1e6, 1e5, 1e4, 1e3 })
         {
-            double r2 = (x - CX) * (x - CX) + (y - CY) * (y - CY);
-            wings[y * W + x] = (float)(SKY + 1e6 * Math.Pow(1.0 + r2 / 9.0, -11.0 / 6.0));
+            var frame = new float[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    double dx = x - CX, dy = y - CY;
+                    frame[y * W + x] = (float)(pattern[y * W + x]
+                        + peak * Math.Exp(-(dx*dx + dy*dy) / (2*sigma6*sigma6)));
+                }
+            measured29.Add(AperturePhotometry.MeasureFwhmPx(frame, W, H, CX, CY, SKY, 18.0, 6.0));
         }
-    double narrow = AperturePhotometry.MeasureFwhmPx(wings, W, H, CX, CY, SKY, 8.0);
-    double wide = AperturePhotometry.MeasureFwhmPx(wings, W, H, CX, CY, SKY, 24.0);
-    Console.WriteLine($"         a profile with Kolmogorov-like wings measures "
-                    + $"{narrow:F2} px in an 8 px window and {wide:F2} px in a 24 px one");
-    Check("on a winged profile the measured width grows with the window, as a moment must",
-          wide > narrow * 1.2, $"{wide:F3} against {narrow:F3} px");
+        double spread29 = (measured29.Max() - measured29.Min()) / measured29.Average();
+        Console.WriteLine($"         one 6 px profile at peaks 1e6 to 1e3 over a 2 per cent fixed pattern: "
+                        + string.Join(", ", measured29.Select(v => $"{v:F3}")) + " px");
+        Check("the measured width does not depend on how bright the star is",
+              spread29 < 0.02,
+              $"{spread29:P2} spread over a thousandfold range in brightness, "
+              + "against 30 per cent for plain moments on a real field");
+    }
 
     Check("a star with nothing above the background has no width rather than a wrong one",
           double.IsNaN(AperturePhotometry.MeasureFwhmPx(new float[W * H], W, H, CX, CY, SKY, 10.0)));
