@@ -3614,7 +3614,27 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
             });
         }
 
-        seq.State = "finished";
+        // A RUN WHOSE FRAMES ALL REFUSED IS NOT A RUN THAT FINISHED. Every refusal was already
+        // recorded on its own frame, and nothing read them: the sequence reported "finished,
+        // 6 of 6" with an empty stop reason, which is what a successful run looks like at a
+        // glance. The frames are counted as DONE when they are attempted, so the count cannot
+        // carry this on its own.
+        List<PhotometricSequence.FrameRow> finalRows = seq.Snapshot();
+        int measured = finalRows.Count(r => r.Error == null);
+        if (finalRows.Count > 0 && measured == 0)
+        {
+            seq.State = "failed";
+            seq.StopReason = $"All {finalRows.Count} frames were refused and none was measured. "
+                           + "The first said: " + finalRows[0].Error;
+        }
+        else
+        {
+            seq.State = "finished";
+            if (measured < finalRows.Count)
+                seq.StopReason = $"{finalRows.Count - measured} of {finalRows.Count} frames were "
+                               + "refused; the rest were measured. The first refusal said: "
+                               + finalRows.First(r => r.Error != null).Error;
+        }
     }
     catch (Exception e)
     {
