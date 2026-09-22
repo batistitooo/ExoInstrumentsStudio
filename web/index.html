@@ -402,6 +402,17 @@
          so the plot showed water the frame was never exposed through. One block, shown in
          whichever mode is asking, feeding one request builder. -->
     <section class="block" id="waterBlock" hidden>
+      <div class="coolrow" id="spectrumRow">
+        <div class="coolhead">
+          <label class="lbl" for="targetSpectrum">Target spectrum<span class="q" tabindex="0" data-tip="A tabulated spectrum for the star at the field centre, two columns a line, a wavelength in nanometres and a value. It replaces the Target K box entirely, for the flux and for the image width. This matters most for the coolest stars: a blackbody at 2600 K has no water, no TiO and no VO, and those bands carve the blue half of an I+z' passband while leaving the red half alone. Measured against PHOENIX-ACES over a 727 to 947 nm top hat, the photon-weighted mean wavelength moves by 12 nm, which through the fifth-root seeing law is 1.75 times the colour separation a blackbody gives. The curve is normalised at Johnson V here, so the star's V magnitude still sets its flux, which means it has to cover 555.6 nm as well as the passband.">?</label>
+          <output class="mono coolval" id="spectrumOut">none</output>
+        </div>
+        <textarea id="targetSpectrum" rows="4" spellcheck="false"
+          placeholder="400.0  1.2345e+12&#10;400.1  1.2351e+12&#10;# wavelength in nm, then F_lambda; comments after #"></textarea>
+        <label class="capcheck"><input id="spectrumIsPhotons" type="checkbox"> the second column is already a photon density</label>
+        <p class="hint dim" id="spectrumHint"></p>
+      </div>
+
       <div class="coolrow" id="seeingRow">
         <div class="coolhead">
           <label class="lbl" for="seeingMode">Seeing<span class="q" tabindex="0" data-tip="The seeing as a function of time, given as the FWHM at the zenith at 500 nm, which is the convention every seeing monitor publishes in. Left off, a frame takes the site's published median projected along the line of sight, and the only way to move the seeing is then to move the airmass. That matters because airmass also carries second-order extinction, which is chromatic and lands in the same differential ratio, so a run that tilts the telescope to change the seeing cannot say which of the two it measured. Supplying a series separates them.">?</span></label>

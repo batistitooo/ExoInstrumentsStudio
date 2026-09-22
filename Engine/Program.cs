@@ -716,8 +716,8 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
 
     PwvSeries seqPwv = BuildPwvSeries(req.Pwv, seqStartUt, out string seqPwvError);
     SeeingSeries seqSeeing = BuildSeeingSeries(req.Seeing, seqStartUt, out string seqSeeingError);
-    List<DeepSkyCamera.StarTemperature> seqTemps =
-        BuildStarTemperatures(req.StarTemperatures, out string seqTempError);
+    List<DeepSkyCamera.StarOverride> seqTemps =
+        BuildStarOverrides(req.StarOverrides, out string seqTempError);
     // Mid-ladder by default: a transit at the end of the run has no baseline after it to normalise
     // against, and the whole measurement is the ratio of in-transit to out.
     // THE MIDDLE OF THE RUN, measured the same way a frame's epoch is.
@@ -850,7 +850,7 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         SearchFromUt = now,
         PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
         Seeing = seqSeeing,
-        StarTemperatures = seqTemps,
+        StarOverrides = seqTemps,
         HoldAirmass = req.HoldAirmass ?? double.NaN,
         ApertureRadiusArcsec = req.ApertureRadiusArcsec ?? double.NaN,
         ApertureRadiusInFwhm = req.ApertureRadiusInFwhm ?? double.NaN,
@@ -1225,12 +1225,18 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
       .Append(seq.Calibrate ? ", each frame calibrated" : ", no calibration").Append('\n');
     sb.Append("# water: ").Append(seq.Pwv?.Description ?? "not modelled")
       .Append(seq.Pwv != null ? $" [{seq.Pwv.Id}]" : "").Append('\n');
-    sb.Append("# star temperatures: ").Append(
-        seq.StarTemperatures == null || seq.StarTemperatures.Count == 0
+    sb.Append("# star spectra: ").Append(
+        seq.StarOverrides == null || seq.StarOverrides.Count == 0
             ? "from the catalogue's colours"
-            : string.Join("; ", seq.StarTemperatures.Select(t => t.HasPosition
-                ? $"{t.TeffK.ToString("0.", CultureInfo.InvariantCulture)} K at RA {t.RaDeg.ToString("0.####", CultureInfo.InvariantCulture)} Dec {t.DecDeg.ToString("0.####", CultureInfo.InvariantCulture)}"
-                : $"{t.TeffK.ToString("0.", CultureInfo.InvariantCulture)} K for the rest of the field"))
+            : string.Join("; ", seq.StarOverrides.Select(t =>
+              {
+                  string what = t.Spectrum != null
+                      ? (t.Label ?? $"tabulated spectrum, {t.Spectrum.SampleCount} samples")
+                      : $"{t.TeffK.ToString("0.", CultureInfo.InvariantCulture)} K blackbody";
+                  return t.HasPosition
+                      ? $"{what} at RA {t.RaDeg.ToString("0.####", CultureInfo.InvariantCulture)} Dec {t.DecDeg.ToString("0.####", CultureInfo.InvariantCulture)}"
+                      : $"{what} for the rest of the field";
+              }))
               + " (imposed by the request, not catalogued)").Append('\n');
     sb.Append("# aperture: ").Append(
         double.IsFinite(seq.ApertureRadiusArcsec)
@@ -2338,7 +2344,7 @@ bool TryCaptureOne(CaptureRequestDto req, out CaptureStore.Stored stored, out De
         PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
         Seeing = BuildSeeingSeries(req.Seeing, double.IsNaN(bookedUt) ? nowUt : bookedUt,
                                    out string seeingError),
-        StarTemperatures = BuildStarTemperatures(req.StarTemperatures, out string tempError),
+        StarOverrides = BuildStarOverrides(req.StarOverrides, out string tempError),
     };
 
     if (seeingError != null) { refusal = Results.BadRequest(new { error = seeingError }); return false; }
@@ -3529,7 +3535,7 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                 Seed = seed,
                 PsfColourGroups = seq.PsfColourGroups,
                 Seeing = seq.Seeing,
-                StarTemperatures = seq.StarTemperatures,
+                StarOverrides = seq.StarOverrides,
                 HeldAirmass = seq.HoldAirmass,
                 Pwv = seq.Pwv,
                 Transient = seq.Transient,
@@ -3754,42 +3760,69 @@ static TransitInjection BuildTransient(TransientRequest req, double defaultEpoch
 /// rather than clamped: a temperature outside them is a unit mistake or a typing one, and
 /// rendering it quietly would produce a frame nobody asked for.
 /// </summary>
-static List<DeepSkyCamera.StarTemperature> BuildStarTemperatures(
-    List<StarTemperatureRequest> reqs, out string error)
+static List<DeepSkyCamera.StarOverride> BuildStarOverrides(
+    List<StarOverrideRequest> reqs, out string error)
 {
     error = null;
     if (reqs == null || reqs.Count == 0) return null;
 
-    var built = new List<DeepSkyCamera.StarTemperature>(reqs.Count);
+    var built = new List<DeepSkyCamera.StarOverride>(reqs.Count);
     int fieldWide = 0;
-    foreach (StarTemperatureRequest t in reqs)
+    foreach (StarOverrideRequest t in reqs)
     {
         if (t == null) continue;
-        if (!(t.TeffK >= 1000.0 && t.TeffK <= 50000.0))
+
+        SpectralCurve curve = null;
+        if (!string.IsNullOrWhiteSpace(t.Spectrum))
         {
-            error = $"A star temperature of {t.TeffK} K is out of range. 1000 to 50000 K.";
+            try
+            {
+                curve = StarSpectrumTable.Parse(t.Spectrum, t.SpectrumIsPhotonDensity ?? false, out _);
+            }
+            catch (ArgumentException ex) { error = ex.Message; return null; }
+        }
+
+        // ONE OR THE OTHER, and saying both is refused rather than resolved by precedence. A
+        // caller who sent a spectrum AND a temperature has two beliefs about the same star and
+        // the program should not pick one for them.
+        if (curve != null && t.TeffK.HasValue)
+        {
+            error = "A star can be given a spectrum or a temperature, not both. The spectrum "
+                  + "already says everything the temperature would.";
+            return null;
+        }
+        if (curve == null && !t.TeffK.HasValue)
+        {
+            error = "A star override needs either teffK or spectrum.";
+            return null;
+        }
+        if (curve == null && !(t.TeffK.Value >= 1000.0 && t.TeffK.Value <= 50000.0))
+        {
+            error = $"A star temperature of {t.TeffK.Value} K is out of range. 1000 to 50000 K.";
             return null;
         }
         bool hasRa = t.RaDeg.HasValue, hasDec = t.DecDeg.HasValue;
         if (hasRa != hasDec)
         {
-            error = "A star temperature needs both raDeg and decDeg, or neither. With neither it "
+            error = "A star override needs both raDeg and decDeg, or neither. With neither it "
                   + "applies to every star the positioned entries did not claim.";
             return null;
         }
         if (!hasRa && ++fieldWide > 1)
         {
-            error = "Only one temperature can apply to the whole field. Give the others their own "
+            error = "Only one override can apply to the whole field. Give the others their own "
                   + "positions, or merge them.";
             return null;
         }
-        built.Add(new DeepSkyCamera.StarTemperature
+        built.Add(new DeepSkyCamera.StarOverride
         {
             HasPosition = hasRa,
             RaDeg = t.RaDeg ?? 0.0,
             DecDeg = t.DecDeg ?? 0.0,
             MatchRadiusArcsec = t.MatchRadiusArcsec ?? 2.0,
-            TeffK = t.TeffK,
+            TeffK = t.TeffK ?? double.NaN,
+            Spectrum = curve,
+            Label = t.Label,
         });
     }
     return built.Count > 0 ? built : null;

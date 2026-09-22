@@ -3859,7 +3859,7 @@ $('seqStart').onclick = async () => {
         airmassFrom: parseFloat($('seqXFrom').value),
         airmassTo: parseFloat($('seqXTo').value),
         holdAirmass: $('seqHoldX').value === '' ? undefined : parseFloat($('seqHoldX').value),
-        starTemperatures: starTemperatureBody(),
+        starOverrides: starOverrideBody(),
         apertureRadiusArcsec: $('seqApArcsec').value === '' ? undefined : parseFloat($('seqApArcsec').value),
         apertureRadiusInFwhm: $('seqApFwhm').value === '' ? undefined : parseFloat($('seqApFwhm').value),
         comparisons: parseInt($('seqComps').value, 10),
@@ -4588,14 +4588,38 @@ seeingModeChanged();
 // The two temperature controls, as the list the endpoint takes. The target's is imposed at the
 // field centre, which is where an observer pointed at it; the field's takes everything the target
 // did not claim. Both empty sends nothing and every star keeps its catalogue colour.
-function starTemperatureBody() {
+function starOverrideBody() {
   const out = [];
+  const spec = $('targetSpectrum').value.trim();
   const t = $('seqTargetK').value.trim();
   const f = $('seqFieldK').value.trim();
-  if (t !== '') out.push({ raDeg: fieldRa(), decDeg: fieldDec(), matchRadiusArcsec: 5, teffK: parseFloat(t) });
+  // The spectrum wins over the temperature box, and the two are never sent together: the server
+  // refuses that rather than picking one, because a caller who sent both has two beliefs about
+  // the same star.
+  if (spec !== '') {
+    out.push({ raDeg: fieldRa(), decDeg: fieldDec(), matchRadiusArcsec: 5, spectrum: spec,
+               spectrumIsPhotonDensity: $('spectrumIsPhotons').checked,
+               label: 'pasted in the interface' });
+  } else if (t !== '') {
+    out.push({ raDeg: fieldRa(), decDeg: fieldDec(), matchRadiusArcsec: 5, teffK: parseFloat(t) });
+  }
   if (f !== '') out.push({ teffK: parseFloat(f) });
   return out.length ? out : undefined;
 }
+
+function spectrumChanged() {
+  const spec = $('targetSpectrum').value.trim();
+  const lines = spec === '' ? 0 : spec.split('\n').filter(l => l.trim() !== '' && !l.trim().startsWith('#')).length;
+  $('spectrumOut').textContent = lines === 0 ? 'none' : `${lines} samples`;
+  $('spectrumHint').textContent = lines === 0
+    ? 'Empty, so the Target K box is used, or the catalogue colour if that is empty too.'
+    : 'Used instead of Target K. Normalised at Johnson V, so it has to cover 555.6 nm and the whole passband.';
+}
+for (const id of ['targetSpectrum', 'spectrumIsPhotons']) {
+  $(id).addEventListener('input', spectrumChanged);
+  $(id).addEventListener('change', spectrumChanged);
+}
+spectrumChanged();
 
 function seeingRequestBody() {
   const mode = $('seeingMode').value;

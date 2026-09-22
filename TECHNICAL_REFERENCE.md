@@ -1268,6 +1268,59 @@ the list, and the exported CSV carries a header line ending "imposed by the requ
 catalogued". A frame built this way is about a star that is in no catalogue, and anything measured
 on it has to say so.
 
+### A tabulated spectrum, because a blackbody has no molecular bands
+
+A temperature is enough for a star whose continuum is its spectrum. For the coolest ones it is not
+enough at all, and the shortfall is not a refinement.
+
+A blackbody at 2600 K has no water, no TiO and no VO. A real M dwarf has all three, and in an
+I+z' passband they carve the blue half while leaving the red half alone. Measured on PHOENIX-ACES
+against a blackbody of the same temperature, over a 727 to 947 nm top hat, the photon-weighted
+mean wavelength moves from **849.5 to 861.3 nm**. Through Boyd's lambda^(-1/5) that is a colour
+separation against a 5500 K comparison **1.75 times larger** than the blackbody gives. A blackbody
+does not approximate a chromatic effect here, it halves it.
+
+Which is why the effect is so sensitive to the spectrum at all. Writing f for the FWHM ratio
+(lambda_t / lambda_e)^(-1/5), the effect scales as 1 - f, and
+
+```
+d(1-f)/(1-f) = 0.2 * f/(1-f) * dlambda/lambda
+```
+
+With f near 1 that prefactor is tens: a ONE PER CENT error in a target's effective wavelength is
+a double-digit error in the effect. The choice of model atmosphere stops being a detail and
+becomes a systematic to quote.
+
+`StarOverrideRequest.Spectrum` takes the curve as text, two columns a line, a wavelength in
+nanometres and a value, comments after #. `StarSpectrumTable` parses it and does two things the
+rest of the chain used to assume had already been done:
+
+  * **Units.** `spectrumIsPhotonDensity` false, the default, reads the column as F_lambda and
+    multiplies by wavelength to get photons. A PHOENIX or BT-Settl file is F_lambda, so the common
+    case is the default. Handing the old code a raw F_lambda was silently wrong, too red by a
+    factor of the wavelength.
+  * **Normalisation.** The curve is scaled to 1 at Johnson V, 5556 A, which is the convention the
+    whole photometric chain is anchored on and the reason the star's observed V magnitude still
+    sets its flux. `SystemBandpass.EffectiveWidthAngstromForSpectrum` required that and checked
+    nothing; a curve that does not reach V is now refused, because guessing a scale for it would
+    put an arbitrary factor on the star's brightness.
+
+Refused, not repaired: fewer than 16 samples, more than 200000, wavelengths that do not ascend, a
+curve that does not cover Johnson V, a curve that is zero at V. And a spectrum that stops INSIDE
+the passband is refused per frame, because outside its own range a curve reads zero rather than
+extrapolating, so the band integral would quietly drop whatever fell off the end.
+
+One curve serves both consumers, as one temperature does. The band integral that sets the star's
+flux and the sub-band weighting that sets its image width both read it, so a star cannot be one
+thing for its brightness and another for its width. A star carrying a spectrum also gets its own
+PSF group rather than being binned with others: a tabulated spectrum is not a point on a
+temperature axis, and averaging it into a bin would throw away the bands it was supplied for.
+
+Evidence, `Verify` section 28: a blackbody written out as a table and read back through the
+spectrum path weights the sub-bands to within **0.0 pm** of the blackbody path, which is the check
+that would catch a units mistake; and a notch cut across the blue half of the delivered band moves
+the effective wavelength 4.4 nm redward, which no temperature can reproduce.
+
 ## 5.9 Water vapour
 
 `Engine/Simulation/PwvTransmission.cs`, `Engine/Simulation/PwvSeries.cs`, `tools/fetch_pwv_grid.py`,

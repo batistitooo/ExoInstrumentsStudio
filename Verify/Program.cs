@@ -4047,7 +4047,7 @@ Section("24. A star's own colour sets its image width, and a fixed aperture then
         field24.Add(new RenderedStar { VMag = 12.0, ColorIndexBV = 0.2 + 0.2 * i });
     field24.Add(new RenderedStar { VMag = 12.0, ColorIndexBV = double.NaN });
 
-    List<(List<RenderedStar> Members, double TeffK)> split24 =
+    List<(List<RenderedStar> Members, double TeffK, SpectralCurve Spectrum)> split24 =
         DeepSkyCamera.SplitByColour(field24, 3, out int noColour24);
 
     Check("a star with no usable colour is counted, not silently given one",
@@ -4061,7 +4061,7 @@ Section("24. A star's own colour sets its image width, and a fixed aperture then
           split24[0].TeffK < split24[split24.Count - 1].TeffK,
           $"{split24[0].TeffK:F0} K to {split24[split24.Count - 1].TeffK:F0} K");
 
-    List<(List<RenderedStar> Members, double TeffK)> again24 =
+    List<(List<RenderedStar> Members, double TeffK, SpectralCurve Spectrum)> again24 =
         DeepSkyCamera.SplitByColour(field24, 3, out _);
     bool sameOrder = true;
     for (int g = 0; g < split24.Count; g++)
@@ -4257,13 +4257,13 @@ Section("27. A star's temperature, when the catalogue's colour cannot reach it")
           Math.Abs(field27[0].EffectiveTeffK - floorK) < 1e-9,
           $"{field27[0].EffectiveTeffK:F0} K from B-V 2.0");
 
-    var temps27 = new List<DeepSkyCamera.StarTemperature>
+    var temps27 = new List<DeepSkyCamera.StarOverride>
     {
-        new DeepSkyCamera.StarTemperature { HasPosition = true, RaDeg = 280.0, DecDeg = 38.0,
-                                            MatchRadiusArcsec = 5.0, TeffK = 2600.0 },
-        new DeepSkyCamera.StarTemperature { TeffK = 5500.0 },
+        new DeepSkyCamera.StarOverride { HasPosition = true, RaDeg = 280.0, DecDeg = 38.0,
+                                         MatchRadiusArcsec = 5.0, TeffK = 2600.0 },
+        new DeepSkyCamera.StarOverride { TeffK = 5500.0 },
     };
-    int applied27 = DeepSkyCamera.ApplyStarTemperatures(field27, temps27, out string refuse27);
+    int applied27 = DeepSkyCamera.ApplyStarOverrides(field27, temps27, out string refuse27);
 
     Check("the positioned entry takes the star at that position and nothing else",
           refuse27 == null && applied27 == 3 && Math.Abs(field27[0].EffectiveTeffK - 2600.0) < 1e-9,
@@ -4277,10 +4277,10 @@ Section("27. A star's temperature, when the catalogue's colour cannot reach it")
     {
         new RenderedStar { RaDeg = 281.0, DecDeg = 38.0, VMag = 12.0, ColorIndexBV = 0.6 },
     };
-    DeepSkyCamera.ApplyStarTemperatures(missed27, new List<DeepSkyCamera.StarTemperature>
+    DeepSkyCamera.ApplyStarOverrides(missed27, new List<DeepSkyCamera.StarOverride>
     {
-        new DeepSkyCamera.StarTemperature { HasPosition = true, RaDeg = 280.0, DecDeg = 38.0,
-                                            MatchRadiusArcsec = 2.0, TeffK = 2600.0 },
+        new DeepSkyCamera.StarOverride { HasPosition = true, RaDeg = 280.0, DecDeg = 38.0,
+                                         MatchRadiusArcsec = 2.0, TeffK = 2600.0 },
     }, out string refuse27b);
     Check("a positioned temperature that matches no star is refused, with the distance to the nearest",
           refuse27b != null && refuse27b.Contains("arcsec"),
@@ -4316,6 +4316,99 @@ Section("27. A star's temperature, when the catalogue's colour cannot reach it")
     Check("and passing no override reproduces the colour-derived flux exactly",
           StellarPhotometry.CollectedElectrons(12.0, 2.0, double.NaN, resp27, null, 1e4, 60.0, 1.0)
           == eFloor, "the overload without a temperature is the one that existed before");
+}
+
+Section("28. A tabulated spectrum, because a blackbody has no molecular bands");
+{
+    const double alt28 = 2396.0, centre28 = 700e-9, band28 = 1500.0, plate28 = 0.35;
+    VisualTelescopeSpec scope28 = VisualTelescopeCatalog.Rc20;
+    SystemResponse resp28 = DeepSkyCamera.BuildSystemResponse(scope28, CameraFilter.Red, 1.2, alt28);
+
+    // A blackbody written out as a table, in the units a model file actually comes in.
+    string Table(double teff, Func<double, double> carve)
+    {
+        var sb = new System.Text.StringBuilder("# lambda_nm  F_lambda\n");
+        for (double nm = 400.0; nm <= 1100.0; nm += 0.25)
+        {
+            double lam = nm * 1e-7;                       // cm
+            double h = 6.62607015e-27, c = 2.99792458e10, k = 1.380649e-16;
+            double flam = 2*h*c*c/Math.Pow(lam, 5) / (Math.Exp(h*c/(lam*k*teff)) - 1.0);
+            sb.Append(nm.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture))
+              .Append(' ')
+              .Append((flam * carve(nm)).ToString("0.######e+00", System.Globalization.CultureInfo.InvariantCulture))
+              .Append('\n');
+        }
+        return sb.ToString();
+    }
+
+    SpectralCurve plain28 = StarSpectrumTable.Parse(Table(2600.0, _ => 1.0), false, out var notes28);
+    Check("a pasted F_lambda table is converted to photons and normalised at Johnson V",
+          Math.Abs(plain28.At(StarSpectrumTable.JohnsonVMeters) - 1.0) < 1e-9,
+          $"{plain28.SampleCount} samples, value at V is {plain28.At(StarSpectrumTable.JohnsonVMeters):F9}");
+    Check("and it says what it did with the column it was given",
+          notes28.Count > 0 && string.Join(" ", notes28).Contains("F_lambda"),
+          notes28.Count > 0 ? notes28[notes28.Count - 1] : "nothing recorded");
+
+    // THE SELF-CONSISTENCY CHECK, and the one that would catch a units mistake: a spectrum that IS
+    // a blackbody has to weight the sub-bands exactly as the blackbody path does.
+    double LamOf(ChromaticSubBand[] b) => DeepSkyCamera.PhotonWeightedWavelength(b);
+    double lamT = LamOf(DeepSkyCamera.BuildSubBands(centre28, band28, 20.0, plate28, alt28, 0.0, 1.0, resp28, 2600.0));
+    double lamS = LamOf(DeepSkyCamera.BuildSubBands(centre28, band28, 20.0, plate28, alt28, 0.0, 1.0, resp28, plain28));
+    Check("a spectrum that is a blackbody weights the sub-bands as the blackbody path does",
+          Math.Abs(lamT - lamS) * 1e9 < 0.02,
+          $"{lamT * 1e9:F5} nm against {lamS * 1e9:F5} nm, {(lamS - lamT) * 1e12:F1} pm apart");
+
+    // AND THE MOLECULAR BANDS, which is the entire reason this exists. A notch across the blue
+    // half of the passband, of the depth PHOENIX shows there, moves the photon-weighted mean
+    // wavelength redward; a temperature cannot express that at all.
+    // The notch has to sit where the passband actually has weight. This filter delivers its
+    // photons around 640 nm, so a notch at 700 nm would fall where the throughput is already
+    // zero and prove nothing; the first version of this check did exactly that and passed a
+    // change of 0.00 nm off as agreement.
+    SpectralCurve carved28 = StarSpectrumTable.Parse(
+        Table(2600.0, nm => nm > 600.0 && nm < 640.0 ? 0.35 : 1.0), false, out _);
+    double lamC = LamOf(DeepSkyCamera.BuildSubBands(centre28, band28, 20.0, plate28, alt28, 0.0, 1.0, resp28, carved28));
+    Console.WriteLine($"         blackbody 2600 K             {lamT * 1e9,8:F2} nm");
+    Console.WriteLine($"         same, with a 600 to 640 notch {lamC * 1e9,7:F2} nm");
+    Check("a band carved out of the blue half moves the effective wavelength redward",
+          lamC > lamT + 1e-10,
+          $"{(lamC - lamT) * 1e9:+0.00;-0.00} nm, which no temperature can reproduce");
+
+    // REFUSALS, each for a mistake that would otherwise be silent.
+    Check("a table too short to be a spectrum is refused",
+          Refused(() => StarSpectrumTable.Parse("500 1\n600 2\n", false, out _)));
+    Check("a table whose wavelengths do not ascend is refused, not sorted",
+          Refused(() =>
+          {
+              var sb = new System.Text.StringBuilder();
+              for (double nm = 1100.0; nm >= 400.0; nm -= 0.25) sb.Append(nm).Append(" 1.0\n");
+              StarSpectrumTable.Parse(sb.ToString(), true, out _);
+          }),
+          "two files concatenated, or a column read as the wrong one");
+    Check("a table that does not reach Johnson V is refused, because it cannot be normalised there",
+          Refused(() =>
+          {
+              var sb = new System.Text.StringBuilder();
+              for (double nm = 700.0; nm <= 1000.0; nm += 1.0) sb.Append(nm).Append(" 1.0\n");
+              StarSpectrumTable.Parse(sb.ToString(), true, out _);
+          }),
+          "the star's V magnitude is what sets its flux, so V has to be in the curve");
+
+    Check("a spectrum that stops inside the passband is refused with the shortfall named",
+          !StarSpectrumTable.Covers(plain28, 300e-9, 2000e-9, out string short28)
+          && short28 != null && short28.Contains("nm"),
+          short28 == null ? "it passed silently" : short28.Substring(0, Math.Min(90, short28.Length)));
+    Check("and one that spans it is accepted",
+          StarSpectrumTable.Covers(plain28, 620e-9, 780e-9, out _));
+
+    // THE WHOLE POINT, END TO END: the flux follows the spectrum too, not only the width.
+    double eBody = StellarPhotometry.CollectedElectrons(12.0, 2.0, double.NaN, resp28, null,
+                                                        1e4, 60.0, 1.0, 2600.0, null);
+    double eSpec = StellarPhotometry.CollectedElectrons(12.0, 2.0, double.NaN, resp28, null,
+                                                        1e4, 60.0, 1.0, double.NaN, carved28);
+    Check("the band integral follows the spectrum as well as the sub-band weights",
+          eSpec > 0.0 && Math.Abs(eSpec - eBody) / eBody > 0.02,
+          $"{eSpec:F0} e- against {eBody:F0} e- for the blackbody of the same temperature");
 }
 
 Console.WriteLine();

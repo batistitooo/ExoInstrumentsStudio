@@ -124,7 +124,7 @@ namespace ExoStudio.Simulation
         /// Temperatures this run imposed on stars of the field, or null for none. Recorded because
         /// a run whose target was given a temperature is about a star that is in no catalogue.
         /// </summary>
-        public List<DeepSkyCamera.StarTemperature> StarTemperatures;
+        public List<DeepSkyCamera.StarOverride> StarOverrides;
 
         public double ApertureRadiusArcsec = double.NaN;
         public double ApertureRadiusInFwhm = double.NaN;

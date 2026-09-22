@@ -642,12 +642,19 @@ namespace ExoStudio.Api
             // own spectrum.
             psfColourGroups = s.PsfColourGroups,
             holdAirmass = double.IsFinite(s.HoldAirmass) ? s.HoldAirmass : (double?)null,
-            starTemperatures = s.StarTemperatures == null || s.StarTemperatures.Count == 0 ? null
-                : s.StarTemperatures.Select(t => new
+            starOverrides = s.StarOverrides == null || s.StarOverrides.Count == 0 ? null
+                : s.StarOverrides.Select(t => new
                   {
                       raDeg = t.HasPosition ? t.RaDeg : (double?)null,
                       decDeg = t.HasPosition ? t.DecDeg : (double?)null,
-                      teffK = t.TeffK,
+                      teffK = double.IsNaN(t.TeffK) ? (double?)null : t.TeffK,
+                      spectrum = t.Spectrum == null ? null : new
+                      {
+                          samples = t.Spectrum.SampleCount,
+                          fromNm = t.Spectrum.MinWavelengthMeters * 1e9,
+                          toNm = t.Spectrum.MaxWavelengthMeters * 1e9,
+                      },
+                      label = t.Label,
                   }).ToArray(),
             apertureRadiusArcsec = double.IsFinite(s.ApertureRadiusArcsec) ? s.ApertureRadiusArcsec : (double?)null,
             apertureRadiusInFwhm = double.IsFinite(s.ApertureRadiusInFwhm) ? s.ApertureRadiusInFwhm : (double?)null,
@@ -945,7 +952,7 @@ namespace ExoStudio.Api
         /// whose target quietly kept the catalogue's temperature would measure a near null and
         /// nothing in its output would say why.
         /// </summary>
-        public List<StarTemperatureRequest> StarTemperatures { get; set; }
+        public List<StarOverrideRequest> StarOverrides { get; set; }
 
         /// <summary>
         /// Photometric aperture radius in arcsec, FIXED for the run whatever the seeing does.
@@ -1182,7 +1189,7 @@ namespace ExoStudio.Api
     /// the frame is then about a star that is in no catalogue, and the run records how many stars
     /// were given one.
     /// </summary>
-    public sealed class StarTemperatureRequest
+    public sealed class StarOverrideRequest
     {
         /// <summary>The star's own position. Both or neither; neither means every star the
         /// positional entries did not claim.</summary>
@@ -1192,8 +1199,32 @@ namespace ExoStudio.Api
         /// <summary>How close a star has to be to count as this one. Default 2 arcsec.</summary>
         public double? MatchRadiusArcsec { get; set; }
 
-        /// <summary>Effective temperature in kelvin.</summary>
-        public double TeffK { get; set; }
+        /// <summary>Effective temperature in kelvin. Ignored when a spectrum is given.</summary>
+        public double? TeffK { get; set; }
+
+        /// <summary>
+        /// A tabulated spectrum instead: two columns a line, a wavelength in NANOMETRES and a
+        /// value, comments after #. It replaces the temperature entirely, for the flux and for the
+        /// image width.
+        ///
+        /// A blackbody at 2600 K has no water, no TiO and no VO, and those bands carve the blue
+        /// half of an I+z' passband while leaving the red half alone. Measured against PHOENIX-ACES
+        /// over a 727 to 947 nm top hat, the photon-weighted mean wavelength moves by 12 nm, which
+        /// through Boyd's lambda^(-1/5) is 1.75 times the colour separation a blackbody gives. For
+        /// the coolest stars a temperature is not an approximation of a spectrum.
+        /// </summary>
+        public string Spectrum { get; set; }
+
+        /// <summary>
+        /// false, the default, reads the second column as F_lambda and converts it to photons;
+        /// true takes it as a photon density already. A PHOENIX or BT-Settl file is F_lambda.
+        /// Either way it is normalised at Johnson V here, so the star's V magnitude still sets
+        /// its flux.
+        /// </summary>
+        public bool? SpectrumIsPhotonDensity { get; set; }
+
+        /// <summary>What to call it in a note or a header, for example "PHOENIX 2600 K".</summary>
+        public string Label { get; set; }
     }
 
     public sealed class SeeingRequest
@@ -1303,7 +1334,7 @@ namespace ExoStudio.Api
         /// whose target quietly kept the catalogue's temperature would measure a near null and
         /// nothing in its output would say why.
         /// </summary>
-        public List<StarTemperatureRequest> StarTemperatures { get; set; }
+        public List<StarOverrideRequest> StarOverrides { get; set; }
 
         /// <summary>What the frame is of, for the FITS OBJECT keyword and the download name.</summary>
         public string ObjectName { get; set; }

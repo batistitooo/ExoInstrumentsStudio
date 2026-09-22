@@ -68,12 +68,24 @@ namespace ExoStudio.Simulation
         /// temperature against an ensemble held at another, which isolates the colour difference
         /// from the accident of what the field happens to contain.
         /// </summary>
-        public sealed class StarTemperature
+        public sealed class StarOverride
         {
             public bool HasPosition;
             public double RaDeg, DecDeg;
             public double MatchRadiusArcsec = 2.0;
-            public double TeffK;
+
+            /// <summary>Effective temperature in kelvin, or NaN when a spectrum is given instead.</summary>
+            public double TeffK = double.NaN;
+
+            /// <summary>
+            /// A tabulated photon spectrum normalised to 1 at Johnson V. When present it replaces
+            /// the temperature entirely, for the flux AND for the image width, because the bands a
+            /// cool star carries are exactly what a temperature cannot express.
+            /// </summary>
+            public SpectralCurve Spectrum;
+
+            /// <summary>What to call it in a note or a header.</summary>
+            public string Label;
         }
 
         /// <summary>
@@ -87,9 +99,9 @@ namespace ExoStudio.Simulation
         /// zero for a reason nothing in the output could show. This is the same refusal the
         /// transit injection makes when its host is not there.
         /// </summary>
-        public static int ApplyStarTemperatures(List<RenderedStar> stars,
-                                                IList<StarTemperature> temperatures,
-                                                out string refusal)
+        public static int ApplyStarOverrides(List<RenderedStar> stars,
+                                             IList<StarOverride> temperatures,
+                                             out string refusal)
         {
             refusal = null;
             if (stars == null || temperatures == null || temperatures.Count == 0) return 0;
@@ -97,7 +109,7 @@ namespace ExoStudio.Simulation
             var claimed = new bool[stars.Count];
             int applied = 0;
 
-            foreach (StarTemperature t in temperatures)
+            foreach (StarOverride t in temperatures)
             {
                 if (t == null || !t.HasPosition) continue;
 
@@ -118,7 +130,7 @@ namespace ExoStudio.Simulation
                 {
                     refusal =
                         $"No star of this field lies within {radius:0.#} arcsec of RA {t.RaDeg:0.####}, "
-                      + $"Dec {t.DecDeg:0.####}, so the temperature {t.TeffK:0.} K would have been "
+                      + $"Dec {t.DecDeg:0.####}, so {(t.Spectrum != null ? t.Label ?? "that spectrum" : $"the temperature {t.TeffK:0.} K")} would have been "
                       + "imposed on empty sky"
                       + (best >= 0 ? $"; the nearest star is {bestSep:0.#} arcsec away. " : ". ")
                       + "Give the star's own position, or widen the match radius.";
@@ -127,13 +139,14 @@ namespace ExoStudio.Simulation
 
                 RenderedStar s = stars[best];
                 s.OverrideTeffK = t.TeffK;
+                s.OverrideSpectrum = t.Spectrum;
                 stars[best] = s;
                 claimed[best] = true;
                 applied++;
             }
 
             // The field default, last, so it takes only what no position claimed.
-            foreach (StarTemperature t in temperatures)
+            foreach (StarOverride t in temperatures)
             {
                 if (t == null || t.HasPosition) continue;
                 for (int i = 0; i < stars.Count; i++)
@@ -141,6 +154,7 @@ namespace ExoStudio.Simulation
                     if (claimed[i]) continue;
                     RenderedStar s = stars[i];
                     s.OverrideTeffK = t.TeffK;
+                    s.OverrideSpectrum = t.Spectrum;
                     stars[i] = s;
                     claimed[i] = true;
                     applied++;
@@ -247,7 +261,7 @@ namespace ExoStudio.Simulation
             /// Ballesteros, so the M dwarfs ground-based transit surveys actually observe cannot
             /// be asked for at all. This is how a study says what its target is.
             /// </summary>
-            public IList<StarTemperature> StarTemperatures;
+            public IList<StarOverride> StarOverrides;
 
             /// <summary>
             /// Cooler setpoint, Celsius. NaN keeps the instrument's own published temperature.
@@ -1150,7 +1164,7 @@ namespace ExoStudio.Simulation
             // each is convolved with its own kernel further down, after the extended sources have
             // been convolved with the achromatic one. Null keeps the single-plane path exactly as
             // it was.
-            List<(float[] Plane, double TeffK, int Count)> colourPlanes = null;
+            List<(float[] Plane, double TeffK, SpectralCurve Spectrum, int Count)> colourPlanes = null;
             List<InjectedStar> injected = null;
             double fieldRadiusDeg = 0.5 * Math.Sqrt((double)w * w + (double)h * h) * plateScale / 3600.0;
 
@@ -1232,11 +1246,28 @@ namespace ExoStudio.Simulation
                 // band integral that sets a star's flux and the sub-band weighting that sets its
                 // image width go through RenderedStar.EffectiveTeffK, so they cannot disagree
                 // about what a star is.
-                res.StarsWithImposedTemperature = ApplyStarTemperatures(
-                    stars, req.StarTemperatures, out string temperatureRefusal);
+                res.StarsWithImposedTemperature = ApplyStarOverrides(
+                    stars, req.StarOverrides, out string temperatureRefusal);
                 if (temperatureRefusal != null)
                 {
                     res.Error = temperatureRefusal;
+                    return new PreparedExposure { Meta = res };
+                }
+
+                // A SPECTRUM THAT STOPS INSIDE THE PASSBAND IS REFUSED. Outside its own range a
+                // curve is not extrapolated, it reads zero, so the band integral would quietly
+                // drop the part of the star that falls off the end: a flux too low and an
+                // effective wavelength pulled toward whichever end survived, with nothing in the
+                // frame to show for it.
+                double bandCentre = FilterCentralWavelengthMeters(spec, req.Filter);
+                double bandHalf = 0.75 * FilterBandwidthAngstrom(spec, req.Filter) * 1e-10;
+                foreach (RenderedStar checkStar in stars)
+                {
+                    if (checkStar.OverrideSpectrum == null) continue;
+                    if (StarSpectrumTable.Covers(checkStar.OverrideSpectrum,
+                                                 bandCentre - bandHalf, bandCentre + bandHalf,
+                                                 out string shortfall)) continue;
+                    res.Error = shortfall;
                     return new PreparedExposure { Meta = res };
                 }
 
@@ -1329,7 +1360,7 @@ namespace ExoStudio.Simulation
                             : StellarPhotometry.CollectedElectrons(
                                 star.VMag, star.ColorIndexBV, star.ReddeningEBv,
                                 response, reddening, areaCm2, exposure, starTransmission,
-                                star.OverrideTeffK),
+                                star.OverrideTeffK, star.OverrideSpectrum),
                     });
                 }
 
@@ -1338,7 +1369,7 @@ namespace ExoStudio.Simulation
                     StellarPhotometry.CollectedElectrons(
                         star.VMag, star.ColorIndexBV, star.ReddeningEBv,
                         response, reddening, areaCm2, exposure, starTransmission,
-                        star.OverrideTeffK);
+                        star.OverrideTeffK, star.OverrideSpectrum);
 
                 int colourGroups = Math.Clamp(req.PsfColourGroups, 0, 16);
                 if (colourGroups >= 2 && !space)
@@ -1348,18 +1379,18 @@ namespace ExoStudio.Simulation
                     // flux callback the single plane got, so a group's pixels are the pixels that
                     // star would have laid down anyway. What differs is only which plane they land
                     // on, and therefore which kernel finds them.
-                    colourPlanes = new List<(float[], double, int)>(colourGroups);
+                    colourPlanes = new List<(float[], double, SpectralCurve, int)>(colourGroups);
                     res.StarsDrawn = 0;
-                    List<(List<RenderedStar> Members, double TeffK)> split =
+                    List<(List<RenderedStar> Members, double TeffK, SpectralCurve Spectrum)> split =
                         SplitByColour(stars, colourGroups, out int withoutColour);
                     res.StarsWithoutColour = withoutColour;
-                    foreach ((List<RenderedStar> members, double teffK) in split)
+                    foreach ((List<RenderedStar> members, double teffK, SpectralCurve groupSpectrum) in split)
                     {
                         var plane = new float[w * h];
                         res.StarsDrawn += StarFieldRenderer.DepositStars(
                             plane, w, h, members, projection,
                             meridianRa, endMeridianRa, observerLatitudeDeg, cutoff, electronsFor);
-                        colourPlanes.Add((plane, teffK, members.Count));
+                        colourPlanes.Add((plane, teffK, groupSpectrum, members.Count));
                     }
                 }
                 else
@@ -1427,10 +1458,12 @@ namespace ExoStudio.Simulation
                 var counts = new int[colourPlanes.Count];
                 for (int g = 0; g < colourPlanes.Count; g++)
                 {
-                    (float[] plane, double teffK, int count) = colourPlanes[g];
-                    ChromaticSubBand[] groupBands = BuildSubBands(
-                        wavelength, bandwidthA, zenithDistance, plateScale, atmosphereAltM,
-                        zenithRight, zenithUp, response, teffK);
+                    (float[] plane, double teffK, SpectralCurve groupSpectrum, int count) = colourPlanes[g];
+                    ChromaticSubBand[] groupBands = groupSpectrum != null
+                        ? BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale,
+                                        atmosphereAltM, zenithRight, zenithUp, response, groupSpectrum)
+                        : BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale,
+                                        atmosphereAltM, zenithRight, zenithUp, response, teffK);
 
                     teffs[g] = teffK;
                     counts[g] = count;
@@ -2565,12 +2598,40 @@ namespace ExoStudio.Simulation
                                                      plateScale, siteAltitudeMeters, zenithRight, zenithUp);
             if (response == null || !(teffK > 0.0)) return bands;
 
+            return WeighSubBands(bands, response,
+                                 lambda => StellarPhotometry.PhotonSpectralDensity(lambda, teffK));
+        }
+
+        /// <summary>
+        /// The same sub-bands weighted by a TABULATED photon spectrum rather than a blackbody.
+        ///
+        /// This is the one that matters for a cool star. A blackbody at 2600 K has no water, no
+        /// TiO and no VO, and those bands eat the blue half of an I+z' passband while leaving the
+        /// red half alone, which moves the photon-weighted mean wavelength by about 12 nm. Through
+        /// the lambda^(-1/5) law that is most of the colour separation the whole measurement is
+        /// made of, so a temperature is not an approximation of a spectrum here.
+        /// </summary>
+        public static ChromaticSubBand[] BuildSubBands(
+            double centreMeters, double bandwidthAngstrom, double zenithDistanceDeg,
+            double plateScale, double siteAltitudeMeters,
+            double zenithRight, double zenithUp,
+            SystemResponse response, SpectralCurve spectrum)
+        {
+            ChromaticSubBand[] bands = BuildSubBands(centreMeters, bandwidthAngstrom, zenithDistanceDeg,
+                                                     plateScale, siteAltitudeMeters, zenithRight, zenithUp);
+            if (response == null || spectrum == null) return bands;
+            return WeighSubBands(bands, response, spectrum.At);
+        }
+
+        /// <summary>Photon weight times system throughput, per sub-band, with the flat fallback.</summary>
+        private static ChromaticSubBand[] WeighSubBands(
+            ChromaticSubBand[] bands, SystemResponse response, Func<double, double> photonsAt)
+        {
             double total = 0.0;
             for (int i = 0; i < bands.Length; i++)
             {
                 double lambda = bands[i].WavelengthMeters;
-                double weight = StellarPhotometry.PhotonSpectralDensity(lambda, teffK)
-                              * response.ThroughputAt(lambda);
+                double weight = photonsAt(lambda) * response.ThroughputAt(lambda);
                 if (double.IsNaN(weight) || !(weight > 0.0)) weight = 0.0;
                 bands[i].Weight = weight;
                 total += weight;
@@ -2625,12 +2686,26 @@ namespace ExoStudio.Simulation
         /// The sort breaks ties on catalogue index, so the deposit order inside a group, and
         /// therefore the floating-point accumulation, depends on the seed and nothing else.
         /// </summary>
-        public static List<(List<RenderedStar> Members, double TeffK)> SplitByColour(
+        public static List<(List<RenderedStar> Members, double TeffK, SpectralCurve Spectrum)> SplitByColour(
             List<RenderedStar> stars, int groups, out int withoutColour)
         {
             withoutColour = 0;
-            var result = new List<(List<RenderedStar>, double)>();
+            var result = new List<(List<RenderedStar>, double, SpectralCurve)>();
             if (stars == null || stars.Count == 0) return result;
+
+            // A STAR WITH ITS OWN SPECTRUM GETS ITS OWN GROUP, before any binning. There is
+            // nothing to bin it with: a tabulated spectrum is not a point on a temperature axis,
+            // and averaging it into a bin would throw away the bands it was supplied for. In
+            // practice there are one or two of these, the target and perhaps a check star.
+            var rest = new List<RenderedStar>(stars.Count);
+            foreach (RenderedStar st in stars)
+            {
+                if (st.OverrideSpectrum != null)
+                    result.Add((new List<RenderedStar> { st }, st.EffectiveTeffK, st.OverrideSpectrum));
+                else rest.Add(st);
+            }
+            if (rest.Count == 0) return result;
+            stars = rest;
 
             var teff = new double[stars.Count];
             var known = new List<double>(stars.Count);
@@ -2646,7 +2721,7 @@ namespace ExoStudio.Simulation
             if (known.Count == 0)
             {
                 withoutColour = stars.Count;
-                result.Add((new List<RenderedStar>(stars), double.NaN));
+                result.Add((new List<RenderedStar>(stars), double.NaN, null));
                 return result;
             }
 
@@ -2676,7 +2751,7 @@ namespace ExoStudio.Simulation
                     members.Add(stars[order[i]]);
                     temps.Add(teff[order[i]]);
                 }
-                result.Add((members, temps[temps.Count / 2]));
+                result.Add((members, temps[temps.Count / 2], null));
             }
             return result;
         }

@@ -52,6 +52,20 @@ namespace ExoInstruments.Core
         public double OverrideTeffK;
 
         /// <summary>
+        /// A tabulated photon spectrum supplied by the caller, normalised to 1 at Johnson V, which
+        /// replaces the blackbody entirely. Null leaves the temperature in charge.
+        ///
+        /// WHY A TEMPERATURE IS NOT ENOUGH FOR THE COOLEST STARS. A blackbody at 2600 K has no
+        /// water, no TiO and no VO, and those bands carve the blue half of an I+z' passband while
+        /// leaving the red half alone. Measured on PHOENIX-ACES against a blackbody of the same
+        /// temperature, over a 727 to 947 nm top hat, the photon-weighted mean wavelength moves
+        /// from 849.5 to 861.3 nm. Through Boyd's lambda^(-1/5) that is a colour separation
+        /// against a 5500 K comparison 1.75 times larger than the blackbody gives, so the
+        /// blackbody does not approximate the effect, it halves it.
+        /// </summary>
+        public SpectralCurve OverrideSpectrum;
+
+        /// <summary>
         /// The temperature to use for this star: the override when there is one, otherwise
         /// Ballesteros from the colour index, otherwise NaN for a star with no usable colour.
         /// One definition, so the image width and the band integral cannot disagree.

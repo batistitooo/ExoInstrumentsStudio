@@ -130,8 +130,33 @@ namespace ExoInstruments.Core
             SystemResponse response, ReddenedResponseCache cache,
             double apertureAreaCm2, double exposureSeconds, double extraTransmission,
             double overrideTeffK)
+            => CollectedElectrons(vMag, colorIndexBV, eBv, response, cache, apertureAreaCm2,
+                                  exposureSeconds, extraTransmission, overrideTeffK, null);
+
+        /// <summary>
+        /// As above, with the star's spectrum tabulated rather than modelled at all.
+        ///
+        /// The curve is photon density normalised to 1 at Johnson V, the same convention the
+        /// Planck path normalises to, so the observed V magnitude still sets the flux and nothing
+        /// is counted twice. When it is present it wins over both the temperature override and the
+        /// colour index: a measured spectrum is the most specific statement available about what a
+        /// star radiates, and there is no sense in averaging it with a model.
+        /// </summary>
+        public static double CollectedElectrons(
+            double vMag, double colorIndexBV, double eBv,
+            SystemResponse response, ReddenedResponseCache cache,
+            double apertureAreaCm2, double exposureSeconds, double extraTransmission,
+            double overrideTeffK, SpectralCurve spectrum)
         {
             if (response == null) return 0.0;
+
+            if (spectrum != null)
+            {
+                double w = response.EffectiveWidthAngstromForSpectrum(
+                    spectrum, !double.IsNaN(eBv) && eBv > 0.0 ? eBv : 0.0);
+                return PhotonFluxModel.CollectedElectrons(vMag, w, apertureAreaCm2, exposureSeconds)
+                     * Math.Max(0.0, extraTransmission);
+            }
 
             bool reddened = !double.IsNaN(eBv) && eBv > 0.0;
 

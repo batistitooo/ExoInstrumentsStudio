@@ -263,6 +263,14 @@ target has, so a study run without it would have under-measured a colour effect 
 
 **The mod holds the same clamp**, and the same catalogue file, so it gains the same reach.
 
+A second field came with it, `OverrideSpectrum`, and a single `EffectiveTeffK` that both consumers
+read. A temperature is not enough for the coolest stars: a blackbody at 2600 K has no water, no TiO
+and no VO, and those bands carve the blue half of an I+z' passband while leaving the red half
+alone. Measured against PHOENIX-ACES over a 727 to 947 nm top hat, the photon-weighted mean
+wavelength moves from 849.5 to 861.3 nm, which through Boyd's lambda^(-1/5) is **1.75 times** the
+colour separation a blackbody gives. A tabulated curve, when present, replaces the temperature
+outright, for the flux and for the image width.
+
 #### `Core/StellarPhotometry.cs`, the band integral accepts a temperature
 
 `CollectedElectrons` derived a star's effective temperature from its colour index and had no other
@@ -278,3 +286,14 @@ charge once the temperature is imposed, and omitting it reproduces the colour-de
 exactly.
 
 **The mod holds the same signature** and would gain the same way in.
+
+The same overload also takes a `SpectralCurve`, which short-circuits to
+`SystemResponse.EffectiveWidthAngstromForSpectrum`. That method already existed here and had no
+caller anywhere, and it carried an unchecked precondition: the curve had to be a photon density
+already normalised to 1 at Johnson V. A caller handing over a raw F_lambda got an answer too red
+by a factor of the wavelength, silently. `Engine/Simulation/StarSpectrumTable` now does the
+conversion and the normalisation once, and refuses a curve that cannot be normalised at V.
+
+Evidence, `Verify` section 28: a blackbody written out as a table and read back through the
+spectrum path weights the sub-bands to within **0.0 pm** of the blackbody path, which is the check
+that catches a units mistake.
