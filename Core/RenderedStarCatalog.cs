@@ -36,6 +36,36 @@ namespace ExoInstruments.Core
 
         public bool HasColor => !double.IsNaN(ColorIndexBV);
 
+        /// <summary>
+        /// An effective temperature supplied by the caller, overriding whatever this star's colour
+        /// index implies. NaN, the default, leaves the colour in charge.
+        ///
+        /// WHY THIS HAS TO EXIST. The packed catalogue's colour index is clamped at B-V = 2.0,
+        /// which through Ballesteros' relation is a FLOOR OF 3169 K. There is no such star in the
+        /// file and no code change reaches below it: an M dwarf at 2600 K, which is the regime
+        /// ground-based transit surveys work in, simply cannot be asked for. The clamp is in the
+        /// data, so the way past it is to let a request say what a star is.
+        ///
+        /// It is an override and it says so. A frame built with one is a frame about a star that
+        /// is not in any catalogue, and the run records how many stars were given one.
+        /// </summary>
+        public double OverrideTeffK;
+
+        /// <summary>
+        /// The temperature to use for this star: the override when there is one, otherwise
+        /// Ballesteros from the colour index, otherwise NaN for a star with no usable colour.
+        /// One definition, so the image width and the band integral cannot disagree.
+        /// </summary>
+        public double EffectiveTeffK
+        {
+            get
+            {
+                if (!double.IsNaN(OverrideTeffK) && OverrideTeffK > 0.0) return OverrideTeffK;
+                double? t = StellarColor.TeffFromColorIndexBV(HasColor ? ColorIndexBV : (double?)null);
+                return t ?? double.NaN;
+            }
+        }
+
         public bool HasReddening => !double.IsNaN(ReddeningEBv);
     }
 

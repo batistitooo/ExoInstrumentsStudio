@@ -60,6 +60,97 @@ namespace ExoStudio.Simulation
 
         // ------------------------------------------------------------------ request/result
 
+        /// <summary>
+        /// One temperature imposed on the field: on the star nearest a given position, or, with no
+        /// position, on every star the positional entries did not claim.
+        ///
+        /// The two together are what a differential measurement needs: a target at its own
+        /// temperature against an ensemble held at another, which isolates the colour difference
+        /// from the accident of what the field happens to contain.
+        /// </summary>
+        public sealed class StarTemperature
+        {
+            public bool HasPosition;
+            public double RaDeg, DecDeg;
+            public double MatchRadiusArcsec = 2.0;
+            public double TeffK;
+        }
+
+        /// <summary>
+        /// Impose the requested temperatures on a field, in place, and return how many stars took
+        /// one. Positional entries are resolved first, each to the NEAREST star inside its radius;
+        /// a position-free entry then claims everything left.
+        ///
+        /// A POSITIONAL ENTRY THAT MATCHES NOTHING IS REFUSED, not ignored. Silently dropping it
+        /// would render a frame whose target is at the catalogue's temperature while the request
+        /// and every label on the run said otherwise, and the measurement would come back near
+        /// zero for a reason nothing in the output could show. This is the same refusal the
+        /// transit injection makes when its host is not there.
+        /// </summary>
+        public static int ApplyStarTemperatures(List<RenderedStar> stars,
+                                                IList<StarTemperature> temperatures,
+                                                out string refusal)
+        {
+            refusal = null;
+            if (stars == null || temperatures == null || temperatures.Count == 0) return 0;
+
+            var claimed = new bool[stars.Count];
+            int applied = 0;
+
+            foreach (StarTemperature t in temperatures)
+            {
+                if (t == null || !t.HasPosition) continue;
+
+                double radius = t.MatchRadiusArcsec > 0.0 ? t.MatchRadiusArcsec : 2.0;
+                int best = -1;
+                double bestSep = double.MaxValue;
+                for (int i = 0; i < stars.Count; i++)
+                {
+                    if (claimed[i]) continue;
+                    double dRa = (stars[i].RaDeg - t.RaDeg)
+                               * Math.Cos(stars[i].DecDeg * Math.PI / 180.0);
+                    double dDec = stars[i].DecDeg - t.DecDeg;
+                    double sep = Math.Sqrt(dRa * dRa + dDec * dDec) * 3600.0;
+                    if (sep < bestSep) { bestSep = sep; best = i; }
+                }
+
+                if (best < 0 || bestSep > radius)
+                {
+                    refusal =
+                        $"No star of this field lies within {radius:0.#} arcsec of RA {t.RaDeg:0.####}, "
+                      + $"Dec {t.DecDeg:0.####}, so the temperature {t.TeffK:0.} K would have been "
+                      + "imposed on empty sky"
+                      + (best >= 0 ? $"; the nearest star is {bestSep:0.#} arcsec away. " : ". ")
+                      + "Give the star's own position, or widen the match radius.";
+                    return applied;
+                }
+
+                RenderedStar s = stars[best];
+                s.OverrideTeffK = t.TeffK;
+                stars[best] = s;
+                claimed[best] = true;
+                applied++;
+            }
+
+            // The field default, last, so it takes only what no position claimed.
+            foreach (StarTemperature t in temperatures)
+            {
+                if (t == null || t.HasPosition) continue;
+                for (int i = 0; i < stars.Count; i++)
+                {
+                    if (claimed[i]) continue;
+                    RenderedStar s = stars[i];
+                    s.OverrideTeffK = t.TeffK;
+                    stars[i] = s;
+                    claimed[i] = true;
+                    applied++;
+                }
+                break;
+            }
+
+            return applied;
+        }
+
         public sealed class Request
         {
             public VisualTelescopeSpec Spec;
@@ -147,6 +238,16 @@ namespace ExoStudio.Simulation
             /// the sequence records the held value so an analysis can see it was held.
             /// </summary>
             public double HeldAirmass = double.NaN;
+
+            /// <summary>
+            /// Effective temperatures to impose on stars of this field, overriding what their
+            /// colour indices imply. Null or empty leaves every star as the catalogue has it.
+            ///
+            /// The packed catalogue's colour is clamped at B-V = 2.0, a floor of 3169 K through
+            /// Ballesteros, so the M dwarfs ground-based transit surveys actually observe cannot
+            /// be asked for at all. This is how a study says what its target is.
+            /// </summary>
+            public IList<StarTemperature> StarTemperatures;
 
             /// <summary>
             /// Cooler setpoint, Celsius. NaN keeps the instrument's own published temperature.
@@ -374,6 +475,12 @@ namespace ExoStudio.Simulation
             /// measurement that ignores it is quoting a width it did not use.
             /// </summary>
             public int StarsWithoutColour;
+
+            /// <summary>
+            /// How many stars were given a temperature by the request rather than by their colour.
+            /// Never silent: a frame built this way is about stars that are not in any catalogue.
+            /// </summary>
+            public int StarsWithImposedTemperature;
 
             /// <summary>
             /// The seeing the run ASKED FOR, at the zenith and at 500 nm, against SeeingFwhmArcsec
@@ -1121,6 +1228,18 @@ namespace ExoStudio.Simulation
                 var stars = new List<RenderedStar>();
                 starLayer.Catalog.Search(req.RaDeg, req.DecDeg, starSearchRadiusDeg, 30.0, stars);
 
+                // THE TEMPERATURES THE REQUEST IMPOSES, before anything reads a colour. Both the
+                // band integral that sets a star's flux and the sub-band weighting that sets its
+                // image width go through RenderedStar.EffectiveTeffK, so they cannot disagree
+                // about what a star is.
+                res.StarsWithImposedTemperature = ApplyStarTemperatures(
+                    stars, req.StarTemperatures, out string temperatureRefusal);
+                if (temperatureRefusal != null)
+                {
+                    res.Error = temperatureRefusal;
+                    return new PreparedExposure { Meta = res };
+                }
+
                 var reddening = new ReddenedResponseCache(response);
                 double exposure = req.ExposureSeconds;
                 double starTransmission = nonAtmTransmission * starScint;
@@ -1209,7 +1328,8 @@ namespace ExoStudio.Simulation
                             ? star.FixedElectrons
                             : StellarPhotometry.CollectedElectrons(
                                 star.VMag, star.ColorIndexBV, star.ReddeningEBv,
-                                response, reddening, areaCm2, exposure, starTransmission),
+                                response, reddening, areaCm2, exposure, starTransmission,
+                                star.OverrideTeffK),
                     });
                 }
 
@@ -1217,7 +1337,8 @@ namespace ExoStudio.Simulation
                 Func<RenderedStar, double> electronsFor = star =>
                     StellarPhotometry.CollectedElectrons(
                         star.VMag, star.ColorIndexBV, star.ReddeningEBv,
-                        response, reddening, areaCm2, exposure, starTransmission);
+                        response, reddening, areaCm2, exposure, starTransmission,
+                        star.OverrideTeffK);
 
                 int colourGroups = Math.Clamp(req.PsfColourGroups, 0, 16);
                 if (colourGroups >= 2 && !space)
@@ -2515,10 +2636,9 @@ namespace ExoStudio.Simulation
             var known = new List<double>(stars.Count);
             for (int i = 0; i < stars.Count; i++)
             {
-                double? t = StellarColor.TeffFromColorIndexBV(
-                    stars[i].HasColor ? stars[i].ColorIndexBV : (double?)null);
-                teff[i] = t ?? double.NaN;
-                if (t.HasValue) known.Add(t.Value);
+                double t = stars[i].EffectiveTeffK;
+                teff[i] = t;
+                if (!double.IsNaN(t)) known.Add(t);
             }
 
             // Not one star in the field carries a usable colour. One group at NaN, which

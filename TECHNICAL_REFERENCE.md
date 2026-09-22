@@ -1233,6 +1233,41 @@ aperture for a reason that does not apply to it. The test is now against the rad
 actually requested, which is the floor binding and nothing else, and is identical to the old
 behaviour whenever no radius is asked for.
 
+### A star's temperature, when its colour cannot carry it
+
+The packed all-sky catalogue stores a colour index, and that index is clamped at B-V = 2.0. Read
+directly out of `data/GaiaAllSky.starcat`, over a million records sampled in three widely separated
+blocks, the maximum is exactly 2.000 and nothing exceeds it. Through Ballesteros' relation
+(`Core/StellarColor.TeffFromColorIndexBV`) that is a FLOOR OF 3169 K.
+
+Which rules out the stars this simulator is most often pointed at. SPECULOOS, TRAPPIST and every
+ultracool-dwarf transit survey work at 2300 to 2800 K. None of them could be asked for: a request
+for a 2600 K target would silently get a 3169 K one, the colour difference against a solar-type
+ensemble would come out smaller than it is, and nothing in the output would say why.
+
+The clamp is in the DATA, so no code change reaches below it. `StarTemperatures` on a capture or a
+sequence request imposes a temperature instead:
+
+  * an entry with a position takes the NEAREST star inside its match radius, default 2 arcsec;
+  * an entry without one takes every star the positioned entries did not claim, which is how a
+    comparison ensemble becomes synthetic and a single colour.
+
+One definition serves both consumers. `RenderedStar.EffectiveTeffK` returns the override when there
+is one and Ballesteros otherwise, and both the band integral that sets a star's flux
+(`StellarPhotometry.CollectedElectrons`) and the sub-band weighting that sets its image width go
+through it, so a star cannot be one temperature for its brightness and another for its width.
+
+A POSITIONED ENTRY THAT MATCHES NOTHING IS REFUSED, with the distance to the nearest star in the
+message. Dropping it would render a frame whose target kept the catalogue's temperature while the
+request and every label on the run said otherwise, and the measurement would come back near null
+for a reason nothing in the output could show. It is the same refusal the transit injection makes
+when its host is not there, for the same reason.
+
+Nothing about it is silent. The frame reports `StarsWithImposedTemperature`, the sequence echoes
+the list, and the exported CSV carries a header line ending "imposed by the request, not
+catalogued". A frame built this way is about a star that is in no catalogue, and anything measured
+on it has to say so.
+
 ## 5.9 Water vapour
 
 `Engine/Simulation/PwvTransmission.cs`, `Engine/Simulation/PwvSeries.cs`, `tools/fetch_pwv_grid.py`,

@@ -642,6 +642,13 @@ namespace ExoStudio.Api
             // own spectrum.
             psfColourGroups = s.PsfColourGroups,
             holdAirmass = double.IsFinite(s.HoldAirmass) ? s.HoldAirmass : (double?)null,
+            starTemperatures = s.StarTemperatures == null || s.StarTemperatures.Count == 0 ? null
+                : s.StarTemperatures.Select(t => new
+                  {
+                      raDeg = t.HasPosition ? t.RaDeg : (double?)null,
+                      decDeg = t.HasPosition ? t.DecDeg : (double?)null,
+                      teffK = t.TeffK,
+                  }).ToArray(),
             apertureRadiusArcsec = double.IsFinite(s.ApertureRadiusArcsec) ? s.ApertureRadiusArcsec : (double?)null,
             apertureRadiusInFwhm = double.IsFinite(s.ApertureRadiusInFwhm) ? s.ApertureRadiusInFwhm : (double?)null,
 
@@ -933,6 +940,14 @@ namespace ExoStudio.Api
 
 
         /// <summary>
+        /// Temperatures imposed on stars of this field, overriding their colour indices. A
+        /// positional entry that matches no star is REFUSED rather than dropped, because a run
+        /// whose target quietly kept the catalogue's temperature would measure a near null and
+        /// nothing in its output would say why.
+        /// </summary>
+        public List<StarTemperatureRequest> StarTemperatures { get; set; }
+
+        /// <summary>
         /// Photometric aperture radius in arcsec, FIXED for the run whatever the seeing does.
         /// Null takes the default, which tracks the seeing at Howell's 0.68 FWHM.
         ///
@@ -1157,6 +1172,30 @@ namespace ExoStudio.Api
     }
 
 
+
+    /// <summary>
+    /// A temperature imposed on one star of the field, or, with no position, on all the rest.
+    ///
+    /// The packed catalogue clamps B-V at 2.0, which through Ballesteros' relation is a floor of
+    /// 3169 K, so the M dwarfs ground-based transit surveys actually observe cannot be requested
+    /// through a colour at all. This is how a run says what its target is, and it is an override:
+    /// the frame is then about a star that is in no catalogue, and the run records how many stars
+    /// were given one.
+    /// </summary>
+    public sealed class StarTemperatureRequest
+    {
+        /// <summary>The star's own position. Both or neither; neither means every star the
+        /// positional entries did not claim.</summary>
+        public double? RaDeg { get; set; }
+        public double? DecDeg { get; set; }
+
+        /// <summary>How close a star has to be to count as this one. Default 2 arcsec.</summary>
+        public double? MatchRadiusArcsec { get; set; }
+
+        /// <summary>Effective temperature in kelvin.</summary>
+        public double TeffK { get; set; }
+    }
+
     public sealed class SeeingRequest
     {
         /// <summary>constant | ramp | measured</summary>
@@ -1256,6 +1295,15 @@ namespace ExoStudio.Api
         /// it used rather than picking silently.
         /// </summary>
         public double? ApertureRadiusInFwhm { get; set; }
+
+
+        /// <summary>
+        /// Temperatures imposed on stars of this field, overriding their colour indices. A
+        /// positional entry that matches no star is REFUSED rather than dropped, because a run
+        /// whose target quietly kept the catalogue's temperature would measure a near null and
+        /// nothing in its output would say why.
+        /// </summary>
+        public List<StarTemperatureRequest> StarTemperatures { get; set; }
 
         /// <summary>What the frame is of, for the FITS OBJECT keyword and the download name.</summary>
         public string ObjectName { get; set; }

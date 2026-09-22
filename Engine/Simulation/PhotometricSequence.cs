@@ -120,6 +120,12 @@ namespace ExoStudio.Simulation
         /// the seeing, or a multiple of each frame's own FWHM. NaN for the default. Recorded
         /// because the aperture is not a detail of the reduction here, it is the experiment.
         /// </summary>
+        /// <summary>
+        /// Temperatures this run imposed on stars of the field, or null for none. Recorded because
+        /// a run whose target was given a temperature is about a star that is in no catalogue.
+        /// </summary>
+        public List<DeepSkyCamera.StarTemperature> StarTemperatures;
+
         public double ApertureRadiusArcsec = double.NaN;
         public double ApertureRadiusInFwhm = double.NaN;
 

@@ -108,13 +108,39 @@ namespace ExoInstruments.Core
             double vMag, double colorIndexBV, double eBv,
             SystemResponse response, ReddenedResponseCache cache,
             double apertureAreaCm2, double exposureSeconds, double extraTransmission)
+            => CollectedElectrons(vMag, colorIndexBV, eBv, response, cache,
+                                  apertureAreaCm2, exposureSeconds, extraTransmission, double.NaN);
+
+        /// <summary>
+        /// As above, with the star's effective temperature supplied rather than derived from its
+        /// colour index.
+        ///
+        /// The catalogue's colour is clamped at B-V = 2.0, so Ballesteros cannot return below
+        /// 3169 K and an M dwarf at 2600 K is unreachable through the colour. Given the
+        /// temperature directly, the band integral is the one that star's spectrum makes.
+        ///
+        /// WITH REDDENING THE OVERRIDE IS THE INTRINSIC TEMPERATURE, not the observed colour's:
+        /// the point of supplying it is to say what the star IS, and the extinction curve still
+        /// enters as a shape normalised at V so nothing is attenuated twice.
+        ///
+        /// overrideTeffK NaN or non-positive reproduces the overload above exactly.
+        /// </summary>
+        public static double CollectedElectrons(
+            double vMag, double colorIndexBV, double eBv,
+            SystemResponse response, ReddenedResponseCache cache,
+            double apertureAreaCm2, double exposureSeconds, double extraTransmission,
+            double overrideTeffK)
         {
             if (response == null) return 0.0;
 
             bool reddened = !double.IsNaN(eBv) && eBv > 0.0;
 
             double teffK = 0.0;
-            if (!double.IsNaN(colorIndexBV))
+            if (!double.IsNaN(overrideTeffK) && overrideTeffK > 0.0)
+            {
+                teffK = overrideTeffK;
+            }
+            else if (!double.IsNaN(colorIndexBV))
             {
                 double? teff = reddened
                     ? ReddenedStarSpectrum.IntrinsicTeffK(colorIndexBV, eBv)

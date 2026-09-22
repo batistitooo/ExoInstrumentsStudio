@@ -82,7 +82,7 @@ descriptions are written so the port is a read rather than an investigation.
 
 ### What has changed in `Core/`, and why
 
-Six entries, as of 2026-08-27.
+Eight entries, the last two as of 2026-09-22.
 
 #### `Core/AperturePhotometry.cs` — the aperture takes partial pixels
 
@@ -238,3 +238,43 @@ Evidence, `Verify` section 6: the cone search and the independent streaming read
 
 **The mod holds the same arrays** and gains the same ceiling removal; KSP has less memory to spare
 than a headless server, not more.
+
+#### `Core/RenderedStarCatalog.cs`, a star can be told what temperature it is
+
+The packed catalogue stores a colour index and nothing else, and that index is clamped at
+B-V = 2.0. Read straight out of `data/GaiaAllSky.starcat`, over a million records sampled in three
+widely separated blocks, the maximum is exactly 2.000 and nothing exceeds it. Through Ballesteros'
+relation in `Core/StellarColor` that is a floor of **3169 K**.
+
+Which excludes the stars this simulator is most often pointed at. SPECULOOS, TRAPPIST and every
+ultracool-dwarf transit programme work at 2300 to 2800 K. Asked for one, the catalogue returned a
+3169 K star instead, the colour difference against a solar-type ensemble came out smaller than it
+is, and nothing said so.
+
+The clamp is in the DATA, so no code change reaches below it. `RenderedStar` now carries an
+optional `OverrideTeffK`, and a single `EffectiveTeffK` returns the override when there is one and
+Ballesteros otherwise. Both consumers go through it, the band integral that sets a star's flux and
+the sub-band weighting that sets its image width, so a star cannot be one temperature for its
+brightness and another for its width. Unset, it is NaN and every star is exactly what it was.
+
+Evidence, `Verify` section 27: B-V 2.0 measures 3169 K; the override reaches 2600 K; and against a
+5500 K ensemble the floor delivers **66 per cent** of the effective-wavelength separation the real
+target has, so a study run without it would have under-measured a colour effect by a third.
+
+**The mod holds the same clamp**, and the same catalogue file, so it gains the same reach.
+
+#### `Core/StellarPhotometry.cs`, the band integral accepts a temperature
+
+`CollectedElectrons` derived a star's effective temperature from its colour index and had no other
+way in, so the clamp above reached the flux as well as the width. It now takes an optional explicit
+temperature, used in place of the derivation when it is finite and positive; with reddening the
+supplied value is the INTRINSIC temperature, which is the whole point of supplying it, and the
+extinction curve still enters as a shape normalised at V so nothing is attenuated twice.
+
+Every existing overload forwards NaN and is unchanged.
+
+Evidence, `Verify` section 27: the same V and the same colour index give a different collected
+charge once the temperature is imposed, and omitting it reproduces the colour-derived number
+exactly.
+
+**The mod holds the same signature** and would gain the same way in.

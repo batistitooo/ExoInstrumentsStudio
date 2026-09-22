@@ -4237,6 +4237,87 @@ Section("26. A fixed aperture is what sees the effect, and an aperture that trac
           $"{CcdEquation.OptimalApertureRadiusInFwhm} FWHM, so the default cancels the effect above");
 }
 
+Section("27. A star's temperature, when the catalogue's colour cannot reach it");
+{
+    // THE FLOOR, MEASURED FROM THE RELATION RATHER THAN ASSERTED. B-V is clamped at 2.0 in the
+    // packed catalogue, and this is what that clamp means in kelvin.
+    double floorK = StellarColor.TeffFromColorIndexBV(2.0) ?? double.NaN;
+    Check("the catalogue's reddest possible colour is a temperature floor above the M dwarfs",
+          floorK > 3100.0 && floorK < 3250.0 && floorK > 2600.0,
+          $"B-V 2.0 is {floorK:F0} K, so 2600 K cannot be requested through a colour at all");
+
+    var field27 = new List<RenderedStar>
+    {
+        new RenderedStar { RaDeg = 280.0000, DecDeg = 38.0000, VMag = 12.0, ColorIndexBV = 2.0 },
+        new RenderedStar { RaDeg = 280.0100, DecDeg = 38.0000, VMag = 12.5, ColorIndexBV = 0.65 },
+        new RenderedStar { RaDeg = 280.0200, DecDeg = 38.0000, VMag = 13.0, ColorIndexBV = 0.70 },
+    };
+
+    Check("without an override a star's temperature is its colour's",
+          Math.Abs(field27[0].EffectiveTeffK - floorK) < 1e-9,
+          $"{field27[0].EffectiveTeffK:F0} K from B-V 2.0");
+
+    var temps27 = new List<DeepSkyCamera.StarTemperature>
+    {
+        new DeepSkyCamera.StarTemperature { HasPosition = true, RaDeg = 280.0, DecDeg = 38.0,
+                                            MatchRadiusArcsec = 5.0, TeffK = 2600.0 },
+        new DeepSkyCamera.StarTemperature { TeffK = 5500.0 },
+    };
+    int applied27 = DeepSkyCamera.ApplyStarTemperatures(field27, temps27, out string refuse27);
+
+    Check("the positioned entry takes the star at that position and nothing else",
+          refuse27 == null && applied27 == 3 && Math.Abs(field27[0].EffectiveTeffK - 2600.0) < 1e-9,
+          $"{field27[0].EffectiveTeffK:F0} K on the target, {applied27} stars given one");
+    Check("and the entry without a position takes the rest, which makes the ensemble synthetic",
+          Math.Abs(field27[1].EffectiveTeffK - 5500.0) < 1e-9
+          && Math.Abs(field27[2].EffectiveTeffK - 5500.0) < 1e-9,
+          "one colour for every comparison, so the field's own mixture stops mattering");
+
+    var missed27 = new List<RenderedStar>
+    {
+        new RenderedStar { RaDeg = 281.0, DecDeg = 38.0, VMag = 12.0, ColorIndexBV = 0.6 },
+    };
+    DeepSkyCamera.ApplyStarTemperatures(missed27, new List<DeepSkyCamera.StarTemperature>
+    {
+        new DeepSkyCamera.StarTemperature { HasPosition = true, RaDeg = 280.0, DecDeg = 38.0,
+                                            MatchRadiusArcsec = 2.0, TeffK = 2600.0 },
+    }, out string refuse27b);
+    Check("a positioned temperature that matches no star is refused, with the distance to the nearest",
+          refuse27b != null && refuse27b.Contains("arcsec"),
+          refuse27b == null ? "it was dropped silently" : refuse27b.Substring(0, Math.Min(96, refuse27b.Length)));
+
+    // WHAT THE FLOOR WOULD HAVE COST, in the quantity the whole study is about.
+    VisualTelescopeSpec scope27 = VisualTelescopeCatalog.Rc20;
+    const double alt27 = 2396.0, centre27 = 700e-9, band27 = 1500.0, plate27 = 0.35;
+    SystemResponse resp27 = DeepSkyCamera.BuildSystemResponse(scope27, CameraFilter.Red, 1.2, alt27);
+    double Lam(double teff) => DeepSkyCamera.PhotonWeightedWavelength(
+        DeepSkyCamera.BuildSubBands(centre27, band27, 20.0, plate27, alt27, 0.0, 1.0, resp27, teff));
+
+    double lamTrue = Lam(2600.0), lamFloor = Lam(floorK), lamSun = Lam(5500.0);
+    double sepTrue = lamTrue / lamSun - 1.0, sepFloor = lamFloor / lamSun - 1.0;
+    Console.WriteLine($"         against a 5500 K ensemble, separation in effective wavelength:");
+    Console.WriteLine($"         2600 K target  {sepTrue * 100.0,7:F3} per cent");
+    Console.WriteLine($"         3169 K floor   {sepFloor * 100.0,7:F3} per cent, "
+                    + $"which is {sepFloor / sepTrue * 100.0:F0} per cent of it");
+
+    Check("the override reaches a colour separation the catalogue's floor cannot",
+          lamTrue > lamFloor && sepFloor < sepTrue,
+          $"{lamTrue * 1e9:F2} nm at 2600 K against {lamFloor * 1e9:F2} nm at the floor");
+
+    // AND THE FLUX FOLLOWS THE SAME TEMPERATURE, so a star is not one thing for its brightness
+    // and another for its width.
+    double eFloor = StellarPhotometry.CollectedElectrons(12.0, 2.0, double.NaN, resp27, null,
+                                                        1e4, 60.0, 1.0, double.NaN);
+    double eOver = StellarPhotometry.CollectedElectrons(12.0, 2.0, double.NaN, resp27, null,
+                                                        1e4, 60.0, 1.0, 2600.0);
+    Check("the band integral uses the imposed temperature too, not just the image width",
+          eOver != eFloor && eOver > 0.0,
+          $"{eOver:F0} e- against {eFloor:F0} e- for the same V and the same colour index");
+    Check("and passing no override reproduces the colour-derived flux exactly",
+          StellarPhotometry.CollectedElectrons(12.0, 2.0, double.NaN, resp27, null, 1e4, 60.0, 1.0)
+          == eFloor, "the overload without a temperature is the one that existed before");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

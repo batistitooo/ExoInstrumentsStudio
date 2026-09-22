@@ -3859,6 +3859,7 @@ $('seqStart').onclick = async () => {
         airmassFrom: parseFloat($('seqXFrom').value),
         airmassTo: parseFloat($('seqXTo').value),
         holdAirmass: $('seqHoldX').value === '' ? undefined : parseFloat($('seqHoldX').value),
+        starTemperatures: starTemperatureBody(),
         apertureRadiusArcsec: $('seqApArcsec').value === '' ? undefined : parseFloat($('seqApArcsec').value),
         apertureRadiusInFwhm: $('seqApFwhm').value === '' ? undefined : parseFloat($('seqApFwhm').value),
         comparisons: parseInt($('seqComps').value, 10),
@@ -4583,6 +4584,18 @@ for (const id of ['seeingMode', 'seeingArcsec', 'seeingFrom', 'seeingTo',
   $(id).addEventListener('change', seeingModeChanged);
 }
 seeingModeChanged();
+
+// The two temperature controls, as the list the endpoint takes. The target's is imposed at the
+// field centre, which is where an observer pointed at it; the field's takes everything the target
+// did not claim. Both empty sends nothing and every star keeps its catalogue colour.
+function starTemperatureBody() {
+  const out = [];
+  const t = $('seqTargetK').value.trim();
+  const f = $('seqFieldK').value.trim();
+  if (t !== '') out.push({ raDeg: fieldRa(), decDeg: fieldDec(), matchRadiusArcsec: 5, teffK: parseFloat(t) });
+  if (f !== '') out.push({ teffK: parseFloat(f) });
+  return out.length ? out : undefined;
+}
 
 function seeingRequestBody() {
   const mode = $('seeingMode').value;

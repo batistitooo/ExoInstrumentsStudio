@@ -716,6 +716,8 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
 
     PwvSeries seqPwv = BuildPwvSeries(req.Pwv, seqStartUt, out string seqPwvError);
     SeeingSeries seqSeeing = BuildSeeingSeries(req.Seeing, seqStartUt, out string seqSeeingError);
+    List<DeepSkyCamera.StarTemperature> seqTemps =
+        BuildStarTemperatures(req.StarTemperatures, out string seqTempError);
     // Mid-ladder by default: a transit at the end of the run has no baseline after it to normalise
     // against, and the whole measurement is the ratio of in-transit to out.
     // THE MIDDLE OF THE RUN, measured the same way a frame's epoch is.
@@ -785,6 +787,7 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
     }
     if (seqPwvError != null) return Results.BadRequest(new { error = seqPwvError });
     if (seqSeeingError != null) return Results.BadRequest(new { error = seqSeeingError });
+    if (seqTempError != null) return Results.BadRequest(new { error = seqTempError });
     if (req.ApertureRadiusArcsec is { } ra && !(ra > 0.0 && ra <= 60.0))
         return Results.BadRequest(new { error = $"apertureRadiusArcsec {ra} is out of range. Above 0 and at most 60 arcsec, or omit it for the default." });
     if (req.ApertureRadiusInFwhm is { } rf && !(rf >= 0.1 && rf <= 10.0))
@@ -847,6 +850,7 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         SearchFromUt = now,
         PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
         Seeing = seqSeeing,
+        StarTemperatures = seqTemps,
         HoldAirmass = req.HoldAirmass ?? double.NaN,
         ApertureRadiusArcsec = req.ApertureRadiusArcsec ?? double.NaN,
         ApertureRadiusInFwhm = req.ApertureRadiusInFwhm ?? double.NaN,
@@ -1221,6 +1225,13 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
       .Append(seq.Calibrate ? ", each frame calibrated" : ", no calibration").Append('\n');
     sb.Append("# water: ").Append(seq.Pwv?.Description ?? "not modelled")
       .Append(seq.Pwv != null ? $" [{seq.Pwv.Id}]" : "").Append('\n');
+    sb.Append("# star temperatures: ").Append(
+        seq.StarTemperatures == null || seq.StarTemperatures.Count == 0
+            ? "from the catalogue's colours"
+            : string.Join("; ", seq.StarTemperatures.Select(t => t.HasPosition
+                ? $"{t.TeffK.ToString("0.", CultureInfo.InvariantCulture)} K at RA {t.RaDeg.ToString("0.####", CultureInfo.InvariantCulture)} Dec {t.DecDeg.ToString("0.####", CultureInfo.InvariantCulture)}"
+                : $"{t.TeffK.ToString("0.", CultureInfo.InvariantCulture)} K for the rest of the field"))
+              + " (imposed by the request, not catalogued)").Append('\n');
     sb.Append("# aperture: ").Append(
         double.IsFinite(seq.ApertureRadiusArcsec)
             ? $"{seq.ApertureRadiusArcsec.ToString("0.###", CultureInfo.InvariantCulture)} arcsec, fixed against the seeing"
@@ -2327,9 +2338,11 @@ bool TryCaptureOne(CaptureRequestDto req, out CaptureStore.Stored stored, out De
         PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
         Seeing = BuildSeeingSeries(req.Seeing, double.IsNaN(bookedUt) ? nowUt : bookedUt,
                                    out string seeingError),
+        StarTemperatures = BuildStarTemperatures(req.StarTemperatures, out string tempError),
     };
 
     if (seeingError != null) { refusal = Results.BadRequest(new { error = seeingError }); return false; }
+    if (tempError != null) { refusal = Results.BadRequest(new { error = tempError }); return false; }
 
     if (pwvError != null) { refusal = Results.BadRequest(new { error = pwvError }); return false; }
     if (transientError != null) { refusal = Results.BadRequest(new { error = transientError }); return false; }
@@ -3516,6 +3529,7 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                 Seed = seed,
                 PsfColourGroups = seq.PsfColourGroups,
                 Seeing = seq.Seeing,
+                StarTemperatures = seq.StarTemperatures,
                 HeldAirmass = seq.HoldAirmass,
                 Pwv = seq.Pwv,
                 Transient = seq.Transient,
@@ -3715,6 +3729,52 @@ static TransitInjection BuildTransient(TransientRequest req, double defaultEpoch
 /// rather than a clamp. The ramp's offsets are minutes from <paramref name="epochUt"/>, the run's
 /// own start, because a request cannot know which instant the scheduler will pick.
 /// </summary>
+/// <summary>
+/// The temperature overrides from a request, validated, or null for none. Bounds are refused
+/// rather than clamped: a temperature outside them is a unit mistake or a typing one, and
+/// rendering it quietly would produce a frame nobody asked for.
+/// </summary>
+static List<DeepSkyCamera.StarTemperature> BuildStarTemperatures(
+    List<StarTemperatureRequest> reqs, out string error)
+{
+    error = null;
+    if (reqs == null || reqs.Count == 0) return null;
+
+    var built = new List<DeepSkyCamera.StarTemperature>(reqs.Count);
+    int fieldWide = 0;
+    foreach (StarTemperatureRequest t in reqs)
+    {
+        if (t == null) continue;
+        if (!(t.TeffK >= 1000.0 && t.TeffK <= 50000.0))
+        {
+            error = $"A star temperature of {t.TeffK} K is out of range. 1000 to 50000 K.";
+            return null;
+        }
+        bool hasRa = t.RaDeg.HasValue, hasDec = t.DecDeg.HasValue;
+        if (hasRa != hasDec)
+        {
+            error = "A star temperature needs both raDeg and decDeg, or neither. With neither it "
+                  + "applies to every star the positioned entries did not claim.";
+            return null;
+        }
+        if (!hasRa && ++fieldWide > 1)
+        {
+            error = "Only one temperature can apply to the whole field. Give the others their own "
+                  + "positions, or merge them.";
+            return null;
+        }
+        built.Add(new DeepSkyCamera.StarTemperature
+        {
+            HasPosition = hasRa,
+            RaDeg = t.RaDeg ?? 0.0,
+            DecDeg = t.DecDeg ?? 0.0,
+            MatchRadiusArcsec = t.MatchRadiusArcsec ?? 2.0,
+            TeffK = t.TeffK,
+        });
+    }
+    return built.Count > 0 ? built : null;
+}
+
 static SeeingSeries BuildSeeingSeries(SeeingRequest req, double epochUt, out string error)
 {
     error = null;
