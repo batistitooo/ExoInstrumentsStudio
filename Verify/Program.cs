@@ -3917,6 +3917,160 @@ Section("23. A frame's epoch is the middle of its exposure, because that is when
           + $"{t23.DurationSeconds / 3600.0:F2} h transit");
 }
 
+Section("24. A star's own colour sets its image width, and a fixed aperture then sees the difference");
+{
+    VisualTelescopeSpec scope24 = VisualTelescopeCatalog.Rc20;
+    const double alt24 = 2396.0;
+    const double centre24 = 700e-9;      // metres, a red passband's centre
+    const double bandwidth24 = 1500.0;   // Angstrom
+    const double plate24 = 0.35;         // arcsec per pixel, a 1 m class sampling
+    const double seeing24 = 1.0;         // arcsec at the band centre
+    const double redK = 2600.0, blueK = 5500.0;
+
+    SystemResponse resp24 = DeepSkyCamera.BuildSystemResponse(scope24, CameraFilter.Red, 1.2, alt24);
+
+    ChromaticSubBand[] flat24 = DeepSkyCamera.BuildSubBands(
+        centre24, bandwidth24, 20.0, plate24, alt24, 0.0, 1.0);
+
+    // THE DEFAULT IS THE FRAME THAT EXISTED BEFORE THIS TERM. Weighting is opt-in twice over: a
+    // null response and a temperature at or below zero both fall back to the flat weights, and
+    // the sub-bands then are the ones the shared kernel was always built on.
+    ChromaticSubBand[] noResp = DeepSkyCamera.BuildSubBands(
+        centre24, bandwidth24, 20.0, plate24, alt24, 0.0, 1.0, null, redK);
+    ChromaticSubBand[] noTeff = DeepSkyCamera.BuildSubBands(
+        centre24, bandwidth24, 20.0, plate24, alt24, 0.0, 1.0, resp24, 0.0);
+    bool unchanged24 = true;
+    for (int i = 0; i < flat24.Length; i++)
+        unchanged24 &= flat24[i].Weight == noResp[i].Weight
+                    && flat24[i].Weight == noTeff[i].Weight
+                    && flat24[i].WavelengthMeters == noResp[i].WavelengthMeters
+                    && flat24[i].OffsetX == noResp[i].OffsetX
+                    && flat24[i].OffsetY == noResp[i].OffsetY;
+    Check("without a response or without a temperature the sub-bands are the flat ones, exactly",
+          unchanged24, "the unweighted frame is bit-for-bit the frame this term did not exist for");
+
+    ChromaticSubBand[] redBands = DeepSkyCamera.BuildSubBands(
+        centre24, bandwidth24, 20.0, plate24, alt24, 0.0, 1.0, resp24, redK);
+    ChromaticSubBand[] blueBands = DeepSkyCamera.BuildSubBands(
+        centre24, bandwidth24, 20.0, plate24, alt24, 0.0, 1.0, resp24, blueK);
+
+    double lamRed = DeepSkyCamera.PhotonWeightedWavelength(redBands);
+    double lamBlue = DeepSkyCamera.PhotonWeightedWavelength(blueBands);
+
+    // The reported lambda_eff is the weighted mean it claims to be, summed here independently so
+    // the check is not the function agreeing with itself.
+    double num24 = 0.0, den24 = 0.0;
+    foreach (ChromaticSubBand b in redBands) { num24 += b.Weight * b.WavelengthMeters; den24 += b.Weight; }
+    Check("the reported effective wavelength is the photon-weighted mean of the sub-bands",
+          Math.Abs(lamRed - num24 / den24) < 1e-18,
+          $"{lamRed * 1e9:F4} nm against {num24 / den24 * 1e9:F4} nm");
+
+    Check("a 2600 K dwarf sits redward of a 5500 K star in the same passband",
+          lamRed > lamBlue,
+          $"{lamRed * 1e9:F2} nm against {lamBlue * 1e9:F2} nm, a ratio of {lamRed / lamBlue:F4}");
+
+    float[] redKernel = OpticalPsf.BuildChromaticKernel(
+        plate24, scope24.ApertureMeters, scope24.SecondaryObstructionFraction, seeing24,
+        centre24, 0.0, scope24.SpiderVaneCount, scope24.SpiderVaneWidthMeters,
+        scope24.PrimaryMirrorPads, redBands, out int redRadius);
+    float[] blueKernel = OpticalPsf.BuildChromaticKernel(
+        plate24, scope24.ApertureMeters, scope24.SecondaryObstructionFraction, seeing24,
+        centre24, 0.0, scope24.SpiderVaneCount, scope24.SpiderVaneWidthMeters,
+        scope24.PrimaryMirrorPads, blueBands, out int blueRadius);
+
+    double fwhmRed = OpticalPsf.MeasureKernelFwhmArcsec(redKernel, redRadius, plate24);
+    double fwhmBlue = OpticalPsf.MeasureKernelFwhmArcsec(blueKernel, blueRadius, plate24);
+
+    // BOYD 1978 SETS THE FLOOR, DIFFRACTION SETS THE CEILING. Seeing narrows as lambda^(-1/5), so
+    // the red star's image would be exactly that much narrower if seeing were all there is. It is
+    // not: the diffraction core widens as lambda, in the other direction, so the delivered ratio
+    // must land between the pure seeing law and 1. On a half-metre at 700 nm the Airy core is a
+    // third of the seeing and the compensation is visible, which is the whole reason the effect
+    // depends on aperture diameter.
+    double seeingOnly = Math.Pow(lamRed / lamBlue, -0.2);
+    double delivered = fwhmRed / fwhmBlue;
+    Check("the red star is delivered narrower, and by between the seeing law and nothing",
+          delivered > seeingOnly - 1e-9 && delivered < 1.0,
+          $"delivered {delivered:F5}, seeing alone would give {seeingOnly:F5}, "
+          + $"{fwhmRed:F4} against {fwhmBlue:F4} arcsec");
+
+    // WHAT A FIXED APERTURE THEN MEASURES, which is the quantity the effect is stated in.
+    double Ee(float[] k, int radius, double rPx)
+    {
+        int side = 2 * radius + 1;
+        double inside = 0.0, total = 0.0;
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+            {
+                double v = k[y * side + x];
+                total += v;
+                double dx = x - radius, dy = y - radius;
+                if (dx * dx + dy * dy <= rPx * rPx) inside += v;
+            }
+        return total > 0.0 ? inside / total : double.NaN;
+    }
+
+    double DeltaMmag(double rInFwhm, double k)
+    {
+        float[] rWide = OpticalPsf.BuildChromaticKernel(
+            plate24, scope24.ApertureMeters, scope24.SecondaryObstructionFraction, seeing24 * k,
+            centre24, 0.0, scope24.SpiderVaneCount, scope24.SpiderVaneWidthMeters,
+            scope24.PrimaryMirrorPads, redBands, out int rr);
+        float[] bWide = OpticalPsf.BuildChromaticKernel(
+            plate24, scope24.ApertureMeters, scope24.SecondaryObstructionFraction, seeing24 * k,
+            centre24, 0.0, scope24.SpiderVaneCount, scope24.SpiderVaneWidthMeters,
+            scope24.PrimaryMirrorPads, blueBands, out int br);
+        double rPx = rInFwhm * seeing24 / plate24;
+        double before = Ee(redKernel, redRadius, rPx) / Ee(blueKernel, blueRadius, rPx);
+        double after = Ee(rWide, rr, rPx) / Ee(bWide, br, rPx);
+        return 2.5 * Math.Log10(after / before) * 1000.0;
+    }
+
+    double at1 = DeltaMmag(1.0, 1.3);
+    double at2 = DeltaMmag(2.0, 1.3);
+    Console.WriteLine($"         seeing 1.0 -> 1.3 arcsec, {redK:F0} K against {blueK:F0} K:");
+    Console.WriteLine($"         r = 1.0 FWHM0  {at1,8:F3} mmag");
+    Console.WriteLine($"         r = 2.0 FWHM0  {at2,8:F3} mmag");
+
+    Check("a seeing excursion moves the ratio of two colours in a fixed aperture",
+          Math.Abs(at1) > 0.05, $"{at1:F3} mmag at r = 1.0 FWHM0, which one shared kernel puts at exactly 0");
+    Check("and the narrower star keeps more of its light, so the sign is the red star's",
+          at1 > 0.0, $"{at1:F3} mmag");
+    Check("the effect falls with aperture radius, which is the curve the measurement is of",
+          Math.Abs(at2) < Math.Abs(at1),
+          $"{at2:F3} mmag at r = 2.0 against {at1:F3} at r = 1.0");
+
+    // THE SPLIT ITSELF: equal counts, extremes separated, and nothing drawn at a width it was
+    // not given.
+    var field24 = new List<RenderedStar>();
+    for (int i = 0; i < 9; i++)
+        field24.Add(new RenderedStar { VMag = 12.0, ColorIndexBV = 0.2 + 0.2 * i });
+    field24.Add(new RenderedStar { VMag = 12.0, ColorIndexBV = double.NaN });
+
+    List<(List<RenderedStar> Members, double TeffK)> split24 =
+        DeepSkyCamera.SplitByColour(field24, 3, out int noColour24);
+
+    Check("a star with no usable colour is counted, not silently given one",
+          noColour24 == 1, $"{noColour24} of {field24.Count} took the field median");
+    Check("the split returns the groups it was asked for",
+          split24.Count == 3, $"{split24.Count} groups");
+    Check("every star lands in exactly one group",
+          split24.Sum(g => g.Members.Count) == field24.Count,
+          $"{split24.Sum(g => g.Members.Count)} against {field24.Count}");
+    Check("the groups are ordered in temperature, so the extremes are separated",
+          split24[0].TeffK < split24[split24.Count - 1].TeffK,
+          $"{split24[0].TeffK:F0} K to {split24[split24.Count - 1].TeffK:F0} K");
+
+    List<(List<RenderedStar> Members, double TeffK)> again24 =
+        DeepSkyCamera.SplitByColour(field24, 3, out _);
+    bool sameOrder = true;
+    for (int g = 0; g < split24.Count; g++)
+        for (int i = 0; i < split24[g].Members.Count; i++)
+            sameOrder &= split24[g].Members[i].ColorIndexBV.Equals(again24[g].Members[i].ColorIndexBV);
+    Check("the split is deterministic, so the deposit order depends on the seed and nothing else",
+          sameOrder, "ties break on catalogue index");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

@@ -87,6 +87,13 @@ namespace ExoStudio.Simulation
         public ulong Seed;
         public bool Calibrate;
 
+        /// <summary>
+        /// How many colour groups each frame's stars were split into for the PSF. 0 or 1 is one
+        /// shared kernel, which is what every run before this carried. Recorded because a run
+        /// whose stars were drawn at their own widths is not comparable with one whose were not.
+        /// </summary>
+        public int PsfColourGroups;
+
         /// <summary>The water overhead across the run, or null when the term is absent.</summary>
         public PwvSeries Pwv;
 

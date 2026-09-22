@@ -96,6 +96,23 @@ namespace ExoStudio.Simulation
             public ulong Seed = 12345;
 
             /// <summary>
+            /// How many colour groups the stars are split into, so that each group's image width
+            /// is set by its own spectrum. 0 or 1, the default, is one shared kernel for the whole
+            /// frame, and a frame that is bit-for-bit what it was before this existed. Capped at
+            /// 16, because each group costs one more convolution over the full plane.
+            ///
+            /// WHY ONE KERNEL PER FRAME SETS A REAL EFFECT TO EXACTLY ZERO. Seeing FWHM goes as
+            /// lambda^(-1/5) (Boyd 1978, J. Opt. Soc. Am. 68, 877), so in one passband a red
+            /// dwarf's image is measurably narrower than a solar-type comparison's, and in a
+            /// FIXED aperture the two lose different fractions of their light when the seeing
+            /// moves. BuildChromaticKernel has carried that wavelength law all along, but the
+            /// ground sub-bands were weighted flat and the single kernel was shared by every
+            /// source in the frame, so no star's own spectrum ever reached its own width and the
+            /// difference came out identically zero. This is the switch that lets it be non-zero.
+            /// </summary>
+            public int PsfColourGroups = 0;
+
+            /// <summary>
             /// Cooler setpoint, Celsius. NaN keeps the instrument's own published temperature.
             ///
             /// This is a real control, not a label: DarkCurrentModel scales the published dark
@@ -302,6 +319,25 @@ namespace ExoStudio.Simulation
             /// Separate because the cures differ: a shorter exposure against less binning.</summary>
             public double SaturatedByConverterFraction;
             public int PsfKernelRadiusPx;
+
+            /// <summary>
+            /// One entry per colour group when the stars were split, empty when they were not:
+            /// the group's effective temperature, the photon-weighted mean wavelength its own
+            /// kernel was built on, and how many stars it drew. Lambda_eff is the quantity the
+            /// whole colour effect runs on, so it is reported rather than left to be inferred
+            /// from the temperature and the filter.
+            /// </summary>
+            public double[] PsfGroupTeffK = System.Array.Empty<double>();
+            public double[] PsfGroupLambdaEffMeters = System.Array.Empty<double>();
+            public int[] PsfGroupStarCount = System.Array.Empty<int>();
+
+            /// <summary>
+            /// Stars the split could not colour, drawn with the field's median width instead of
+            /// their own. Gaia leaves many entries without a colour index and Ballesteros
+            /// refuses one outside -0.5 to 2.5, so this is never zero on a real field and a
+            /// measurement that ignores it is quoting a width it did not use.
+            /// </summary>
+            public int StarsWithoutColour;
 
             /// <summary>
             /// Where the time in Prepare went, milliseconds. Not decoration: a frame costs about
@@ -912,6 +948,13 @@ namespace ExoStudio.Simulation
 
             // --- signal plane ------------------------------------------------------------
             var signal = new float[w * h];
+
+            // One plane per colour group when the stars are split, null when they are not. The
+            // stars then do NOT go on the signal plane: each group is deposited on its own, and
+            // each is convolved with its own kernel further down, after the extended sources have
+            // been convolved with the achromatic one. Null keeps the single-plane path exactly as
+            // it was.
+            List<(float[] Plane, double TeffK, int Count)> colourPlanes = null;
             List<InjectedStar> injected = null;
             double fieldRadiusDeg = 0.5 * Math.Sqrt((double)w * w + (double)h * h) * plateScale / 3600.0;
 
@@ -1082,12 +1125,39 @@ namespace ExoStudio.Simulation
                 }
 
                 var swStars = System.Diagnostics.Stopwatch.StartNew();
-                res.StarsDrawn = StarFieldRenderer.DepositStars(
-                    signal, w, h, stars, projection,
-                    meridianRa, endMeridianRa, observerLatitudeDeg, cutoff,
-                    star => StellarPhotometry.CollectedElectrons(
+                Func<RenderedStar, double> electronsFor = star =>
+                    StellarPhotometry.CollectedElectrons(
                         star.VMag, star.ColorIndexBV, star.ReddeningEBv,
-                        response, reddening, areaCm2, exposure, starTransmission));
+                        response, reddening, areaCm2, exposure, starTransmission);
+
+                int colourGroups = Math.Clamp(req.PsfColourGroups, 0, 16);
+                if (colourGroups >= 2 && !space)
+                {
+                    // SPLIT, THEN DEPOSIT, and nothing else about the deposit changes: each group
+                    // gets the same projection, the same meridians, the same cutoff and the same
+                    // flux callback the single plane got, so a group's pixels are the pixels that
+                    // star would have laid down anyway. What differs is only which plane they land
+                    // on, and therefore which kernel finds them.
+                    colourPlanes = new List<(float[], double, int)>(colourGroups);
+                    res.StarsDrawn = 0;
+                    List<(List<RenderedStar> Members, double TeffK)> split =
+                        SplitByColour(stars, colourGroups, out int withoutColour);
+                    res.StarsWithoutColour = withoutColour;
+                    foreach ((List<RenderedStar> members, double teffK) in split)
+                    {
+                        var plane = new float[w * h];
+                        res.StarsDrawn += StarFieldRenderer.DepositStars(
+                            plane, w, h, members, projection,
+                            meridianRa, endMeridianRa, observerLatitudeDeg, cutoff, electronsFor);
+                        colourPlanes.Add((plane, teffK, members.Count));
+                    }
+                }
+                else
+                {
+                    res.StarsDrawn = StarFieldRenderer.DepositStars(
+                        signal, w, h, stars, projection,
+                        meridianRa, endMeridianRa, observerLatitudeDeg, cutoff, electronsFor);
+                }
                 res.StarsMs = swStars.Elapsed.TotalMilliseconds;
             }
 
@@ -1131,6 +1201,49 @@ namespace ExoStudio.Simulation
 
             var swConv = System.Diagnostics.Stopwatch.StartNew();
             FourierConvolution.Convolve(signal, w, h, kernel, psfRadius);
+
+            // THE COLOUR GROUPS, EACH THROUGH ITS OWN KERNEL, summed back onto the same plane.
+            // The kernel above stays the frame's achromatic one and is what the extended sources
+            // were just convolved with: a galaxy has a spectrum too, but it is resolved, and the
+            // effect this exists to measure is about point sources in a fixed aperture.
+            //
+            // The sum is ordinary addition because convolution is linear: summing the convolved
+            // groups is the same frame as convolving the summed groups would be, whenever the
+            // kernels are equal, which is the check Verify makes.
+            if (colourPlanes != null)
+            {
+                var teffs = new double[colourPlanes.Count];
+                var lambdas = new double[colourPlanes.Count];
+                var counts = new int[colourPlanes.Count];
+                for (int g = 0; g < colourPlanes.Count; g++)
+                {
+                    (float[] plane, double teffK, int count) = colourPlanes[g];
+                    ChromaticSubBand[] groupBands = BuildSubBands(
+                        wavelength, bandwidthA, zenithDistance, plateScale, atmosphereAltM,
+                        zenithRight, zenithUp, response, teffK);
+
+                    teffs[g] = teffK;
+                    counts[g] = count;
+                    lambdas[g] = PhotonWeightedWavelength(groupBands);
+
+                    float[] groupKernel = OpticalPsf.BuildChromaticKernel(
+                        plateScale, spec.ApertureMeters, spec.SecondaryObstructionFraction, seeing,
+                        wavelength, 0.0, spec.SpiderVaneCount, spec.SpiderVaneWidthMeters,
+                        spec.PrimaryMirrorPads, groupBands, out int groupRadius);
+
+                    // A kernel the builder refused is not quietly skipped: the group's stars would
+                    // vanish from the frame and the photometry would read that as physics. Fall
+                    // back to the frame's own kernel, which is the pre-split behaviour for those
+                    // stars, and say so in the metadata by leaving lambda_eff at the band centre.
+                    if (groupKernel == null) { groupKernel = kernel; groupRadius = psfRadius; }
+
+                    FourierConvolution.Convolve(plane, w, h, groupKernel, groupRadius);
+                    for (int i = 0; i < signal.Length; i++) signal[i] += plane[i];
+                }
+                res.PsfGroupTeffK = teffs;
+                res.PsfGroupLambdaEffMeters = lambdas;
+                res.PsfGroupStarCount = counts;
+            }
             res.ConvolveMs = swConv.Elapsed.TotalMilliseconds;
 
             // The silicon's own fixed patterns, drawn from a seed that depends on the instrument
@@ -2211,6 +2324,152 @@ namespace ExoStudio.Simulation
                 };
             }
             return bands;
+        }
+
+        /// <summary>
+        /// The same twelve sub-bands, weighted by ONE STAR'S OWN photon spectrum through the
+        /// system response instead of flat.
+        ///
+        /// FLAT WEIGHTS ARE THE REASON A COLOUR NEVER REACHED AN IMAGE WIDTH. The overload above
+        /// sets Weight = 1.0 on every sub-band, so the kernel it builds is the same kernel for a
+        /// 2600 K dwarf and a 5500 K solar analogue: BuildChromaticKernel runs its lambda^(-1/5)
+        /// law over the same twelve wavelengths carrying the same twelve weights, and the width
+        /// it delivers comes out identical. The star's spectrum is what decides WHERE in the
+        /// passband its photons actually are, and therefore what seeing it actually sees.
+        ///
+        /// The weight is the photon spectral density at the sub-band's wavelength times the
+        /// system's throughput there, which is the same product SystemResponse integrates for the
+        /// effective width: filter, QE, atmosphere and reddening screen, so the kernel and the
+        /// flux are built on one definition of the passband rather than two.
+        ///
+        /// teffK at or below zero, or no response, returns the flat weights unchanged, and the
+        /// frame is then bit-for-bit the one this overload did not exist for.
+        /// </summary>
+        public static ChromaticSubBand[] BuildSubBands(
+            double centreMeters, double bandwidthAngstrom, double zenithDistanceDeg,
+            double plateScale, double siteAltitudeMeters,
+            double zenithRight, double zenithUp,
+            SystemResponse response, double teffK)
+        {
+            ChromaticSubBand[] bands = BuildSubBands(centreMeters, bandwidthAngstrom, zenithDistanceDeg,
+                                                     plateScale, siteAltitudeMeters, zenithRight, zenithUp);
+            if (response == null || !(teffK > 0.0)) return bands;
+
+            double total = 0.0;
+            for (int i = 0; i < bands.Length; i++)
+            {
+                double lambda = bands[i].WavelengthMeters;
+                double weight = StellarPhotometry.PhotonSpectralDensity(lambda, teffK)
+                              * response.ThroughputAt(lambda);
+                if (double.IsNaN(weight) || !(weight > 0.0)) weight = 0.0;
+                bands[i].Weight = weight;
+                total += weight;
+            }
+
+            // A STAR WITH NO PHOTONS ANYWHERE IN THE PASSBAND WOULD GIVE A KERNEL OF NOTHING, and
+            // BuildChromaticKernel returns null for a zero total weight, which would drop every
+            // star in the group out of the frame. Fall back to the flat weights rather than
+            // delete the stars: the band integral that sets their flux refuses them on its own
+            // terms if they really do not belong in this filter.
+            if (!(total > 0.0))
+                for (int i = 0; i < bands.Length; i++) bands[i].Weight = 1.0;
+
+            return bands;
+        }
+
+        /// <summary>
+        /// The photon-weighted mean wavelength of a set of sub-bands, which is the lambda_eff the
+        /// group's kernel was actually built on. Reported rather than recomputed downstream,
+        /// because the whole colour effect scales with the ratio of two of these.
+        /// </summary>
+        public static double PhotonWeightedWavelength(IList<ChromaticSubBand> bands)
+        {
+            if (bands == null || bands.Count == 0) return double.NaN;
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < bands.Count; i++)
+            {
+                if (!(bands[i].Weight > 0.0) || !(bands[i].WavelengthMeters > 0.0)) continue;
+                num += bands[i].Weight * bands[i].WavelengthMeters;
+                den += bands[i].Weight;
+            }
+            return den > 0.0 ? num / den : double.NaN;
+        }
+
+        /// <summary>
+        /// The frame's stars split into at most <paramref name="groups"/> bins of effective
+        /// temperature, each bin carrying the temperature its own kernel should be built on.
+        ///
+        /// EQUAL COUNT, NOT EQUAL WIDTH. A transit field is mostly solar-type stars with one red
+        /// dwarf in it, and that dwarf is the entire measurement. Equal-width temperature bins
+        /// would put it in a bin of its own only by luck and would leave most bins empty; cutting
+        /// the sorted temperatures into equal counts guarantees the extremes are separated, which
+        /// is the property this is for.
+        ///
+        /// A STAR WITH NO USABLE COLOUR TAKES THE FIELD MEDIAN, and is counted. Gaia leaves many
+        /// entries without a colour index, and Ballesteros refuses a B-V outside -0.5 to 2.5, so
+        /// on a real field this is never zero. Such a star is then drawn at a width that is the
+        /// field's rather than its own, which is the pre-split behaviour for it; the count comes
+        /// back so a measurement can say how many of its comparisons were treated that way
+        /// instead of quoting a width it did not use.
+        ///
+        /// The sort breaks ties on catalogue index, so the deposit order inside a group, and
+        /// therefore the floating-point accumulation, depends on the seed and nothing else.
+        /// </summary>
+        public static List<(List<RenderedStar> Members, double TeffK)> SplitByColour(
+            List<RenderedStar> stars, int groups, out int withoutColour)
+        {
+            withoutColour = 0;
+            var result = new List<(List<RenderedStar>, double)>();
+            if (stars == null || stars.Count == 0) return result;
+
+            var teff = new double[stars.Count];
+            var known = new List<double>(stars.Count);
+            for (int i = 0; i < stars.Count; i++)
+            {
+                double? t = StellarColor.TeffFromColorIndexBV(
+                    stars[i].HasColor ? stars[i].ColorIndexBV : (double?)null);
+                teff[i] = t ?? double.NaN;
+                if (t.HasValue) known.Add(t.Value);
+            }
+
+            // Not one star in the field carries a usable colour. One group at NaN, which
+            // BuildSubBands turns back into flat weights: the unchanged frame, not a refusal.
+            if (known.Count == 0)
+            {
+                withoutColour = stars.Count;
+                result.Add((new List<RenderedStar>(stars), double.NaN));
+                return result;
+            }
+
+            known.Sort();
+            double median = known[known.Count / 2];
+            for (int i = 0; i < teff.Length; i++)
+                if (double.IsNaN(teff[i])) { teff[i] = median; withoutColour++; }
+
+            int k = Math.Min(groups, stars.Count);
+            var order = new int[stars.Count];
+            for (int i = 0; i < order.Length; i++) order[i] = i;
+            Array.Sort(order, (a, b) =>
+            {
+                int c = teff[a].CompareTo(teff[b]);
+                return c != 0 ? c : a.CompareTo(b);
+            });
+
+            for (int g = 0; g < k; g++)
+            {
+                int from = (int)((long)g * order.Length / k);
+                int to = (int)((long)(g + 1) * order.Length / k);
+                if (to <= from) continue;
+                var members = new List<RenderedStar>(to - from);
+                var temps = new List<double>(to - from);
+                for (int i = from; i < to; i++)
+                {
+                    members.Add(stars[order[i]]);
+                    temps.Add(teff[order[i]]);
+                }
+                result.Add((members, temps[temps.Count / 2]));
+            }
+            return result;
         }
 
         /// <summary>

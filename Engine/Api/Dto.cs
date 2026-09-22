@@ -629,6 +629,12 @@ namespace ExoStudio.Api
             calibrate = s.Calibrate,
             comparisons = s.Comparisons,
 
+            // WHETHER THE STARS WERE DRAWN AT THEIR OWN WIDTHS, which decides whether this run is
+            // comparable with another at all. Zero or one is the shared kernel every run before
+            // this carried; anything more and each colour group went through a PSF built on its
+            // own spectrum.
+            psfColourGroups = s.PsfColourGroups,
+
             // Reported whether supplied or drawn: re-post the same request with this number and
             // the run repeats frame for frame.
             seed = s.Seed,
@@ -875,6 +881,20 @@ namespace ExoStudio.Api
         public double? ExposureSeconds { get; set; }
         public int? Binning { get; set; }
 
+        /// <summary>
+        /// Split the stars into this many colour groups, each drawn through a PSF built on its
+        /// own spectrum. 0 or 1, the default, is one kernel for the whole frame and a frame that
+        /// is bit-for-bit what it was before this existed. Capped at 16: each group is one more
+        /// convolution over the full plane.
+        ///
+        /// Seeing FWHM goes as lambda^(-1/5) (Boyd 1978), so stars of different colours are
+        /// delivered at different widths in the same passband, and in a FIXED aperture they lose
+        /// different fractions of their light when the seeing moves. With one kernel for the
+        /// frame that difference is exactly zero by construction, which is right for a picture
+        /// and wrong for a measurement that is about the difference.
+        /// </summary>
+        public int? PsfColourGroups { get; set; }
+
         /// <summary>How many sub-exposures. 5 to 400; a hundred is what a floor is usually measured on.</summary>
         public int? Frames { get; set; }
 
@@ -1094,6 +1114,21 @@ namespace ExoStudio.Api
         public double? ExposureSeconds { get; set; }
         public int? Binning { get; set; }
         public bool? Tracking { get; set; }
+
+        /// <summary>
+        /// Split the stars into this many colour groups, each drawn through a PSF built on its
+        /// own spectrum. 0 or 1, the default, is one kernel for the whole frame and a frame that
+        /// is bit-for-bit what it was before this existed. Capped at 16: each group is one more
+        /// convolution over the full plane.
+        ///
+        /// Seeing FWHM goes as lambda^(-1/5) (Boyd 1978), so stars of different colours are
+        /// delivered at different widths in the same passband, and in a FIXED aperture they lose
+        /// different fractions of their light when the seeing moves. With one kernel for the
+        /// frame that difference is exactly zero by construction, which is right for a picture
+        /// and wrong for a measurement that is about the difference.
+        /// </summary>
+        public int? PsfColourGroups { get; set; }
+
 
         /// <summary>What the frame is of, for the FITS OBJECT keyword and the download name.</summary>
         public string ObjectName { get; set; }

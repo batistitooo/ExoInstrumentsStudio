@@ -451,6 +451,7 @@
           <option selected>1</option><option>2</option><option>4</option><option>8</option>
         </select></label>
         <label>Comparisons<input id="seqComps" type="number" min="2" max="12" step="1" value="4"></label>
+        <label>Colour groups<span class="q" tabindex="0" data-tip="How many groups the field's stars are split into, each drawn through a point spread function built on its own spectrum. Seeing narrows as the fifth root of wavelength (Boyd 1978), so a red dwarf is delivered slightly sharper than its bluer comparisons, and in a fixed aperture the two lose different fractions of their light when the seeing moves. Left at 0 or 1 every star shares one kernel and that difference is exactly zero, which is right for a picture and wrong for a measurement about the difference. Each group costs one more convolution over the frame.">?</span><input id="seqPsfGroups" type="number" min="0" max="16" step="1" value="0"></label>
         <label>Airmass from<input id="seqXFrom" type="number" min="1" max="4.9" step="0.01" value="1.05"></label>
         <label>Airmass to<input id="seqXTo" type="number" min="1.01" max="5" step="0.01" value="2"></label>
         <label>Base seed<input id="seqSeed" type="number" min="1" step="1" placeholder="drawn"></label>

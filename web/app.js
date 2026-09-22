@@ -3857,6 +3857,7 @@ $('seqStart').onclick = async () => {
         airmassFrom: parseFloat($('seqXFrom').value),
         airmassTo: parseFloat($('seqXTo').value),
         comparisons: parseInt($('seqComps').value, 10),
+        psfColourGroups: parseInt($('seqPsfGroups').value, 10) || 0,
         calibrate: $('seqCal').checked,
         seed: seedRaw === '' ? undefined : Number(seedRaw),
         pwv: pwvRequestBody(),

@@ -832,6 +832,7 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         EndUt = seqEndUt,
         LadderNote = ladderNote,
         SearchFromUt = now,
+        PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
         DriftArcsecPerFrame = req.DriftArcsecPerFrame ?? 0.0,
         DriftPositionAngleDeg = req.DriftPositionAngleDeg ?? 45.0,
         // Recorded from the RESOLVED spec rather than from the request, so the record says what
@@ -2287,6 +2288,7 @@ bool TryCaptureOne(CaptureRequestDto req, out CaptureStore.Stored stored, out De
                                    req.RaDeg, req.DecDeg, out string transientError),
         RequestedUt = bookedUt,
         Seed = seed,
+        PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
     };
 
     if (pwvError != null) { refusal = Results.BadRequest(new { error = pwvError }); return false; }
@@ -3461,6 +3463,7 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                 DetectorTemperatureCelsius = double.NaN,
                 ZoomFactor = double.NaN,
                 Seed = seed,
+                PsfColourGroups = seq.PsfColourGroups,
                 Pwv = seq.Pwv,
                 Transient = seq.Transient,
             };

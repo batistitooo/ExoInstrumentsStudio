@@ -1068,6 +1068,56 @@ button. 35 checks, about a minute, or a few with `--sequence`.
 
 ---
 
+### The stars' own colours, and the kernel each one gets
+
+A frame used to be convolved once. One chromatic kernel was built from twelve sub-bands, and
+every source in the plane was convolved with it, which is correct for a picture and has one
+consequence that is not obvious: no star's own spectrum ever reached its own image width.
+
+The sub-bands already carried the wavelength law. `OpticalPsf.BuildChromaticKernel` scales the
+seeing of each sub-band as lambda^(-1/5), which is Fried's relation and the exponent every
+seeing-monitor paper quotes, after Boyd (1978, J. Opt. Soc. Am. 68, 877). What was missing is the
+weight: the ground sub-bands were built with `Weight = 1.0`, flat, so the twelve wavelengths were
+summed in the same proportion for a 2600 K dwarf and a 5500 K solar analogue and the two came out
+the same width to the last bit.
+
+That matters for one kind of measurement and one only. Differential photometry in a FIXED aperture
+divides a target by an ensemble of comparisons, and the ratio is meant to cancel everything the
+two have in common. The fraction of light inside the aperture is not common if the two are
+delivered at different widths: when the seeing moves, the broader star loses more, and the ratio
+walks. With a shared kernel that term is identically zero, so a run measuring it would report a
+null result and the null would be an artefact of the renderer rather than a fact about the sky.
+
+`PsfColourGroups` on a capture or a sequence request splits the field's stars into that many bins
+of effective temperature. Each bin is deposited on its own plane, gets sub-bands weighted by a
+blackbody at its own temperature through the system response, and is convolved with the kernel
+that weighting builds; the planes are then summed. Convolution is linear, so summing the convolved
+groups is the same frame as the single plane whenever the kernels are equal, which is what the
+default reduces to.
+
+The default is 0, and 0 or 1 is the single shared kernel: the frame is then bit-for-bit what it
+was before this existed, which section 24 of the harness asserts on the sub-bands themselves. The
+cap is 16, because each group is one more convolution over the full plane.
+
+The bins are equal in COUNT, not in temperature width. A transit field is mostly solar-type stars
+with one red dwarf in it, and that dwarf is the entire measurement; equal-width bins would isolate
+it only by luck and would leave most bins empty. A star Gaia left without a colour index, or whose
+B-V falls outside the range Ballesteros' relation accepts, takes the field median and is counted
+in `StarsWithoutColour`, so a measurement can say how many of its comparisons were drawn at a
+width that was not their own.
+
+Each group reports the photon-weighted mean wavelength its kernel was built on, in
+`PsfGroupLambdaEffMeters`. That is the quantity the whole effect scales with, and it is published
+rather than left to be recomputed from a temperature and a filter.
+
+WHAT THIS DOES NOT DO. The dispersion offset is still common to the frame: it depends on
+wavelength and zenith distance, both the same across a field arcminutes wide, so it stays in the
+kernel. A source's own centroid shift with its colour, the first-order part of that, is NOT
+applied per source anywhere, despite what the comment on `BuildChromaticKernel` used to claim;
+`AtmosphericRefraction.DifferentialRefractionArcsec` has a single call site on the ground path and
+it is the shared kernel's. Splitting by colour now gives each group its own offsets as a side
+effect of giving it its own sub-bands, which is closer to right, but a group is not a star.
+
 ## 5.9 Water vapour
 
 `Engine/Simulation/PwvTransmission.cs`, `Engine/Simulation/PwvSeries.cs`, `tools/fetch_pwv_grid.py`,
