@@ -49,6 +49,7 @@
     <Compile Include="$(StudioRoot)\Simulation\ObservingPlan.cs" />
     <Compile Include="$(StudioRoot)\Simulation\PwvTransmission.cs" />
     <Compile Include="$(StudioRoot)\Simulation\PwvSeries.cs" />
+    <Compile Include="$(StudioRoot)\Simulation\SeeingSeries.cs" />
     <Compile Include="$(StudioRoot)\Simulation\TransitInjection.cs" />
     <!-- Section 19: the airmass ladder, and whether it is placed in darkness. -->
     <Compile Include="$(StudioRoot)\Simulation\PhotometricSequence.cs" />

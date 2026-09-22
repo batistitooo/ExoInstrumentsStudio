@@ -453,6 +453,13 @@ namespace ExoStudio.Api
                 backgroundRmsElectrons = Finite(r.BackgroundRmsElectrons),
                 fwhmPx = Finite(r.FwhmPx),
                 apertureRadiusPx = Finite(r.ApertureRadiusPx),
+
+            // WHICH OF THE THREE WAYS THE RADIUS WAS CHOSEN, and what was asked for before the
+            // 1.5 px floor. A run that cannot say which aperture it measured in cannot be
+            // compared with another, and the floor binding is the one case the reduction calls
+            // unreliable, so it has to be visible rather than inferred.
+            apertureMode = r.ApertureMode,
+            apertureRadiusRequestedPx = Finite(r.ApertureRadiusRequestedPx),
             },
 
             // Fitted from the pixels against the passband integral that produced them. Agreement is
@@ -634,6 +641,20 @@ namespace ExoStudio.Api
             // this carried; anything more and each colour group went through a PSF built on its
             // own spectrum.
             psfColourGroups = s.PsfColourGroups,
+            holdAirmass = double.IsFinite(s.HoldAirmass) ? s.HoldAirmass : (double?)null,
+            apertureRadiusArcsec = double.IsFinite(s.ApertureRadiusArcsec) ? s.ApertureRadiusArcsec : (double?)null,
+            apertureRadiusInFwhm = double.IsFinite(s.ApertureRadiusInFwhm) ? s.ApertureRadiusInFwhm : (double?)null,
+
+            // THE RUN'S OWN SEEING, for the same reason the water is published: a run whose
+            // seeing was driven cannot be compared with one that took the site median, and a
+            // screenshot has to say which it was.
+            seeing = s.Seeing == null ? null : new
+            {
+                id = s.Seeing.Id,
+                mode = s.Seeing.Mode.ToString(),
+                description = s.Seeing.Description,
+                notes = s.Seeing.Notes,
+            },
 
             // Reported whether supplied or drawn: re-post the same request with this number and
             // the run repeats frame for frame.
@@ -895,8 +916,56 @@ namespace ExoStudio.Api
         /// </summary>
         public int? PsfColourGroups { get; set; }
 
+
+        /// <summary>
+        /// The seeing as a function of time, at the zenith and referred to 500 nm. Null takes the
+        /// site's published median times X^0.6, which is what every run before this did.
+        ///
+        /// Supplying one is the only way to move the seeing WITHOUT moving the airmass, and that
+        /// separation is the whole point: airmass carries second-order extinction, which is
+        /// chromatic and lands in the same differential ratio, so a seeing study run by tilting
+        /// the telescope cannot say which of the two it measured.
+        /// </summary>
+        public SeeingRequest Seeing { get; set; }
+
         /// <summary>How many sub-exposures. 5 to 400; a hundred is what a floor is usually measured on.</summary>
         public int? Frames { get; set; }
+
+
+        /// <summary>
+        /// Photometric aperture radius in arcsec, FIXED for the run whatever the seeing does.
+        /// Null takes the default, which tracks the seeing at Howell's 0.68 FWHM.
+        ///
+        /// A fixed aperture is what a real pipeline uses, and it is the reason a seeing change
+        /// does not cancel between stars of different colours: their images are not the same width,
+        /// so they do not lose the same fraction of their light out of the same circle. A radius
+        /// that tracks the seeing cancels that by construction, which is right for a picture and
+        /// wrong for a measurement about it.
+        /// </summary>
+        public double? ApertureRadiusArcsec { get; set; }
+
+        /// <summary>
+        /// Aperture radius as a multiple of each frame's own FWHM, recomputed per frame. Null takes
+        /// the default of 0.68. Ignored when ApertureRadiusArcsec is given, and the run says which
+        /// it used rather than picking silently.
+        /// </summary>
+        public double? ApertureRadiusInFwhm { get; set; }
+
+        /// <summary>
+        /// Render every frame at this airmass, whatever the field is really doing. Null takes the
+        /// airmass from the sky, which is what an observation does.
+        ///
+        /// An idealisation, named as one. No real field holds an airmass, so a ladder of zero
+        /// width cannot be placed and is refused; this is the other way of asking, and it is
+        /// honest because it says what it is. It exists because airmass carries second-order
+        /// extinction, which is chromatic and therefore does not cancel between two stars of
+        /// different colours: an effect measured while the airmass moves cannot be attributed.
+        ///
+        /// The ladder is still placed in real darkness, and still has to be placeable, because the
+        /// run happens on a real night; it simply no longer sets the airmass each frame is
+        /// rendered at.
+        /// </summary>
+        public double? HoldAirmass { get; set; }
 
         /// <summary>The ladder's ends. Defaults run from near the zenith to twice the air.</summary>
         public double? AirmassFrom { get; set; }
@@ -1087,6 +1156,32 @@ namespace ExoStudio.Api
         public string Label { get; set; }
     }
 
+
+    public sealed class SeeingRequest
+    {
+        /// <summary>constant | ramp | measured</summary>
+        public string Mode { get; set; }
+
+        /// <summary>Zenith FWHM at 500 nm, arcsec, for the constant mode.</summary>
+        public double? Arcsec { get; set; }
+
+        /// <summary>The ramp: two zenith FWHM at 500 nm, and where the transition sits inside the
+        /// run. Offsets are minutes from the run's own start, so a request does not have to know
+        /// what instant the scheduler will pick.</summary>
+        public double? FromArcsec { get; set; }
+        public double? ToArcsec { get; set; }
+        public double? StartMinutes { get; set; }
+        public double? EndMinutes { get; set; }
+
+        /// <summary>
+        /// For the measured mode: two columns per line, an instant (ISO, or seconds since J2000)
+        /// and a zenith FWHM in arcsec. Anything after # is ignored, so a DIMM record usually
+        /// parses unedited.
+        /// </summary>
+        public string Series { get; set; }
+        public string Label { get; set; }
+    }
+
     public sealed class CaptureRequestDto
     {
         /// <summary>
@@ -1129,6 +1224,38 @@ namespace ExoStudio.Api
         /// </summary>
         public int? PsfColourGroups { get; set; }
 
+
+
+        /// <summary>
+        /// The seeing as a function of time, at the zenith and referred to 500 nm. Null takes the
+        /// site's published median times X^0.6, which is what every run before this did.
+        ///
+        /// Supplying one is the only way to move the seeing WITHOUT moving the airmass, and that
+        /// separation is the whole point: airmass carries second-order extinction, which is
+        /// chromatic and lands in the same differential ratio, so a seeing study run by tilting
+        /// the telescope cannot say which of the two it measured.
+        /// </summary>
+        public SeeingRequest Seeing { get; set; }
+
+
+        /// <summary>
+        /// Photometric aperture radius in arcsec, FIXED for the run whatever the seeing does.
+        /// Null takes the default, which tracks the seeing at Howell's 0.68 FWHM.
+        ///
+        /// A fixed aperture is what a real pipeline uses, and it is the reason a seeing change
+        /// does not cancel between stars of different colours: their images are not the same width,
+        /// so they do not lose the same fraction of their light out of the same circle. A radius
+        /// that tracks the seeing cancels that by construction, which is right for a picture and
+        /// wrong for a measurement about it.
+        /// </summary>
+        public double? ApertureRadiusArcsec { get; set; }
+
+        /// <summary>
+        /// Aperture radius as a multiple of each frame's own FWHM, recomputed per frame. Null takes
+        /// the default of 0.68. Ignored when ApertureRadiusArcsec is given, and the run says which
+        /// it used rather than picking silently.
+        /// </summary>
+        public double? ApertureRadiusInFwhm { get; set; }
 
         /// <summary>What the frame is of, for the FITS OBJECT keyword and the download name.</summary>
         public string ObjectName { get; set; }

@@ -402,6 +402,33 @@
          so the plot showed water the frame was never exposed through. One block, shown in
          whichever mode is asking, feeding one request builder. -->
     <section class="block" id="waterBlock" hidden>
+      <div class="coolrow" id="seeingRow">
+        <div class="coolhead">
+          <label class="lbl" for="seeingMode">Seeing<span class="q" tabindex="0" data-tip="The seeing as a function of time, given as the FWHM at the zenith at 500 nm, which is the convention every seeing monitor publishes in. Left off, a frame takes the site's published median projected along the line of sight, and the only way to move the seeing is then to move the airmass. That matters because airmass also carries second-order extinction, which is chromatic and lands in the same differential ratio, so a run that tilts the telescope to change the seeing cannot say which of the two it measured. Supplying a series separates them.">?</span></label>
+          <output class="mono coolval" id="seeingOut">site median</output>
+        </div>
+        <select id="seeingMode">
+          <option value="none" selected>the site's own median</option>
+          <option value="constant">constant</option>
+          <option value="ramp">ramp: two values and a transition inside the run</option>
+          <option value="measured">measured: paste a real record</option>
+        </select>
+        <div class="capgrid" id="seeingConstant" hidden>
+          <label>arcsec at zenith<input id="seeingArcsec" type="number" min="0.05" max="10" step="0.05" value="1"></label>
+        </div>
+        <div class="capgrid" id="seeingRamp" hidden>
+          <label>from arcsec<input id="seeingFrom" type="number" min="0.05" max="10" step="0.05" value="1"></label>
+          <label>to arcsec<input id="seeingTo" type="number" min="0.05" max="10" step="0.05" value="1.3"></label>
+          <label>starts at min<input id="seeingStart" type="number" min="0" step="1" value="60"></label>
+          <label>ends at min<input id="seeingEnd" type="number" min="0" step="1" value="120"></label>
+        </div>
+        <div id="seeingMeasured" hidden>
+          <textarea id="seeingSeries" rows="4" spellcheck="false"
+            placeholder="2026-08-27T22:00:00Z  0.92&#10;2026-08-27T23:00:00Z  1.24&#10;# an instant and a zenith FWHM in arcsec, per line"></textarea>
+        </div>
+        <p class="hint dim" id="seeingHint"></p>
+      </div>
+
       <div class="coolrow" id="pwvRow">
         <div class="coolhead">
           <label class="lbl" for="pwvMode">Water vapour</label>
@@ -453,7 +480,10 @@
         <label>Comparisons<input id="seqComps" type="number" min="2" max="12" step="1" value="4"></label>
         <label>Colour groups<span class="q" tabindex="0" data-tip="How many groups the field's stars are split into, each drawn through a point spread function built on its own spectrum. Seeing narrows as the fifth root of wavelength (Boyd 1978), so a red dwarf is delivered slightly sharper than its bluer comparisons, and in a fixed aperture the two lose different fractions of their light when the seeing moves. Left at 0 or 1 every star shares one kernel and that difference is exactly zero, which is right for a picture and wrong for a measurement about the difference. Each group costs one more convolution over the frame.">?</span><input id="seqPsfGroups" type="number" min="0" max="16" step="1" value="0"></label>
         <label>Airmass from<input id="seqXFrom" type="number" min="1" max="4.9" step="0.01" value="1.05"></label>
-        <label>Airmass to<input id="seqXTo" type="number" min="1.01" max="5" step="0.01" value="2"></label>
+        <label>Airmass to<input id="seqXTo" type="number" min="1" max="5" step="0.01" value="2"></label>
+        <label>Aperture arcsec<span class="q" tabindex="0" data-tip="Photometric aperture radius in arcsec, held FIXED whatever the seeing does, which is what a real pipeline uses. Left empty the radius tracks the seeing at 0.68 of each frame's FWHM. The difference is the whole experiment: stars of different colours are delivered at slightly different widths, so out of a fixed circle they lose different fractions of their light when the seeing moves, and a radius that tracks the seeing cancels that by construction.">?</span><input id="seqApArcsec" type="number" min="0.1" max="60" step="0.1" placeholder="tracks the seeing"></label>
+        <label>Aperture x FWHM<span class="q" tabindex="0" data-tip="Aperture radius as a multiple of each frame's own FWHM, recomputed per frame. Empty means the default of 0.68 (Howell 1989). Ignored when a fixed radius in arcsec is given, and the run records which of the two it used. An aperture slaved to the FWHM this way should make the colour effect vanish, which is one of the results worth showing.">?</span><input id="seqApFwhm" type="number" min="0.1" max="10" step="0.05" placeholder="0.68"></label>
+        <label>Hold airmass<span class="q" tabindex="0" data-tip="Render every frame at this airmass whatever the field is really doing. Left empty the airmass comes from the sky, which is what an observation does. This is an idealisation and it is named as one: no real field holds an airmass, it rises and sets. It exists because airmass carries second-order extinction, which is wavelength dependent and so does not cancel between two stars of different colours, and an effect measured while the airmass moves cannot be attributed to anything. The run is still placed on a real night.">?</span><input id="seqHoldX" type="number" min="1" max="5" step="0.01" placeholder="from the sky"></label>
         <label>Base seed<input id="seqSeed" type="number" min="1" step="1" placeholder="drawn"></label>
         <label class="capcheck"><input id="seqCal" type="checkbox" checked> calibrate each frame</label>
       </div>

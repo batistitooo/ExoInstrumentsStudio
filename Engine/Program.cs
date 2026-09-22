@@ -663,13 +663,18 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
     // The ladder's ends were clamped too: airmassFrom 0.5 became 1.0 and airmassTo 9 became 5
     // with nothing in the response to say so.
     if (req.AirmassFrom is < 1.0 or > 4.9) return Results.BadRequest(new { error = $"airmassFrom {req.AirmassFrom} is out of range. 1 (zenith) to 4.9." });
-    if (req.AirmassTo is < 1.01 or > 5.0) return Results.BadRequest(new { error = $"airmassTo {req.AirmassTo} is out of range. 1.01 to 5." });
+    if (req.AirmassTo is < 1.0 or > 5.0) return Results.BadRequest(new { error = $"airmassTo {req.AirmassTo} is out of range. 1 (zenith) to 5." });
     int frames = req.Frames ?? 100;
     int bin = req.Binning ?? 1;
     double exp = req.ExposureSeconds ?? 120.0;
     double xFrom = req.AirmassFrom ?? 1.02;
     double xTo = req.AirmassTo ?? 2.0;
-    if (!(xTo >= xFrom + 0.01)) return Results.BadRequest(new { error = $"airmassTo {xTo} must be at least 0.01 above airmassFrom {xFrom}." });
+    // A FLAT LADDER IS A REAL OBSERVING MODE AND USED TO BE REFUSED. Staring at one field while
+    // the seeing changes is how a seeing effect is isolated: airmass carries second-order
+    // extinction, which is chromatic, so a run that tilts the telescope to change the seeing
+    // measures the two together and can attribute neither. Equality is now allowed; a ladder that
+    // runs backwards still is not, because that is a swapped pair rather than a choice.
+    if (!(xTo >= xFrom)) return Results.BadRequest(new { error = $"airmassTo {xTo} is below airmassFrom {xFrom}. A ladder climbs, or stays where it is." });
     if (req.Seed == 0UL) return Results.BadRequest(new { error = "Seed 0 is the FITS writer's no-seed sentinel. Supply any nonzero seed, or omit it and one is drawn." });
 
     // THE LADDER, PLACED IN DARKNESS RATHER THAN IN GEOMETRY ALONE.
@@ -710,6 +715,7 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         return Results.BadRequest(new { error = ladderError });
 
     PwvSeries seqPwv = BuildPwvSeries(req.Pwv, seqStartUt, out string seqPwvError);
+    SeeingSeries seqSeeing = BuildSeeingSeries(req.Seeing, seqStartUt, out string seqSeeingError);
     // Mid-ladder by default: a transit at the end of the run has no baseline after it to normalise
     // against, and the whole measurement is the ratio of in-transit to out.
     // THE MIDDLE OF THE RUN, measured the same way a frame's epoch is.
@@ -778,6 +784,13 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         }
     }
     if (seqPwvError != null) return Results.BadRequest(new { error = seqPwvError });
+    if (seqSeeingError != null) return Results.BadRequest(new { error = seqSeeingError });
+    if (req.ApertureRadiusArcsec is { } ra && !(ra > 0.0 && ra <= 60.0))
+        return Results.BadRequest(new { error = $"apertureRadiusArcsec {ra} is out of range. Above 0 and at most 60 arcsec, or omit it for the default." });
+    if (req.ApertureRadiusInFwhm is { } rf && !(rf >= 0.1 && rf <= 10.0))
+        return Results.BadRequest(new { error = $"apertureRadiusInFwhm {rf} is out of range. 0.1 to 10 FWHM, or omit it for the default of 0.68." });
+    if (req.HoldAirmass is { } hx && !(hx >= 1.0 && hx <= 5.0))
+        return Results.BadRequest(new { error = $"holdAirmass {hx} is out of range. 1 (zenith) to 5, or omit it and the airmass comes from the sky." });
     if (seqPwv != null && deepSky.Value.Pwv == null)
         return Results.BadRequest(new { error =
             "A water-vapour series was given but the transmission table is not installed. Build it "
@@ -833,6 +846,10 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         LadderNote = ladderNote,
         SearchFromUt = now,
         PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
+        Seeing = seqSeeing,
+        HoldAirmass = req.HoldAirmass ?? double.NaN,
+        ApertureRadiusArcsec = req.ApertureRadiusArcsec ?? double.NaN,
+        ApertureRadiusInFwhm = req.ApertureRadiusInFwhm ?? double.NaN,
         DriftArcsecPerFrame = req.DriftArcsecPerFrame ?? 0.0,
         DriftPositionAngleDeg = req.DriftPositionAngleDeg ?? 45.0,
         // Recorded from the RESOLVED spec rather than from the request, so the record says what
@@ -1204,6 +1221,18 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
       .Append(seq.Calibrate ? ", each frame calibrated" : ", no calibration").Append('\n');
     sb.Append("# water: ").Append(seq.Pwv?.Description ?? "not modelled")
       .Append(seq.Pwv != null ? $" [{seq.Pwv.Id}]" : "").Append('\n');
+    sb.Append("# aperture: ").Append(
+        double.IsFinite(seq.ApertureRadiusArcsec)
+            ? $"{seq.ApertureRadiusArcsec.ToString("0.###", CultureInfo.InvariantCulture)} arcsec, fixed against the seeing"
+            : double.IsFinite(seq.ApertureRadiusInFwhm)
+                ? $"{seq.ApertureRadiusInFwhm.ToString("0.###", CultureInfo.InvariantCulture)} x this frame's FWHM"
+                : "default, 0.68 x this frame's FWHM").Append('\n');
+    sb.Append("# seeing: ").Append(seq.Seeing?.Description ?? "the site's own median, no wavelength transport")
+      .Append(seq.Seeing != null ? $" [{seq.Seeing.Id}]" : "").Append('\n');
+    sb.Append("# airmass: ").Append(double.IsFinite(seq.HoldAirmass)
+        ? $"HELD at {seq.HoldAirmass.ToString("0.###", CultureInfo.InvariantCulture)} by the request, "
+          + "which is an idealisation and not an observation"
+        : "from the sky").Append('\n');
     sb.Append("# transit: ").Append(seq.Transient?.Description ?? "none injected")
       .Append(seq.Transient != null ? $" [{seq.Transient.Id}]" : "").Append('\n');
     sb.Append("# target ").Append(a.TargetLabel ?? "n/a").Append("; ensemble ").Append(a.EnsembleLabel ?? "n/a")
@@ -1212,7 +1241,11 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
     sb.Append("# transit_factor is the injected truth: the fraction of the host's light that frame "
             + "let through, exposure-averaged. 1 means out of transit.\n");
     sb.Append("# photon_ppt is the photon-limited scatter predicted for that epoch, parts per thousand.\n");
-    sb.Append("ut_seconds,utc,airmass,pwv_mm,transit_factor,ratio,photon_ppt\n");
+    sb.Append("# seeing_zenith500_arcsec is what the run asked for, seeing_delivered_arcsec is what this "
+            + "frame's passband was given at its airmass, and fwhm_px is what the reduction used. "
+            + "None of the three is a width measured on the stars.\n");
+    sb.Append("ut_seconds,utc,airmass,pwv_mm,transit_factor,ratio,photon_ppt,"
+            + "seeing_zenith500_arcsec,seeing_delivered_arcsec,fwhm_px\n");
 
     string Num(double v, string f) => double.IsFinite(v) ? v.ToString(f, CultureInfo.InvariantCulture) : "";
     foreach (var row in a.Series)
@@ -1223,7 +1256,10 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
           .Append(Num(row.PwvMm, "0.######")).Append(',')
           .Append(Num(row.TransitFactor, "0.#########")).Append(',')
           .Append(Num(row.Ratio, "0.#########")).Append(',')
-          .Append(Num(row.PhotonPpt, "0.######")).Append('\n');
+          .Append(Num(row.PhotonPpt, "0.######")).Append(',')
+          .Append(Num(row.SeeingZenith500Arcsec, "0.######")).Append(',')
+          .Append(Num(row.SeeingArcsec, "0.######")).Append(',')
+          .Append(Num(row.FwhmPx, "0.######")).Append('\n');
     }
 
     return Results.File(System.Text.Encoding.UTF8.GetBytes(sb.ToString()), "text/csv",
@@ -2289,7 +2325,11 @@ bool TryCaptureOne(CaptureRequestDto req, out CaptureStore.Stored stored, out De
         RequestedUt = bookedUt,
         Seed = seed,
         PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
+        Seeing = BuildSeeingSeries(req.Seeing, double.IsNaN(bookedUt) ? nowUt : bookedUt,
+                                   out string seeingError),
     };
+
+    if (seeingError != null) { refusal = Results.BadRequest(new { error = seeingError }); return false; }
 
     if (pwvError != null) { refusal = Results.BadRequest(new { error = pwvError }); return false; }
     if (transientError != null) { refusal = Results.BadRequest(new { error = transientError }); return false; }
@@ -2556,9 +2596,19 @@ app.MapPost("/api/captures/{id}/masters", async (string id, string kind, HttpReq
 /// a zero point fitted from the field, and compares. See Simulation/FrameReduction.cs for why the
 /// two independent failure modes it exposes are worth more than either cross-validation alone.
 /// </summary>
+// RE-PHOTOMETERED AT A RADIUS THE CALLER CHOOSES, on the frame that is already stored. The
+// rendering is what a frame costs; measuring it again in a different circle is a loop over the
+// sources and nothing else. A study that wants a curve against aperture radius therefore renders
+// ONCE and asks this endpoint as many times as it has radii, instead of rendering the same sky
+// over and over to move one number in the reduction.
 app.MapGet("/api/captures/{id}/photometry", (string id, double? thresholdSigma, double? brightSnr,
-                                            string bias, string dark, string flat) =>
+                                            string bias, string dark, string flat,
+                                            double? apertureRadiusArcsec, double? apertureRadiusInFwhm) =>
 {
+    if (apertureRadiusArcsec is { } qra && !(qra > 0.0 && qra <= 60.0))
+        return Results.BadRequest(new { error = $"apertureRadiusArcsec {qra} is out of range. Above 0 and at most 60 arcsec, or omit it for the default." });
+    if (apertureRadiusInFwhm is { } qrf && !(qrf >= 0.1 && qrf <= 10.0))
+        return Results.BadRequest(new { error = $"apertureRadiusInFwhm {qrf} is out of range. 0.1 to 10 FWHM, or omit it for the default of 0.68." });
     CaptureStore.Stored s = captureStore.Get(id);
     if (s == null) return Results.NotFound(new { error = "That frame has expired from the store; capture again." });
     if (s.Exposure == null) return Results.BadRequest(new { error = "That frame was stored without its exposure, so it cannot be reduced." });
@@ -2618,7 +2668,8 @@ app.MapGet("/api/captures/{id}/photometry", (string id, double? thresholdSigma, 
     FrameReduction.Result reduced = FrameReduction.Reduce(
         light, s.Exposure,
         Math.Clamp(thresholdSigma ?? FrameReduction.DefaultThresholdSigma, 1.0, 100.0),
-        Math.Clamp(brightSnr ?? 20.0, 1.0, 1000.0));
+        Math.Clamp(brightSnr ?? 20.0, 1.0, 1000.0),
+        apertureRadiusArcsec ?? double.NaN, apertureRadiusInFwhm ?? double.NaN);
     if (applied != null) reduced.Notes.Insert(0, $"Calibrated with {applied}.");
 
     return Results.Json(Dto.Photometry(reduced));
@@ -3464,6 +3515,8 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                 ZoomFactor = double.NaN,
                 Seed = seed,
                 PsfColourGroups = seq.PsfColourGroups,
+                Seeing = seq.Seeing,
+                HeldAirmass = seq.HoldAirmass,
                 Pwv = seq.Pwv,
                 Transient = seq.Transient,
             };
@@ -3495,7 +3548,10 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
 
             if (seq.PreviewPng == null) seq.PreviewPng = PngWriter.GrayscaleFromAdu(science, prep.W, prep.H);
 
-            FrameReduction.Result red = FrameReduction.Reduce(science, prep);
+            FrameReduction.Result red = FrameReduction.Reduce(
+                science, prep,
+                apertureRadiusArcsec: seq.ApertureRadiusArcsec,
+                apertureRadiusInFwhm: seq.ApertureRadiusInFwhm);
 
             // THE EPOCH OF A FRAME IS THE MIDDLE OF ITS EXPOSURE, not the instant the shutter
             // opened. prep.ObservedUt is when it opened: the transit factor recorded alongside is
@@ -3528,6 +3584,7 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                 Airmass = prep.Meta.AirmassX,
                 AltitudeDeg = prep.Meta.TargetAltitudeDeg,
                 SeeingArcsec = prep.Meta.SeeingFwhmArcsec,
+                SeeingZenith500Arcsec = prep.Meta.SeeingZenithFwhm500Arcsec,
                 SkyElectronsPerPixel = prep.SkyElectronsPerPixel,
                 FwhmPx = red.FwhmPx,
                 PwvMm = prep.PwvMm,
@@ -3651,6 +3708,56 @@ static TransitInjection BuildTransient(TransientRequest req, double defaultEpoch
             req.IngressFraction ?? 0.1);
     }
     catch (ArgumentException e) { error = e.Message; return null; }
+}
+
+/// <summary>
+/// A seeing series from a request, or null for the site median, with the refusal spelled out
+/// rather than a clamp. The ramp's offsets are minutes from <paramref name="epochUt"/>, the run's
+/// own start, because a request cannot know which instant the scheduler will pick.
+/// </summary>
+static SeeingSeries BuildSeeingSeries(SeeingRequest req, double epochUt, out string error)
+{
+    error = null;
+    if (req == null) return null;
+    string mode = (req.Mode ?? "constant").Trim().ToLowerInvariant();
+    if (mode == "none" || mode == "off") return null;
+    try
+    {
+        switch (mode)
+        {
+            case "constant":
+                if (!req.Arcsec.HasValue) { error = "A constant seeing series needs arcsec."; return null; }
+                return SeeingSeries.Constant(req.Arcsec.Value);
+
+            case "ramp":
+                if (!req.FromArcsec.HasValue || !req.ToArcsec.HasValue)
+                { error = "A seeing ramp needs fromArcsec and toArcsec."; return null; }
+                if (!double.IsFinite(epochUt) || epochUt == 0.0)
+                {
+                    error = "A seeing ramp needs the instant it runs from, and this request has no "
+                          + "resolved start. Book an epoch, or use a constant series.";
+                    return null;
+                }
+                double startMin = req.StartMinutes ?? 0.0;
+                double endMin = req.EndMinutes ?? (startMin + 60.0);
+                return SeeingSeries.Ramp(req.FromArcsec.Value, req.ToArcsec.Value,
+                                         epochUt + startMin * 60.0, epochUt + endMin * 60.0);
+
+            case "measured":
+                if (string.IsNullOrWhiteSpace(req.Series))
+                { error = "A measured seeing series needs its samples."; return null; }
+                return SeeingSeries.Measured(req.Series, req.Label);
+
+            default:
+                error = $"Unknown seeing mode '{req.Mode}'. Use constant, ramp or measured.";
+                return null;
+        }
+    }
+    catch (ArgumentException ex)
+    {
+        error = ex.Message;
+        return null;
+    }
 }
 
 static PwvSeries BuildPwvSeries(PwvRequest req, double epochUt, out string error,

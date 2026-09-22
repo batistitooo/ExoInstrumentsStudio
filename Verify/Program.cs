@@ -4071,6 +4071,172 @@ Section("24. A star's own colour sets its image width, and a fixed aperture then
           sameOrder, "ties break on catalogue index");
 }
 
+Section("25. The seeing is a series in its own right, so it can move while the airmass does not");
+{
+    const double t0 = 800_000_000.0;   // an epoch that is not UT zero
+    const double hour = 3600.0;
+
+    SeeingSeries flat25 = SeeingSeries.Constant(1.0);
+    Check("a constant series is the same at every instant, and has no state",
+          flat25.ZenithFwhmArcsecAt500(t0) == 1.0
+          && flat25.ZenithFwhmArcsecAt500(t0 + 9 * hour) == 1.0
+          && flat25.ZenithFwhmArcsecAt500(t0 - 9 * hour) == 1.0,
+          "warp changes the pacing of a run, never its result");
+
+    SeeingSeries ramp25 = SeeingSeries.Ramp(1.0, 1.3, t0 + hour, t0 + 2 * hour);
+    Check("a ramp is flat before it starts and after it ends, not extrapolated",
+          ramp25.ZenithFwhmArcsecAt500(t0) == 1.0
+          && ramp25.ZenithFwhmArcsecAt500(t0 + 5 * hour) == 1.3,
+          "a record says nothing about the hours around it");
+    Check("and linear in between, so its midpoint is the mean of its ends",
+          Math.Abs(ramp25.ZenithFwhmArcsecAt500(t0 + 1.5 * hour) - 1.15) < 1e-12,
+          $"{ramp25.ZenithFwhmArcsecAt500(t0 + 1.5 * hour):F6} at the half-way point");
+
+    Check("a ramp that ends before it starts is refused, not swapped",
+          Refused(() => SeeingSeries.Ramp(1.0, 1.3, t0 + 2 * hour, t0 + hour)));
+    Check("a ramp anchored at UT zero is refused, the same refusal a drifting water column makes",
+          Refused(() => SeeingSeries.Ramp(1.0, 1.3, 0.0, hour)),
+          "left there the ramp runs from the simulation epoch and every real frame sits past its end");
+    Check("a seeing that is not a seeing is refused with its bounds",
+          Refused(() => SeeingSeries.Constant(0.0)) && Refused(() => SeeingSeries.Constant(45.0))
+          && Refused(() => SeeingSeries.Constant(double.NaN)));
+
+    SeeingSeries table25 = SeeingSeries.Measured(
+        $"{t0} 0.90\n{t0 + hour} 1.20   # a cloud went over\n{t0 + 2 * hour} 1.00\n");
+    Check("a pasted record interpolates between its samples",
+          Math.Abs(table25.ZenithFwhmArcsecAt500(t0 + 0.5 * hour) - 1.05) < 1e-12,
+          $"{table25.ZenithFwhmArcsecAt500(t0 + 0.5 * hour):F6} arcsec half way to the first step");
+    Check("and is flat outside itself rather than continuing its last slope",
+          table25.ZenithFwhmArcsecAt500(t0 - hour) == 0.90
+          && table25.ZenithFwhmArcsecAt500(t0 + 99 * hour) == 1.00);
+    Check("a record whose instants do not ascend is refused, not sorted",
+          Refused(() => SeeingSeries.Measured($"{t0 + hour} 1.0\n{t0} 1.1\n")),
+          "that is two records concatenated or a column read as the wrong one");
+    Check("a record too short to interpolate is refused",
+          Refused(() => SeeingSeries.Measured($"{t0} 1.0\n")));
+    Check("a sample outside the physical range is skipped and said to be skipped",
+          SeeingSeries.Measured($"{t0} 1.0\n{t0 + hour} 900\n{t0 + 2 * hour} 1.1\n").Notes.Count > 0);
+
+    Check("two identical series carry the same id, two different ones do not",
+          SeeingSeries.Constant(1.0).Id == SeeingSeries.Constant(1.0).Id
+          && SeeingSeries.Constant(1.0).Id != SeeingSeries.Constant(1.1).Id,
+          "a frame can name the seeing that made it");
+
+    // THE TRANSPORT, WHICH IS THE POINT OF FIXING THE CONVENTION.
+    Check("at the zenith and at 500 nm the delivered seeing is the number that was given",
+          SeeingSeries.DeliveredFwhmArcsec(1.0, 1.0, 500e-9) == 1.0);
+
+    double atX = SeeingSeries.DeliveredFwhmArcsec(1.0, 2.0, 500e-9);
+    Check("more air is worse seeing, by the classical three-fifths power",
+          Math.Abs(atX - Math.Pow(2.0, 0.6)) < 1e-12, $"{atX:F6} at airmass 2");
+
+    double izCentre = 837e-9;
+    double red25 = SeeingSeries.DeliveredFwhmArcsec(1.0, 1.0, izCentre);
+    Check("a redder passband is delivered sharper, by Fried's fifth root",
+          red25 < 1.0 && Math.Abs(red25 - Math.Pow(izCentre / 500e-9, -0.2)) < 1e-12,
+          $"{red25:F5} at {izCentre * 1e9:F0} nm, which is {(1.0 - red25) * 100.0:F1} per cent narrower "
+          + "than the same number read at 500 nm");
+
+    // AND THE THING THAT COULD NOT BE DONE BEFORE: two instants, two seeings, ONE airmass.
+    const double heldAirmass = 1.2;
+    double early = SeeingSeries.DeliveredFwhmArcsec(
+        ramp25.ZenithFwhmArcsecAt500(t0), heldAirmass, izCentre);
+    double late = SeeingSeries.DeliveredFwhmArcsec(
+        ramp25.ZenithFwhmArcsecAt500(t0 + 5 * hour), heldAirmass, izCentre);
+    Check("the seeing moves by 30 per cent while the airmass does not move at all",
+          Math.Abs(late / early - 1.3) < 1e-12 && heldAirmass == 1.2,
+          $"{early:F4} to {late:F4} arcsec, both at airmass {heldAirmass:F2}, so no second-order "
+          + "extinction rides along with the excursion");
+}
+
+Section("26. A fixed aperture is what sees the effect, and an aperture that tracks the seeing cancels it");
+{
+    VisualTelescopeSpec scope26 = VisualTelescopeCatalog.Rc20;
+    const double alt26 = 2396.0, centre26 = 700e-9, bandwidth26 = 1500.0;
+    const double plate26 = 0.35, seeing26 = 1.0, k26 = 1.3;
+    SystemResponse resp26 = DeepSkyCamera.BuildSystemResponse(scope26, CameraFilter.Red, 1.2, alt26);
+
+    ChromaticSubBand[] red26 = DeepSkyCamera.BuildSubBands(
+        centre26, bandwidth26, 20.0, plate26, alt26, 0.0, 1.0, resp26, 2600.0);
+    ChromaticSubBand[] blue26 = DeepSkyCamera.BuildSubBands(
+        centre26, bandwidth26, 20.0, plate26, alt26, 0.0, 1.0, resp26, 5500.0);
+
+    float[] Kernel26(ChromaticSubBand[] bands, double arcsec, out int radius) =>
+        OpticalPsf.BuildChromaticKernel(
+            plate26, scope26.ApertureMeters, scope26.SecondaryObstructionFraction, arcsec,
+            centre26, 0.0, scope26.SpiderVaneCount, scope26.SpiderVaneWidthMeters,
+            scope26.PrimaryMirrorPads, bands, out radius);
+
+    double Ee26(float[] k, int radius, double rPx)
+    {
+        int side = 2 * radius + 1;
+        double inside = 0.0, total = 0.0;
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+            {
+                double v = k[y * side + x];
+                total += v;
+                double dx = x - radius, dy = y - radius;
+                if (dx * dx + dy * dy <= rPx * rPx) inside += v;
+            }
+        return total > 0.0 ? inside / total : double.NaN;
+    }
+
+    float[] rNarrow = Kernel26(red26, seeing26, out int rnR);
+    float[] bNarrow = Kernel26(blue26, seeing26, out int bnR);
+    float[] rWide = Kernel26(red26, seeing26 * k26, out int rwR);
+    float[] bWide = Kernel26(blue26, seeing26 * k26, out int bwR);
+
+    // A FIXED CIRCLE: the same number of pixels before and after the seeing moved.
+    double rFixedPx = 1.0 * seeing26 / plate26;
+    double fixedBefore = Ee26(rNarrow, rnR, rFixedPx) / Ee26(bNarrow, bnR, rFixedPx);
+    double fixedAfter = Ee26(rWide, rwR, rFixedPx) / Ee26(bWide, bwR, rFixedPx);
+    double fixedMmag = 2.5 * Math.Log10(fixedAfter / fixedBefore) * 1000.0;
+
+    // A CIRCLE THAT TRACKS THE FIELD'S MEASURED WIDTH, which is what the default reduction does
+    // and what a pipeline does: ONE radius per frame, from one width measured over the field, not
+    // a radius per star. The field width here is the mean of the two stars' own delivered widths.
+    double fwhmFieldBefore = 0.5 * (OpticalPsf.MeasureKernelFwhmArcsec(rNarrow, rnR, plate26)
+                                  + OpticalPsf.MeasureKernelFwhmArcsec(bNarrow, bnR, plate26));
+    double fwhmFieldAfter = 0.5 * (OpticalPsf.MeasureKernelFwhmArcsec(rWide, rwR, plate26)
+                                 + OpticalPsf.MeasureKernelFwhmArcsec(bWide, bwR, plate26));
+    double trackedAfterPx = rFixedPx * fwhmFieldAfter / fwhmFieldBefore;
+    double trackedBefore = fixedBefore;
+    double trackedAfter = Ee26(rWide, rwR, trackedAfterPx) / Ee26(bWide, bwR, trackedAfterPx);
+    double trackedMmag = 2.5 * Math.Log10(trackedAfter / trackedBefore) * 1000.0;
+
+    Console.WriteLine($"         seeing 1.0 -> 1.3 arcsec, 2600 K against 5500 K, D = {scope26.ApertureMeters:F2} m:");
+    Console.WriteLine($"         aperture held at 1.0 FWHM0        {fixedMmag,8:F3} mmag");
+    Console.WriteLine($"         aperture tracking the field width {trackedMmag,8:F3} mmag");
+    Console.WriteLine($"         field width {fwhmFieldBefore:F4} -> {fwhmFieldAfter:F4} arcsec, "
+                    + $"a factor {fwhmFieldAfter / fwhmFieldBefore:F4} against the seeing's {k26:F2}");
+
+    Check("a fixed aperture sees the two colours move apart",
+          Math.Abs(fixedMmag) > 0.05, $"{fixedMmag:F3} mmag");
+
+    // AND TRACKING ALL BUT CANCELS IT, which is the control this exists to establish: an aperture
+    // recomputed from the field's own width each frame keeps each star's enclosed fraction very
+    // nearly put, so their ratio very nearly does not move.
+    //
+    // VERY NEARLY, AND NOT EXACTLY, and the residual is worth a sentence rather than a rounding.
+    // One radius is computed from ONE width averaged over the field, while the two stars are
+    // delivered at slightly different widths and grow by slightly different factors, because the
+    // diffraction core goes as lambda / D and does not widen with the turbulence at all. The
+    // field's own width therefore grows by less than the seeing did, 1.25 against 1.30 here, and
+    // the single radius built from it is not the right one for either star. What survives is two
+    // orders of magnitude below the fixed-aperture term, so the practical statement is that
+    // tracking removes the effect; the exact statement is that it leaves this.
+    Check("an aperture tracking the field's measured width removes almost all of it",
+          Math.Abs(trackedMmag) < 0.1 * Math.Abs(fixedMmag) && trackedMmag != 0.0,
+          $"{trackedMmag:F3} against {fixedMmag:F3} mmag, "
+          + $"{(1.0 - Math.Abs(trackedMmag / fixedMmag)) * 100.0:F0} per cent smaller and not exactly zero");
+
+    // AND THE REDUCTION'S OWN DEFAULT IS THE TRACKING ONE, which is why it had to become a choice.
+    Check("the reduction's default radius is Howell's, recomputed per frame",
+          Math.Abs(CcdEquation.OptimalApertureRadiusInFwhm - 0.68) < 1e-12,
+          $"{CcdEquation.OptimalApertureRadiusInFwhm} FWHM, so the default cancels the effect above");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

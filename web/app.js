@@ -1264,6 +1264,7 @@ $('bundle').onclick = async () => {
           atUtc: (scope.isSpaceBased ? undefined : state.fcStartIso) || undefined,
           seed: $('capSeed').value.trim() === '' ? undefined : Number($('capSeed').value),
           pwv: pwvRequestBody(),
+        seeing: seeingRequestBody(),
         },
       }),
     });
@@ -1325,6 +1326,7 @@ $('capture').onclick = async () => {
         // Empty means "draw one and tell me", which is what the server does and reports back.
         seed: $('capSeed').value.trim() === '' ? undefined : Number($('capSeed').value),
         pwv: pwvRequestBody(),
+        seeing: seeingRequestBody(),
       }),
     });
     const data = await r.json();
@@ -3856,11 +3858,15 @@ $('seqStart').onclick = async () => {
         frames: parseInt($('seqFrames').value, 10),
         airmassFrom: parseFloat($('seqXFrom').value),
         airmassTo: parseFloat($('seqXTo').value),
+        holdAirmass: $('seqHoldX').value === '' ? undefined : parseFloat($('seqHoldX').value),
+        apertureRadiusArcsec: $('seqApArcsec').value === '' ? undefined : parseFloat($('seqApArcsec').value),
+        apertureRadiusInFwhm: $('seqApFwhm').value === '' ? undefined : parseFloat($('seqApFwhm').value),
         comparisons: parseInt($('seqComps').value, 10),
         psfColourGroups: parseInt($('seqPsfGroups').value, 10) || 0,
         calibrate: $('seqCal').checked,
         seed: seedRaw === '' ? undefined : Number(seedRaw),
         pwv: pwvRequestBody(),
+        seeing: seeingRequestBody(),
         transient: transientRequestBody(),
       }),
     });
@@ -4538,6 +4544,69 @@ async function plotPwv(token, telescope, mm, caveat) {
 
 // The request body's water block, or undefined when the term is off. Shared by the single capture
 // and the sequence, so the two cannot drift into meaning different things.
+// ======================================================================================
+// SEEING
+//
+// Four modes, and the choice is the experiment. Off takes the site's published median projected
+// along the line of sight, which is what every run before this did and which ties the seeing to
+// the airmass: the only way to move one was to move the other. Airmass carries second-order
+// extinction, extinction is chromatic, and both land in the same differential ratio, so a seeing
+// study run that way measures the two together and can attribute neither. The other three drive
+// the seeing on its own.
+//
+// The value is always the FWHM at the ZENITH at 500 nm. The server takes it to the line of sight
+// by X^0.6 and to the passband by Fried's lambda^(-1/5), so the same number means the same
+// turbulence in every band, which is the whole reason it is given this way.
+// ======================================================================================
+
+function seeingModeChanged() {
+  const mode = $('seeingMode').value;
+  $('seeingConstant').hidden = mode !== 'constant';
+  $('seeingRamp').hidden = mode !== 'ramp';
+  $('seeingMeasured').hidden = mode !== 'measured';
+
+  $('seeingOut').textContent =
+    mode === 'none' ? 'site median'
+    : mode === 'constant' ? `${$('seeingArcsec').value}" at zenith`
+    : mode === 'ramp' ? `${$('seeingFrom').value}" to ${$('seeingTo').value}"`
+    : 'measured';
+
+  $('seeingHint').textContent =
+    mode === 'none'
+      ? 'The site median, times airmass^0.6. No wavelength transport on this path, so the number is used as though it were the passband centre.'
+      : 'Given at the zenith at 500 nm. Delivered = value x airmass^0.6 x (lambda / 500 nm)^(-1/5).';
+}
+
+for (const id of ['seeingMode', 'seeingArcsec', 'seeingFrom', 'seeingTo',
+                  'seeingStart', 'seeingEnd', 'seeingSeries']) {
+  $(id).addEventListener('input', seeingModeChanged);
+  $(id).addEventListener('change', seeingModeChanged);
+}
+seeingModeChanged();
+
+function seeingRequestBody() {
+  const mode = $('seeingMode').value;
+  if (mode === 'none') return undefined;
+  // Never sent for an orbital instrument: there is no atmosphere up there to have a seeing, and
+  // the server would be right to refuse it rather than quietly render the frame without one.
+  const scope = selectedScope();
+  if (!scope || scope.isSpaceBased) return undefined;
+  if (mode === 'constant') return { mode: 'constant', arcsec: parseFloat($('seeingArcsec').value) };
+  if (mode === 'ramp') {
+    return {
+      mode: 'ramp',
+      fromArcsec: parseFloat($('seeingFrom').value),
+      toArcsec: parseFloat($('seeingTo').value),
+      startMinutes: parseFloat($('seeingStart').value),
+      endMinutes: parseFloat($('seeingEnd').value),
+    };
+  }
+  const text = $('seeingSeries').value.trim();
+  if (!text) return undefined;
+  return { mode: 'measured', series: text, label: 'pasted in the interface' };
+}
+
+
 function pwvRequestBody() {
   const mode = $('pwvMode').value;
   if (mode === 'none') return undefined;

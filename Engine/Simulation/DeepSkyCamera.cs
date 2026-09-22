@@ -113,6 +113,42 @@ namespace ExoStudio.Simulation
             public int PsfColourGroups = 0;
 
             /// <summary>
+            /// The seeing as a function of time, at the zenith and referred to 500 nm. Null takes
+            /// the site's published median instead, which is what every frame before this did, and
+            /// leaves the frame bit-for-bit unchanged.
+            ///
+            /// WITHOUT THIS THE ONLY WAY TO MOVE THE SEEING IS TO MOVE THE AIRMASS, because the
+            /// legacy value is the site median times X^0.6 and nothing else. A study of what
+            /// seeing alone does then cannot be run: every seeing excursion is also an airmass
+            /// excursion, airmass carries second-order extinction, extinction is chromatic, and
+            /// the two land in the same differential ratio with no way to tell them apart.
+            ///
+            /// Giving a series also turns on the wavelength transport, which the legacy path does
+            /// not have. See SeeingSeries for why that difference is deliberate.
+            /// </summary>
+            public SeeingSeries Seeing;
+
+            /// <summary>
+            /// Render every frame at this airmass whatever the field is really doing. NaN, the
+            /// default, takes the airmass from the sky, which is the only honest thing for a
+            /// simulated OBSERVATION.
+            ///
+            /// THIS IS AN IDEALISATION AND IT IS NAMED AS ONE. No real field sits at a constant
+            /// airmass: it rises, culminates and sets, and a request for a ladder of zero width is
+            /// refused by the placement for exactly that reason. But a MECHANISM study holds one
+            /// variable while it moves another, and airmass is the variable that has to be held
+            /// here: it carries second-order extinction, which is chromatic, so an effect measured
+            /// while the airmass moves cannot be told apart from extinction. Held, it contributes
+            /// nothing and whatever is left is the term under study.
+            ///
+            /// The zenith distance is taken from it too, by z = acos(1/X), so the extinction, the
+            /// seeing projection and the differential refraction all speak about the same sky
+            /// rather than two. What a run must NOT do is report such frames as an observation;
+            /// the sequence records the held value so an analysis can see it was held.
+            /// </summary>
+            public double HeldAirmass = double.NaN;
+
+            /// <summary>
             /// Cooler setpoint, Celsius. NaN keeps the instrument's own published temperature.
             ///
             /// This is a real control, not a label: DarkCurrentModel scales the published dark
@@ -338,6 +374,25 @@ namespace ExoStudio.Simulation
             /// measurement that ignores it is quoting a width it did not use.
             /// </summary>
             public int StarsWithoutColour;
+
+            /// <summary>
+            /// The seeing the run ASKED FOR, at the zenith and at 500 nm, against SeeingFwhmArcsec
+            /// which is what the passband was actually given at this airmass. NaN when no series
+            /// was supplied and the site median was used.
+            ///
+            /// Both are reported because a pipeline detrends against the width it MEASURES, which
+            /// is neither of these, and an analysis has to be able to tell the three apart.
+            /// </summary>
+            public double SeeingZenithFwhm500Arcsec = double.NaN;
+
+            /// <summary>The series that produced it, so a frame can name the seeing that made it.</summary>
+            public string SeeingSeriesId;
+
+            /// <summary>
+            /// True when the airmass was held by the request rather than taken from the sky, so
+            /// that a frame cannot be read as an observation by mistake.
+            /// </summary>
+            public bool AirmassHeld;
 
             /// <summary>
             /// Where the time in Prepare went, milliseconds. Not decoration: a frame costs about
@@ -706,6 +761,16 @@ namespace ExoStudio.Simulation
             // refraction in BuildSubBands, and there is nothing up there to refract.
             double zenithDistance = space ? 0.0 : 90.0 - altAz.AltitudeDeg;
             double airmass = space ? 1.0 : ImagingObservingConditions.AirmassAt(altAzOfDate.AltitudeDeg);
+
+            // THE AIRMASS HELD, WHEN A STUDY ASKS FOR IT. Both quantities move together or the
+            // frame would carry two different skies: the extinction would be computed for one
+            // airmass and the dispersion smeared along a zenith distance belonging to another.
+            if (!space && double.IsFinite(req.HeldAirmass) && req.HeldAirmass >= 1.0)
+            {
+                airmass = req.HeldAirmass;
+                zenithDistance = Math.Acos(Math.Clamp(1.0 / airmass, -1.0, 1.0)) * 180.0 / Math.PI;
+                res.AirmassHeld = true;
+            }
             res.AirmassX = airmass;
             if (space) res.TargetAltitudeDeg = double.NaN;   // no horizon to be above
 
@@ -752,7 +817,31 @@ namespace ExoStudio.Simulation
             // Hubble specs already carry ZenithSeeingFwhmArcsec = 0 for exactly this reason. What
             // broadens the PSF up there instead is the OTA's residual wavefront error and the
             // spacecraft's attitude jitter, and both go in through the sub-bands below.
-            double seeing = space ? 0.0 : spec.ZenithSeeingFwhmArcsec * Math.Pow(airmass, 0.6);
+            // THE SEEING, AND WHICH OF TWO CONVENTIONS IT IS IN.
+            //
+            // With a series the value is the zenith FWHM at 500 nm at this instant, taken to the
+            // line of sight by X^0.6 and to the passband by Fried's lambda^(-1/5). Without one it
+            // is the site's published median times X^0.6 and NOTHING ELSE: no wavelength
+            // transport, which is what every frame before a series existed was rendered with.
+            // That inconsistency is deliberate and is argued in SeeingSeries; what matters here is
+            // that the no-series branch is character for character the line it replaced.
+            double seeing;
+            if (space)
+            {
+                seeing = 0.0;
+            }
+            else if (req.Seeing != null)
+            {
+                double zenith500 = req.Seeing.ZenithFwhmArcsecAt500(obsUt);
+                res.SeeingZenithFwhm500Arcsec = zenith500;
+                res.SeeingSeriesId = req.Seeing.Id;
+                seeing = SeeingSeries.DeliveredFwhmArcsec(
+                    zenith500, airmass, FilterCentralWavelengthMeters(spec, req.Filter));
+            }
+            else
+            {
+                seeing = spec.ZenithSeeingFwhmArcsec * Math.Pow(airmass, 0.6);
+            }
             res.SeeingFwhmArcsec = seeing;
             res.PlateScaleArcsec = plateScale;
             res.Width = w; res.Height = h;

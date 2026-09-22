@@ -52,7 +52,15 @@ namespace ExoStudio.Simulation
             public string ObservedUtc;
             public double Airmass;
             public double AltitudeDeg;
+            /// <summary>What the passband was given at this frame's airmass, in arcsec.</summary>
             public double SeeingArcsec;
+
+            /// <summary>
+            /// What the run ASKED for, at the zenith and at 500 nm, or NaN when the site median
+            /// was used. Both are carried because a pipeline detrends against neither: it uses the
+            /// width it MEASURES on the field's own stars, and the three have to be tellable apart.
+            /// </summary>
+            public double SeeingZenith500Arcsec = double.NaN;
             public double SkyElectronsPerPixel;
             public double FwhmPx;
             public double PwvMm;
@@ -93,6 +101,27 @@ namespace ExoStudio.Simulation
         /// whose stars were drawn at their own widths is not comparable with one whose were not.
         /// </summary>
         public int PsfColourGroups;
+
+        /// <summary>
+        /// The seeing this run was driven with, or null for the site median. Recorded because a
+        /// run with a driven seeing and one without are not the same experiment.
+        /// </summary>
+        public SeeingSeries Seeing;
+
+        /// <summary>
+        /// The airmass every frame was rendered at, held by the request rather than taken from the
+        /// sky. NaN for a run that took the sky's own. Recorded because a held run is a mechanism
+        /// study and not an observation, and the two must not be compared without saying so.
+        /// </summary>
+        public double HoldAirmass = double.NaN;
+
+        /// <summary>
+        /// The photometric aperture this run measured in: a radius in arcsec held fixed against
+        /// the seeing, or a multiple of each frame's own FWHM. NaN for the default. Recorded
+        /// because the aperture is not a detail of the reduction here, it is the experiment.
+        /// </summary>
+        public double ApertureRadiusArcsec = double.NaN;
+        public double ApertureRadiusInFwhm = double.NaN;
 
         /// <summary>The water overhead across the run, or null when the term is absent.</summary>
         public PwvSeries Pwv;
@@ -371,7 +400,8 @@ namespace ExoStudio.Simulation
             /// come from the same frames, so they cannot disagree.
             /// </summary>
             public List<(double Ut, double Airmass, double PwvMm, double TransitFactor,
-                         double Ratio, double PhotonPpt)> Series = new();
+                         double Ratio, double PhotonPpt,
+                         double SeeingArcsec, double SeeingZenith500Arcsec, double FwhmPx)> Series = new();
 
             /// <summary>The colours the differential ratio is built from - the whole reason water does not cancel.</summary>
             public double EnsembleBv;
@@ -535,7 +565,8 @@ namespace ExoStudio.Simulation
             for (int i = 0; i < norm.Length; i++)
             {
                 FrameRow f = usable[kept[i]];
-                a.Series.Add((f.Ut, f.Airmass, f.PwvMm, f.TransitFactor, norm[i], photon[i] * 1000.0));
+                a.Series.Add((f.Ut, f.Airmass, f.PwvMm, f.TransitFactor, norm[i], photon[i] * 1000.0,
+                              f.SeeingArcsec, f.SeeingZenith500Arcsec, f.FwhmPx));
             }
 
             // The colour trend: every star's own drift against the same ensemble, then those

@@ -83,6 +83,15 @@ namespace ExoStudio.Simulation
             public double BackgroundElectrons;
             public double BackgroundRmsElectrons;
             public double ApertureRadiusPx;
+
+            /// <summary>
+            /// What was asked for before the 1.5 px floor was applied. Equal to ApertureRadiusPx
+            /// unless the floor bound, which is the one case the reduction calls unreliable.
+            /// </summary>
+            public double ApertureRadiusRequestedPx;
+
+            /// <summary>How the radius was chosen, so a run never has to guess which it got.</summary>
+            public string ApertureMode = "default, 0.68 FWHM";
             public double FwhmPx;
 
             /// <summary>
@@ -170,9 +179,23 @@ namespace ExoStudio.Simulation
         /// is converted to electrons here: the CCD equation is a statement about counted charges
         /// and only holds in those units.
         /// </summary>
+        /// <param name="apertureRadiusArcsec">
+        /// A photometric aperture radius in arcsec, fixed for the run whatever the seeing does.
+        /// NaN takes the default. THIS IS WHAT A REAL PIPELINE DOES: SPECULOOS measures in thirteen
+        /// fixed apertures and picks one for the night, and a fixed aperture is precisely why a
+        /// seeing change does not cancel between stars of different colours. Without it the radius
+        /// here tracks the seeing, which cancels that effect by construction.
+        /// </param>
+        /// <param name="apertureRadiusInFwhm">
+        /// A radius as a multiple of THIS frame's FWHM, recomputed per frame. NaN takes the
+        /// default, which is Howell's 0.68. Used together with the one above, the fixed radius
+        /// wins; that is not a silent precedence, the Result says which was used.
+        /// </param>
         public static Result Reduce(float[] adu, DeepSkyCamera.PreparedExposure prep,
                                     double thresholdSigma = DefaultThresholdSigma,
-                                    double brightSnrFloor = 20.0)
+                                    double brightSnrFloor = 20.0,
+                                    double apertureRadiusArcsec = double.NaN,
+                                    double apertureRadiusInFwhm = double.NaN)
         {
             var r = new Result
             {
@@ -206,9 +229,31 @@ namespace ExoStudio.Simulation
                                             prep.Spec.SecondaryObstructionFraction,
                                             DeepSkyCamera.FilterCentralWavelengthMeters(prep.Spec, prep.Filter));
             double fwhmPx = Math.Max(1.0, fwhmArcsec / prep.Meta.PlateScaleArcsec);
-            double apertureRadiusPx = Math.Max(1.5, CcdEquation.OptimalApertureRadiusInFwhm * fwhmPx);
+
+            // THE RADIUS THE CALLER ASKED FOR, BEFORE THE FLOOR. Three ways of asking, and the
+            // default is character for character the expression that used to be here.
+            double requestedPx;
+            if (double.IsFinite(apertureRadiusArcsec) && apertureRadiusArcsec > 0.0
+                && prep.Meta.PlateScaleArcsec > 0.0)
+            {
+                requestedPx = apertureRadiusArcsec / prep.Meta.PlateScaleArcsec;
+                r.ApertureMode = "fixed arcsec";
+            }
+            else if (double.IsFinite(apertureRadiusInFwhm) && apertureRadiusInFwhm > 0.0)
+            {
+                requestedPx = apertureRadiusInFwhm * fwhmPx;
+                r.ApertureMode = "multiple of this frame's FWHM";
+            }
+            else
+            {
+                requestedPx = CcdEquation.OptimalApertureRadiusInFwhm * fwhmPx;
+                r.ApertureMode = "default, 0.68 FWHM";
+            }
+
+            double apertureRadiusPx = Math.Max(1.5, requestedPx);
             r.FwhmPx = fwhmPx;
             r.ApertureRadiusPx = apertureRadiusPx;
+            r.ApertureRadiusRequestedPx = requestedPx;
 
             double inner = apertureRadiusPx * CcdEquation.SkyAnnulusInnerRadiusInAperture;
             double outer = apertureRadiusPx * CcdEquation.SkyAnnulusOuterRadiusInAperture;
@@ -566,7 +611,15 @@ namespace ExoStudio.Simulation
             // is geometry rather than photons. At the 9.1 px per FWHM this reduction normally runs
             // at, the same measurement gives 0.995 and 0.02 %: the exact areas do their job, and
             // this is the regime where they cannot.
-            if (apertureRadiusPx > CcdEquation.OptimalApertureRadiusInFwhm * fwhmPx + 1e-9)
+            //
+            // THE CONDITION IS THE FLOOR BINDING, NOT THE RADIUS BEING LARGE. It used to be written
+            // against 0.68 * fwhmPx, which was the same thing only because the radius WAS that
+            // expression clamped up to 1.5 px: the test could fire for one reason, the floor. Now
+            // that a caller can ask for a radius of its own, comparing against 0.68 FWHM would
+            // condemn every deliberately wider aperture, which is the opposite of what the
+            // measurement below says. A wide aperture is not the regime the exact areas fail in;
+            // a tight one is.
+            if (apertureRadiusPx > requestedPx + 1e-9)
             {
                 r.Reliable = false;
                 r.Notes.Add($"UNRELIABLE: at {r.FwhmPx:F2} px per FWHM the photometric aperture hits its "

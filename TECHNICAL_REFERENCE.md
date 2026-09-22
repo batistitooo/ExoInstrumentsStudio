@@ -1118,6 +1118,121 @@ applied per source anywhere, despite what the comment on `BuildChromaticKernel` 
 it is the shared kernel's. Splitting by colour now gives each group its own offsets as a side
 effect of giving it its own sub-bands, which is closer to right, but a group is not a star.
 
+### The seeing, as a series in its own right
+
+A frame's seeing used to be one line:
+
+```
+double seeing = space ? 0.0 : spec.ZenithSeeingFwhmArcsec * Math.Pow(airmass, 0.6);
+```
+
+The site's published median, projected along the line of sight, and nothing else. That is a
+reasonable default and it has one consequence that rules out a whole class of measurement: THE
+ONLY WAY TO MOVE THE SEEING IS TO MOVE THE AIRMASS. A sequence, besides, refused a ladder whose
+ends were closer than 0.01 in airmass, so a run at constant airmass could not be expressed at all.
+
+Why that is fatal rather than inconvenient. Airmass does not only change the seeing. It changes the
+extinction, and extinction is wavelength dependent, so its second order does not cancel between two
+stars of different colours in a differential ratio. A study that changes the seeing by tilting the
+telescope therefore changes two chromatic terms at once and can attribute its result to neither.
+Turbulence and the geometry of the line of sight are independent in the sky, and they are now
+independent here.
+
+`SeeingSeries` is the same shape as `PwvSeries`, for the same reasons: a pure function of UT with
+no state, so that warp changes the pacing of a run and never its result, and an `Id` that is a hash
+of what defines it, so a frame can name the seeing that made it. Three kinds:
+
+  * CONSTANT, the control.
+  * RAMP, two values and a transition, which is the shape a seeing degradation through a transit
+    has. Its offsets are minutes from the run's own start, because a request cannot know which
+    instant the scheduler will pick. Two plateaus is this with a short transition.
+  * MEASURED, a record an observer pasted: an instant and a zenith FWHM per line, ISO or seconds
+    since J2000, comments after #. A DIMM record usually parses unedited.
+
+Flat outside itself rather than extrapolated, refused rather than sorted when the instants do not
+ascend, refused rather than clamped for a value that is not a seeing, and refused when a ramp is
+anchored at UT zero, which is the same refusal a drifting water column makes and for the same
+reason.
+
+### The wavelength convention, and a deliberate inconsistency
+
+The value a series carries is the FWHM AT THE ZENITH AT 500 nm, which is what every seeing monitor
+publishes and what `VisualTelescopeSpec.ZenithSeeingFwhmArcsec` documents itself as. It is taken to
+the frame by
+
+```
+delivered = zenith500 * airmass^0.6 * (lambda / 500 nm)^(-1/5)
+```
+
+The first factor is the classical three-fifths power. The second is Fried's relation, r0 going as
+lambda^(6/5) and the FWHM as lambda / r0, after Boyd (1978, J. Opt. Soc. Am. 68, 877). It is
+Kolmogorov: with a finite outer scale (von Karman, Tokovinin 2002, PASP 114, 1156) the colour
+dependence is stronger, so this is a lower bound on any colour effect rather than a best estimate,
+and anything measured with it should say so.
+
+THE LEGACY PATH DOES NOT HAVE THE SECOND FACTOR, and it is left that way on purpose. Without a
+series the site median goes to the kernel as though it were referred to the passband centre, so on
+I+z' the rendered PSF is about 10 per cent wider than a correctly transported 500 nm number, and
+the same value entered means a different physical seeing in r' than in I+z'. Correcting it would
+move every frame this program has ever rendered, including the water-vapour study's, which is a
+decision about published results rather than about code. A run that gives a series gets the
+transport; a run that does not gets exactly what it always got, bit for bit.
+`Core/TransitPhotometry`, on the pixel-free path, has always had it right, with its own
+`SeeingReferenceWavelengthNm = 500.0`.
+
+### A flat ladder
+
+`airmassTo` may now equal `airmassFrom`, and the lower bound is 1 rather than 1.01. A ladder that
+runs backwards is still refused, because that is a swapped pair rather than a choice. Staring at
+one field while a seeing series moves underneath it is the run that isolates a seeing effect, and
+it was not expressible before.
+
+Both numbers are reported on every frame: `SeeingZenithFwhm500Arcsec` is what the run asked for,
+`SeeingFwhmArcsec` is what the passband was given at that airmass. Neither is what a pipeline
+detrends against, which is the width it MEASURES on the field's own stars, and an analysis has to
+be able to tell the three apart.
+
+### The photometric aperture, as something the run chooses
+
+The reduction's aperture radius was `Math.Max(1.5, 0.68 * fwhmPx)` and nothing else: Howell's
+optimal radius, recomputed from each frame's own seeing. That is the right default for a detection
+limit, and it quietly rules out the measurement this section exists for.
+
+A radius that tracks the seeing keeps a CONSTANT fraction of each star's light as the seeing moves.
+Two stars of different colours are delivered at different widths, but if both apertures grow in
+proportion, both enclosed fractions stay put and their ratio never moves. The colour effect is
+cancelled by construction. A real pipeline does not do this: SPECULOOS measures in thirteen FIXED
+apertures and chooses one for the night, so the fraction lost really does depend on the width, and
+really does differ between a red target and its bluer comparisons.
+
+`Reduce` now takes the radius two ways, and says which it used in `ApertureMode`:
+
+  * `apertureRadiusArcsec`, fixed for the run whatever the seeing does. What a pipeline uses.
+  * `apertureRadiusInFwhm`, a multiple of this frame's FWHM, recomputed per frame. The default
+    behaviour generalised, and the control that should make the effect vanish.
+
+Both reach a sequence as request fields, and the capture path takes them as query parameters on
+`GET /api/captures/{id}/photometry`. THAT ENDPOINT IS THE CHEAP ONE, and it is worth saying why: a
+frame costs what it costs to render, and measuring an already-stored frame in a different circle is
+a loop over its sources. A curve against aperture radius is therefore ONE render and as many
+photometry calls as there are radii, not one render per radius.
+
+A correction came with it. The unreliability gate read
+
+```
+if (apertureRadiusPx > CcdEquation.OptimalApertureRadiusInFwhm * fwhmPx + 1e-9)
+```
+
+which looks like a test on the radius being too large and was not one: the radius WAS that
+expression clamped up to 1.5 px, so the only way to exceed it was for the 1.5 px floor to bind,
+which happens on an undersampled frame. The comment beside it says exactly that, and the measured
+numbers it quotes are about a TIGHT aperture, 2.2 px per FWHM, where the centroid's sub-pixel
+jitter moves the enclosed fraction by more than the reported error bar. Now that a caller can ask
+for a radius of its own, comparing against 0.68 FWHM would have condemned every deliberately wider
+aperture for a reason that does not apply to it. The test is now against the radius that was
+actually requested, which is the floor binding and nothing else, and is identical to the old
+behaviour whenever no radius is asked for.
+
 ## 5.9 Water vapour
 
 `Engine/Simulation/PwvTransmission.cs`, `Engine/Simulation/PwvSeries.cs`, `tools/fetch_pwv_grid.py`,
