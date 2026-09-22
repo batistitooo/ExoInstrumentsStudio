@@ -2741,8 +2741,13 @@ app.MapPost("/api/captures/{id}/masters", async (string id, string kind, HttpReq
 // over and over to move one number in the reduction.
 app.MapGet("/api/captures/{id}/photometry", (string id, double? thresholdSigma, double? brightSnr,
                                             string bias, string dark, string flat,
-                                            double? apertureRadiusArcsec, double? apertureRadiusInFwhm) =>
+                                            double? apertureRadiusArcsec, double? apertureRadiusInFwhm,
+                                            double? annulusInner, double? annulusOuter) =>
 {
+    if (annulusInner is { } ai && !(ai >= 1.0 && ai <= 40.0))
+        return Results.BadRequest(new { error = $"annulusInner {ai} is out of range. 1 to 40 aperture radii." });
+    if (annulusOuter is { } ao && !(ao > (annulusInner ?? 1.0) && ao <= 60.0))
+        return Results.BadRequest(new { error = $"annulusOuter {ao} must exceed annulusInner and be at most 60." });
     if (apertureRadiusArcsec is { } qra && !(qra > 0.0 && qra <= 60.0))
         return Results.BadRequest(new { error = $"apertureRadiusArcsec {qra} is out of range. Above 0 and at most 60 arcsec, or omit it for the default." });
     if (apertureRadiusInFwhm is { } qrf && !(qrf >= 0.1 && qrf <= 10.0))
@@ -2807,7 +2812,8 @@ app.MapGet("/api/captures/{id}/photometry", (string id, double? thresholdSigma, 
         light, s.Exposure,
         Math.Clamp(thresholdSigma ?? FrameReduction.DefaultThresholdSigma, 1.0, 100.0),
         Math.Clamp(brightSnr ?? 20.0, 1.0, 1000.0),
-        apertureRadiusArcsec ?? double.NaN, apertureRadiusInFwhm ?? double.NaN);
+        apertureRadiusArcsec ?? double.NaN, apertureRadiusInFwhm ?? double.NaN,
+        null, null, annulusInner ?? double.NaN, annulusOuter ?? double.NaN);
     if (applied != null) reduced.Notes.Insert(0, $"Calibrated with {applied}.");
 
     return Results.Json(Dto.Photometry(reduced));

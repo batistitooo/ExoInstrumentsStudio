@@ -117,6 +117,10 @@ namespace ExoStudio.Simulation
             /// <summary>How the radius was chosen, so a run never has to guess which it got.</summary>
             public string ApertureMode = "default, 0.68 FWHM";
 
+            /// <summary>Where the sky annulus sat, in units of the aperture radius.</summary>
+            public double AnnulusInnerInAperture = CcdEquation.SkyAnnulusInnerRadiusInAperture;
+            public double AnnulusOuterInAperture = CcdEquation.SkyAnnulusOuterRadiusInAperture;
+
             /// <summary>
             /// The extra apertures every matched star was also measured in, in pixels, in the same
             /// order as Match.FluxAtFixedRadii then Match.FluxAtFwhmRadii. Recorded because a
@@ -233,7 +237,9 @@ namespace ExoStudio.Simulation
                                     double apertureRadiusArcsec = double.NaN,
                                     double apertureRadiusInFwhm = double.NaN,
                                     double[] extraRadiiArcsec = null,
-                                    double[] extraRadiiInFwhm = null)
+                                    double[] extraRadiiInFwhm = null,
+                                    double annulusInnerInAperture = double.NaN,
+                                    double annulusOuterInAperture = double.NaN)
         {
             var r = new Result
             {
@@ -348,8 +354,29 @@ namespace ExoStudio.Simulation
             r.ApertureRadiusPx = apertureRadiusPx;
             r.ApertureRadiusRequestedPx = requestedPx;
 
-            double inner = apertureRadiusPx * CcdEquation.SkyAnnulusInnerRadiusInAperture;
-            double outer = apertureRadiusPx * CcdEquation.SkyAnnulusOuterRadiusInAperture;
+            // THE SKY ANNULUS, AND WHY IT HAD TO BECOME A CHOICE.
+            //
+            // Core's convention puts it at 2 to 3 times the aperture radius, which is right for a
+            // detection limit and is INSIDE THE STAR for a tight aperture: at 0.75 FWHM the
+            // annulus starts at 1.5 FWHM, where a Kolmogorov profile still has 6.6 per cent of its
+            // light. That light is measured as sky and subtracted from the star.
+            //
+            // It would cancel out of a differential ratio if it were a fixed fraction of each
+            // star, but the background is a SIGMA-CLIPPED MEDIAN and clipping is not linear in
+            // flux, so two stars of different brightness lose different fractions. Being able to
+            // move the annulus out is what separates that from the effect a study is measuring;
+            // leaving it where a pipeline puts it is what reproduces the pipeline. Both are
+            // wanted, at different moments, so both are available and the default is unchanged.
+            double innerScale = double.IsFinite(annulusInnerInAperture) && annulusInnerInAperture > 0.0
+                ? annulusInnerInAperture : CcdEquation.SkyAnnulusInnerRadiusInAperture;
+            double outerScale = double.IsFinite(annulusOuterInAperture) && annulusOuterInAperture > innerScale
+                ? annulusOuterInAperture : Math.Max(CcdEquation.SkyAnnulusOuterRadiusInAperture,
+                                                    innerScale * CcdEquation.SkyAnnulusOuterRadiusInAperture
+                                                        / CcdEquation.SkyAnnulusInnerRadiusInAperture);
+            double inner = apertureRadiusPx * innerScale;
+            double outer = apertureRadiusPx * outerScale;
+            r.AnnulusInnerInAperture = innerScale;
+            r.AnnulusOuterInAperture = outerScale;
 
             // The extra apertures, resolved to pixels once. A radius in arcsec needs the plate
             // scale; a radius in widths needs this frame's own width, which is why neither can be
@@ -660,8 +687,7 @@ namespace ExoStudio.Simulation
                 // 3 FWHM, which is not a thing any profile does.
                 double AtRadius(double radiusPx) => AperturePhotometry.Measure(
                     electrons, w, h, s.X, s.Y, radiusPx,
-                    radiusPx * CcdEquation.SkyAnnulusInnerRadiusInAperture,
-                    radiusPx * CcdEquation.SkyAnnulusOuterRadiusInAperture,
+                    radiusPx * innerScale, radiusPx * outerScale,
                     prep.Spec.ReadNoiseElectrons, saturationElectrons).Flux;
 
                 var atFixed = new double[fixedRadiiPx.Length];

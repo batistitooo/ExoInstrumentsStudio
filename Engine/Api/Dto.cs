@@ -459,6 +459,8 @@ namespace ExoStudio.Api
             // compared with another, and the floor binding is the one case the reduction calls
             // unreliable, so it has to be visible rather than inferred.
             apertureMode = r.ApertureMode,
+            annulusInnerInAperture = r.AnnulusInnerInAperture,
+            annulusOuterInAperture = r.AnnulusOuterInAperture,
             apertureRadiusRequestedPx = Finite(r.ApertureRadiusRequestedPx),
             },
 
