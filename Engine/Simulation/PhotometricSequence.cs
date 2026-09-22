@@ -43,6 +43,16 @@ namespace ExoStudio.Simulation
             public double TrueMagnitude;
             public double FluxElectrons;
             public double Snr;
+
+            /// <summary>This star's own width on this frame, measured on the pixels, in pixels.</summary>
+            public double FwhmPx = double.NaN;
+
+            /// <summary>The local background under it, electrons per pixel.</summary>
+            public double BackgroundElectrons = double.NaN;
+
+            /// <summary>Flux in each extra aperture, in the order the run asked for them.</summary>
+            public double[] FluxAtFixedRadii = System.Array.Empty<double>();
+            public double[] FluxAtFwhmRadii = System.Array.Empty<double>();
         }
 
         public sealed class FrameRow
@@ -125,6 +135,23 @@ namespace ExoStudio.Simulation
         /// a run whose target was given a temperature is about a star that is in no catalogue.
         /// </summary>
         public List<DeepSkyCamera.StarOverride> StarOverrides;
+
+        /// <summary>
+        /// Extra apertures every star is ALSO measured in on every frame, beyond the one that
+        /// makes the light curve: radii fixed in arcsec, and radii taken as multiples of each
+        /// frame's own measured width. Empty for neither.
+        ///
+        /// This is what makes a curve against aperture radius cost one rendered sequence instead
+        /// of one per radius, and it is why the per-star export exists.
+        /// </summary>
+        /// <summary>
+        /// Every frame rendered at its expectation. Recorded because a noiseless run and a noisy
+        /// one are not the same experiment and must not be pooled.
+        /// </summary>
+        public bool Noiseless;
+
+        public double[] ExtraRadiiArcsec = System.Array.Empty<double>();
+        public double[] ExtraRadiiInFwhm = System.Array.Empty<double>();
 
         public double ApertureRadiusArcsec = double.NaN;
         public double ApertureRadiusInFwhm = double.NaN;

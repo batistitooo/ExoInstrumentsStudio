@@ -4435,6 +4435,91 @@ Section("28. A tabulated spectrum, because a blackbody has no molecular bands");
           $"{eSpec:F0} e- against {eBody:F0} e- for the blackbody of the same temperature");
 }
 
+Section("29. A star's width measured on its own pixels, and an aperture that carries its own sky");
+{
+    // A GAUSSIAN STAR LAID DOWN EXACTLY, so the estimator can be scored against a number rather
+    // than against another estimator.
+    const int W = 121, H = 121;
+    const double CX = 60.3, CY = 59.7, SKY = 200.0;
+    double[] widths = { 3.0, 5.0, 8.0 };
+
+    foreach (double fwhmIn in widths)
+    {
+        double sigma = fwhmIn / 2.3548200450309493;
+        var frame = new float[W * H];
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+            {
+                double dx = x - CX, dy = y - CY;
+                frame[y * W + x] = (float)(SKY + 1e6 * Math.Exp(-(dx*dx + dy*dy) / (2*sigma*sigma)));
+            }
+
+        // Windowed generously: for a Gaussian the moment width and the half-maximum width agree
+        // exactly, so a wide window costs nothing and the check is on the arithmetic.
+        double measured = AperturePhotometry.MeasureFwhmPx(frame, W, H, CX, CY, SKY, 6.0 * sigma);
+        Check($"a {fwhmIn:F0} px Gaussian measures back as {fwhmIn:F0} px",
+              Math.Abs(measured - fwhmIn) / fwhmIn < 0.02,
+              $"{measured:F4} px against {fwhmIn:F4}, {100*(measured-fwhmIn)/fwhmIn:+0.00;-0.00} per cent");
+    }
+
+    // A WIDER WINDOW RETURNS A WIDER STAR ON A PROFILE WITH WINGS, which is why the window is an
+    // argument and not a constant, and why it has to be reported with the width.
+    var wings = new float[W * H];
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+        {
+            double r2 = (x - CX) * (x - CX) + (y - CY) * (y - CY);
+            wings[y * W + x] = (float)(SKY + 1e6 * Math.Pow(1.0 + r2 / 9.0, -11.0 / 6.0));
+        }
+    double narrow = AperturePhotometry.MeasureFwhmPx(wings, W, H, CX, CY, SKY, 8.0);
+    double wide = AperturePhotometry.MeasureFwhmPx(wings, W, H, CX, CY, SKY, 24.0);
+    Console.WriteLine($"         a profile with Kolmogorov-like wings measures "
+                    + $"{narrow:F2} px in an 8 px window and {wide:F2} px in a 24 px one");
+    Check("on a winged profile the measured width grows with the window, as a moment must",
+          wide > narrow * 1.2, $"{wide:F3} against {narrow:F3} px");
+
+    Check("a star with nothing above the background has no width rather than a wrong one",
+          double.IsNaN(AperturePhotometry.MeasureFwhmPx(new float[W * H], W, H, CX, CY, SKY, 10.0)));
+
+    // THE SKY ANNULUS SCALES WITH ITS OWN APERTURE. Reusing one aperture's annulus for a wider
+    // one puts the background inside the star: the recovered flux then turns over and FALLS with
+    // increasing radius, which no profile does. Measured here on the Gaussian above.
+    double sig5 = 5.0 / 2.3548200450309493;
+    var star = new float[W * H];
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+        {
+            double dx = x - CX, dy = y - CY;
+            star[y * W + x] = (float)(SKY + 1e6 * Math.Exp(-(dx*dx + dy*dy) / (2*sig5*sig5)));
+        }
+
+    double[] radii29 = { 3.0, 5.0, 8.0, 12.0, 16.0 };
+    var own = new double[radii29.Length];
+    var shared = new double[radii29.Length];
+    for (int i = 0; i < radii29.Length; i++)
+    {
+        double r = radii29[i];
+        own[i] = AperturePhotometry.Measure(star, W, H, CX, CY, r,
+            r * CcdEquation.SkyAnnulusInnerRadiusInAperture,
+            r * CcdEquation.SkyAnnulusOuterRadiusInAperture, 6.0, 1e9).Flux;
+        shared[i] = AperturePhotometry.Measure(star, W, H, CX, CY, r,
+            radii29[0] * CcdEquation.SkyAnnulusInnerRadiusInAperture,
+            radii29[0] * CcdEquation.SkyAnnulusOuterRadiusInAperture, 6.0, 1e9).Flux;
+    }
+    bool ownRises = true, sharedRises = true;
+    for (int i = 1; i < radii29.Length; i++)
+    {
+        if (!(own[i] > own[i - 1])) ownRises = false;
+        if (!(shared[i] > shared[i - 1])) sharedRises = false;
+    }
+    Console.WriteLine($"         own annulus:    {string.Join(", ", own.Select(v => $"{v/1e6:F3}"))} (x1e6 e-)");
+    Console.WriteLine($"         shared annulus: {string.Join(", ", shared.Select(v => $"{v/1e6:F3}"))}");
+    Check("with its own annulus the recovered flux rises with radius, as a curve of growth must",
+          ownRises, "monotonic over 3 to 16 px");
+    Check("and sharing a tight aperture's annulus breaks it, which is how the bug was found",
+          !sharedRises, "the background is taken from inside the star and subtracted from it");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

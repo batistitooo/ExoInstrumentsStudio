@@ -792,6 +792,14 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         return Results.BadRequest(new { error = $"apertureRadiusArcsec {ra} is out of range. Above 0 and at most 60 arcsec, or omit it for the default." });
     if (req.ApertureRadiusInFwhm is { } rf && !(rf >= 0.1 && rf <= 10.0))
         return Results.BadRequest(new { error = $"apertureRadiusInFwhm {rf} is out of range. 0.1 to 10 FWHM, or omit it for the default of 0.68." });
+    // REFUSED RATHER THAN FILTERED, because a study that asked for a radius and got a CSV without
+    // a column for it would read the gap as a measurement.
+    if (req.ExtraRadiiArcsec is { Length: > 0 } era
+        && (era.Length > 32 || era.Any(v => !(v > 0.0 && v <= 60.0))))
+        return Results.BadRequest(new { error = "extraRadiiArcsec takes at most 32 radii, each above 0 and at most 60 arcsec." });
+    if (req.ExtraRadiiInFwhm is { Length: > 0 } erf
+        && (erf.Length > 32 || erf.Any(v => !(v >= 0.1 && v <= 10.0))))
+        return Results.BadRequest(new { error = "extraRadiiInFwhm takes at most 32 radii, each between 0.1 and 10 FWHM." });
     if (req.HoldAirmass is { } hx && !(hx >= 1.0 && hx <= 5.0))
         return Results.BadRequest(new { error = $"holdAirmass {hx} is out of range. 1 (zenith) to 5, or omit it and the airmass comes from the sky." });
     if (seqPwv != null && deepSky.Value.Pwv == null)
@@ -852,6 +860,9 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         Seeing = seqSeeing,
         StarOverrides = seqTemps,
         HoldAirmass = req.HoldAirmass ?? double.NaN,
+        Noiseless = req.Noiseless ?? false,
+        ExtraRadiiArcsec = req.ExtraRadiiArcsec ?? Array.Empty<double>(),
+        ExtraRadiiInFwhm = req.ExtraRadiiInFwhm ?? Array.Empty<double>(),
         ApertureRadiusArcsec = req.ApertureRadiusArcsec ?? double.NaN,
         ApertureRadiusInFwhm = req.ApertureRadiusInFwhm ?? double.NaN,
         DriftArcsecPerFrame = req.DriftArcsecPerFrame ?? 0.0,
@@ -1238,6 +1249,9 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
                       : $"{what} for the rest of the field";
               }))
               + " (imposed by the request, not catalogued)").Append('\n');
+    sb.Append("# detector: ").Append(seq.Noiseless
+        ? "NOISELESS, every draw at its expectation; this is an amplitude, not an observation"
+        : "with noise").Append('\n');
     sb.Append("# aperture: ").Append(
         double.IsFinite(seq.ApertureRadiusArcsec)
             ? $"{seq.ApertureRadiusArcsec.ToString("0.###", CultureInfo.InvariantCulture)} arcsec, fixed against the seeing"
@@ -1281,6 +1295,95 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
 
     return Results.File(System.Text.Encoding.UTF8.GetBytes(sb.ToString()), "text/csv",
                         $"sequence-{seq.Id}.csv");
+});
+
+/// <summary>
+/// ONE ROW PER FRAME AND PER STAR, which the per-frame export above cannot be.
+///
+/// The other CSV is a light curve: one ratio a frame, the target over its ensemble, already
+/// formed. That is the right shape for plotting a transit and the wrong shape for asking why the
+/// ratio moved. This one is the measurement underneath it, before anything is divided: every star
+/// the reduction matched, on every frame, with its own flux, its own measured width, its own
+/// background, and its flux in every extra aperture the run asked for.
+///
+/// WHICH IS WHAT MAKES A CURVE AGAINST APERTURE RADIUS AFFORDABLE. The rendering is what a frame
+/// costs; measuring the same pixels in another circle is a loop over the sources. Ask for the
+/// radii once, render once, and the whole curve comes out of this file.
+/// </summary>
+app.MapGet("/api/sequences/{id}/stars.csv", (string id) =>
+{
+    PhotometricSequence seq = sequences.Get(id);
+    if (seq == null) return Results.NotFound(new { error = "No such sequence." });
+
+    List<PhotometricSequence.FrameRow> rows = seq.Snapshot();
+    if (rows.Count == 0) return Results.BadRequest(new { error = "That sequence has no frames yet." });
+
+    var sb = new System.Text.StringBuilder();
+    sb.Append("# ExoInstruments Studio per-star photometry, sequence ").Append(seq.Id).Append('\n');
+    sb.Append("# instrument: ").Append(seq.TelescopeDisplay ?? seq.Telescope)
+      .Append(", site ").Append(seq.Site).Append(", band ").Append(seq.Filter).Append('\n');
+    sb.Append("# one row per frame and per star, before any ratio is formed\n");
+    sb.Append("# fwhm_px is measured on this star's own pixels by second moments, windowed at the "
+            + "sky annulus inner edge. It is NOT the seeing, and it is not the frame's mean.\n");
+
+    double[] fixedR = seq.ExtraRadiiArcsec ?? Array.Empty<double>();
+    double[] fwhmR = seq.ExtraRadiiInFwhm ?? Array.Empty<double>();
+    if (fixedR.Length > 0)
+        sb.Append("# extra apertures fixed in arcsec: ")
+          .Append(string.Join(", ", fixedR.Select(v => v.ToString("0.###", CultureInfo.InvariantCulture))))
+          .Append('\n');
+    if (fwhmR.Length > 0)
+        sb.Append("# extra apertures as multiples of each frame's measured width: ")
+          .Append(string.Join(", ", fwhmR.Select(v => v.ToString("0.###", CultureInfo.InvariantCulture))))
+          .Append('\n');
+
+    sb.Append("frame,ut_seconds,utc,airmass,seeing_zenith500_arcsec,seeing_delivered_arcsec,"
+            + "pwv_mm,transit_factor,reliable,ra_deg,dec_deg,colour_bv,true_vmag,snr,"
+            + "fwhm_px,background_e,flux_e");
+    foreach (double v in fixedR)
+        sb.Append(",flux_e_r").Append(v.ToString("0.###", CultureInfo.InvariantCulture)).Append("arcsec");
+    foreach (double v in fwhmR)
+        sb.Append(",flux_e_r").Append(v.ToString("0.###", CultureInfo.InvariantCulture)).Append("fwhm");
+    sb.Append('\n');
+
+    string Num(double v, string f) => double.IsFinite(v) ? v.ToString(f, CultureInfo.InvariantCulture) : "";
+    foreach (PhotometricSequence.FrameRow row in rows)
+    {
+        if (row.Error != null || row.Stars == null) continue;
+        foreach (PhotometricSequence.StarPoint st in row.Stars)
+        {
+            sb.Append(row.Index).Append(',')
+              .Append(Num(row.Ut, "0.###")).Append(',')
+              .Append(SimulationClock.UtToUtc(row.Ut).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")).Append(',')
+              .Append(Num(row.Airmass, "0.######")).Append(',')
+              .Append(Num(row.SeeingZenith500Arcsec, "0.######")).Append(',')
+              .Append(Num(row.SeeingArcsec, "0.######")).Append(',')
+              .Append(Num(row.PwvMm, "0.######")).Append(',')
+              .Append(Num(row.TransitFactor, "0.#########")).Append(',')
+              .Append(row.Reliable ? "1" : "0").Append(',')
+              .Append(Num(st.RaDeg, "0.########")).Append(',')
+              .Append(Num(st.DecDeg, "0.########")).Append(',')
+              .Append(Num(st.ColourBv, "0.####")).Append(',')
+              .Append(Num(st.TrueMagnitude, "0.####")).Append(',')
+              .Append(Num(st.Snr, "0.###")).Append(',')
+              .Append(Num(st.FwhmPx, "0.#####")).Append(',')
+              .Append(Num(st.BackgroundElectrons, "0.###")).Append(',')
+              .Append(Num(st.FluxElectrons, "0.###"));
+
+            // A star measured before the radii were asked for has no columns for them, and an
+            // empty field says so rather than a zero, which would read as no light at all.
+            for (int k = 0; k < fixedR.Length; k++)
+                sb.Append(',').Append(k < st.FluxAtFixedRadii.Length
+                    ? Num(st.FluxAtFixedRadii[k], "0.###") : "");
+            for (int k = 0; k < fwhmR.Length; k++)
+                sb.Append(',').Append(k < st.FluxAtFwhmRadii.Length
+                    ? Num(st.FluxAtFwhmRadii[k], "0.###") : "");
+            sb.Append('\n');
+        }
+    }
+
+    return Results.File(System.Text.Encoding.UTF8.GetBytes(sb.ToString()), "text/csv",
+                        $"sequence-{seq.Id}-stars.csv");
 });
 
 /// <summary>
@@ -2342,6 +2445,7 @@ bool TryCaptureOne(CaptureRequestDto req, out CaptureStore.Stored stored, out De
         RequestedUt = bookedUt,
         Seed = seed,
         PsfColourGroups = Math.Clamp(req.PsfColourGroups ?? 0, 0, 16),
+        Noiseless = req.Noiseless ?? false,
         Seeing = BuildSeeingSeries(req.Seeing, double.IsNaN(bookedUt) ? nowUt : bookedUt,
                                    out string seeingError),
         StarOverrides = BuildStarOverrides(req.StarOverrides, out string tempError),
@@ -3534,6 +3638,7 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                 ZoomFactor = double.NaN,
                 Seed = seed,
                 PsfColourGroups = seq.PsfColourGroups,
+                Noiseless = seq.Noiseless,
                 Seeing = seq.Seeing,
                 StarOverrides = seq.StarOverrides,
                 HeldAirmass = seq.HoldAirmass,
@@ -3571,7 +3676,9 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
             FrameReduction.Result red = FrameReduction.Reduce(
                 science, prep,
                 apertureRadiusArcsec: seq.ApertureRadiusArcsec,
-                apertureRadiusInFwhm: seq.ApertureRadiusInFwhm);
+                apertureRadiusInFwhm: seq.ApertureRadiusInFwhm,
+                extraRadiiArcsec: seq.ExtraRadiiArcsec,
+                extraRadiiInFwhm: seq.ExtraRadiiInFwhm);
 
             // THE EPOCH OF A FRAME IS THE MIDDLE OF ITS EXPOSURE, not the instant the shutter
             // opened. prep.ObservedUt is when it opened: the transit factor recorded alongside is
@@ -3616,6 +3723,8 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                     {
                         RaDeg = m.RaDeg, DecDeg = m.DecDeg, ColourBv = m.ColourBv,
                         TrueMagnitude = m.TrueMagnitude, FluxElectrons = m.FluxElectrons, Snr = m.Snr,
+                        FwhmPx = m.FwhmPx, BackgroundElectrons = m.BackgroundElectrons,
+                        FluxAtFixedRadii = m.FluxAtFixedRadii, FluxAtFwhmRadii = m.FluxAtFwhmRadii,
                     }).ToList(),
             });
         }

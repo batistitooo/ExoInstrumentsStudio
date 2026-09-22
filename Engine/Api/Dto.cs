@@ -641,6 +641,7 @@ namespace ExoStudio.Api
             // this carried; anything more and each colour group went through a PSF built on its
             // own spectrum.
             psfColourGroups = s.PsfColourGroups,
+            noiseless = s.Noiseless,
             holdAirmass = double.IsFinite(s.HoldAirmass) ? s.HoldAirmass : (double?)null,
             starOverrides = s.StarOverrides == null || s.StarOverrides.Count == 0 ? null
                 : s.StarOverrides.Select(t => new
@@ -972,6 +973,33 @@ namespace ExoStudio.Api
         /// it used rather than picking silently.
         /// </summary>
         public double? ApertureRadiusInFwhm { get; set; }
+
+        /// <summary>
+        /// Extra apertures every star is also measured in on every frame, on the same pixels, and
+        /// exported by GET /api/sequences/{id}/stars.csv. Radii in arcsec, held fixed against the
+        /// seeing, which is what a pipeline uses.
+        ///
+        /// A curve against aperture radius costs ONE rendered sequence this way instead of one per
+        /// radius. Rendering is what a frame costs; measuring the same pixels in another circle is
+        /// a loop over the sources.
+        /// </summary>
+        public double[] ExtraRadiiArcsec { get; set; }
+
+        /// <summary>The same, as multiples of each frame's own measured width.</summary>
+        public double[] ExtraRadiiInFwhm { get; set; }
+
+        /// <summary>
+        /// Render every frame at its expectation: no photon noise, no read noise, no
+        /// scintillation draw. Fixed patterns and the whole detector chain stay.
+        ///
+        /// For measuring an AMPLITUDE this is not a convenience, it is the difference between one
+        /// frame and several hundred. The effect this program is used to measure is about a
+        /// millimagnitude and photon noise on a real star is tens of them a frame; averaging that
+        /// down costs everything and tells you nothing the physics did not already fix. Leave it
+        /// off for the injection-recovery half, where what a real night can measure IS the
+        /// question.
+        /// </summary>
+        public bool? Noiseless { get; set; }
 
         /// <summary>
         /// Render every frame at this airmass, whatever the field is really doing. Null takes the
@@ -1335,6 +1363,9 @@ namespace ExoStudio.Api
         /// nothing in its output would say why.
         /// </summary>
         public List<StarOverrideRequest> StarOverrides { get; set; }
+
+        /// <summary>Render at the expectation: no photon, read or scintillation draw. See the sequence's own.</summary>
+        public bool? Noiseless { get; set; }
 
         /// <summary>What the frame is of, for the FITS OBJECT keyword and the download name.</summary>
         public string ObjectName { get; set; }

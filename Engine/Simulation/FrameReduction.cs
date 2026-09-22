@@ -71,6 +71,30 @@ namespace ExoStudio.Simulation
             /// <summary>Measured aperture flux in electrons, and the total the forward model injected.</summary>
             public double FluxElectrons;
             public double TrueElectrons;
+
+            /// <summary>
+            /// THIS STAR'S OWN WIDTH, measured on the pixels by second moments, in pixels. Not the
+            /// seeing, and not the frame's mean: a pipeline regresses against what it measures,
+            /// and the point of this study is that the measurement differs star by star with
+            /// colour. NaN where the star was too faint to give a width.
+            /// </summary>
+            public double FwhmPx;
+
+            /// <summary>The local background under this star, electrons per pixel.</summary>
+            public double BackgroundElectrons;
+
+            /// <summary>
+            /// Flux in each of the caller's extra apertures, electrons, in the order asked for:
+            /// first the radii fixed in arcsec, then the radii taken as multiples of this frame's
+            /// own width. Empty when none were asked for.
+            ///
+            /// ONE RENDER, MANY RADII. A curve against aperture radius used to cost one rendered
+            /// sequence per radius. The rendering is what a frame costs; measuring the same pixels
+            /// in a second circle is a loop over the sources, so the radii belong here rather than
+            /// in the outer loop of a study.
+            /// </summary>
+            public double[] FluxAtFixedRadii = System.Array.Empty<double>();
+            public double[] FluxAtFwhmRadii = System.Array.Empty<double>();
         }
 
         public sealed class Result
@@ -92,6 +116,18 @@ namespace ExoStudio.Simulation
 
             /// <summary>How the radius was chosen, so a run never has to guess which it got.</summary>
             public string ApertureMode = "default, 0.68 FWHM";
+
+            /// <summary>
+            /// The extra apertures every matched star was also measured in, in pixels, in the same
+            /// order as Match.FluxAtFixedRadii then Match.FluxAtFwhmRadii. Recorded because a
+            /// radius in pixels is the only form that is unambiguous once the plate scale and the
+            /// frame's own width are both in play.
+            /// </summary>
+            public double[] FixedRadiiPx = System.Array.Empty<double>();
+            public double[] FwhmRadiiPx = System.Array.Empty<double>();
+
+            /// <summary>The multiples of this frame's width that produced FwhmRadiiPx.</summary>
+            public double[] FwhmRadiiMultiples = System.Array.Empty<double>();
             public double FwhmPx;
 
             /// <summary>
@@ -195,7 +231,9 @@ namespace ExoStudio.Simulation
                                     double thresholdSigma = DefaultThresholdSigma,
                                     double brightSnrFloor = 20.0,
                                     double apertureRadiusArcsec = double.NaN,
-                                    double apertureRadiusInFwhm = double.NaN)
+                                    double apertureRadiusInFwhm = double.NaN,
+                                    double[] extraRadiiArcsec = null,
+                                    double[] extraRadiiInFwhm = null)
         {
             var r = new Result
             {
@@ -219,6 +257,31 @@ namespace ExoStudio.Simulation
                                                   out double background, out double backgroundRms);
             r.BackgroundElectrons = background;
             r.BackgroundRmsElectrons = backgroundRms;
+
+            // THE THRESHOLD IS A SCALE, AND ON A NOISELESS FRAME THE MEASURED SCATTER IS ZERO.
+            //
+            // Detection works by asking which pixels stand a given number of sigma above the
+            // background, and sigma has always been the scatter measured on the frame. That is
+            // right for a frame with noise in it and undefined for one without: the scatter is
+            // exactly zero, AperturePhotometry.FindSources returns on it, and a perfectly good
+            // frame full of perfectly sharp stars reduces to nothing at all.
+            //
+            // The expected noise is still perfectly well defined, so it is what stands in: the
+            // photon and dark shot noise the sky WOULD have carried, plus the read noise, in
+            // quadrature. A noiseless frame is then detected at the same effective depth as its
+            // noisy twin, which is what makes the two comparable.
+            double detectionRms = backgroundRms;
+            if (!(detectionRms > 0.0))
+            {
+                double sky = Math.Max(0.0, prep.SkyElectronsPerPixel);
+                double dark = Math.Max(0.0, prep.Meta.DarkElectronsPerPixel);
+                double rn = Math.Max(0.0, prep.Spec.ReadNoiseElectrons);
+                detectionRms = Math.Sqrt(sky + dark + rn * rn);
+                if (detectionRms > 0.0)
+                    r.Notes.Add($"The frame carries no measurable background scatter, so detection "
+                              + $"used the noise it would have had, {detectionRms:F2} e- per pixel, "
+                              + "rather than the scatter it does not have.");
+            }
 
             // The aperture geometry is Core's own convention, so the measurement and the limiting
             // magnitude in DetectionLimits are talking about the same aperture: 0.68 FWHM radius
@@ -258,8 +321,23 @@ namespace ExoStudio.Simulation
             double inner = apertureRadiusPx * CcdEquation.SkyAnnulusInnerRadiusInAperture;
             double outer = apertureRadiusPx * CcdEquation.SkyAnnulusOuterRadiusInAperture;
 
+            // The extra apertures, resolved to pixels once. A radius in arcsec needs the plate
+            // scale; a radius in widths needs this frame's own width, which is why neither can be
+            // resolved by the caller.
+            double[] fixedRadiiPx = extraRadiiArcsec == null || prep.Meta.PlateScaleArcsec <= 0.0
+                ? Array.Empty<double>()
+                : extraRadiiArcsec.Where(v => v > 0.0)
+                                  .Select(v => v / prep.Meta.PlateScaleArcsec).ToArray();
+            double[] fwhmMultiples = extraRadiiInFwhm == null
+                ? Array.Empty<double>()
+                : extraRadiiInFwhm.Where(v => v > 0.0).ToArray();
+            double[] fwhmRadiiPx = fwhmMultiples.Select(v => v * fwhmPx).ToArray();
+            r.FixedRadiiPx = fixedRadiiPx;
+            r.FwhmRadiiPx = fwhmRadiiPx;
+            r.FwhmRadiiMultiples = fwhmMultiples;
+
             List<(int X, int Y)> peaks = AperturePhotometry.FindSources(
-                electrons, w, h, background, backgroundRms, thresholdSigma,
+                electrons, w, h, background, detectionRms, thresholdSigma,
                 minSeparationPx: Math.Max(2, (int)Math.Round(fwhmPx)));
             r.SourcesFound = peaks.Count;
 
@@ -505,8 +583,38 @@ namespace ExoStudio.Simulation
                 AperturePhotometry.Calibrate(s, zp, zpError, out double mag, out double magError);
                 double snr = s.FluxUncertainty > 0.0 ? s.Flux / s.FluxUncertainty : double.NaN;
 
+                // THE EXTRA APERTURES AND THE STAR'S OWN WIDTH, on the same pixels, in one pass.
+                //
+                // EACH APERTURE CARRIES ITS OWN SKY ANNULUS. Reusing the light curve's annulus
+                // here was wrong and quietly so: the annulus is placed at a fixed multiple of the
+                // aperture it belongs to, so an aperture wider than about 1.4 times the light
+                // curve's own swallows it. The background then came from pixels inside the star,
+                // was subtracted from the star, and the recovered flux turned over and fell with
+                // increasing radius. It showed up as a curve against radius that reversed at
+                // 3 FWHM, which is not a thing any profile does.
+                double AtRadius(double radiusPx) => AperturePhotometry.Measure(
+                    electrons, w, h, s.X, s.Y, radiusPx,
+                    radiusPx * CcdEquation.SkyAnnulusInnerRadiusInAperture,
+                    radiusPx * CcdEquation.SkyAnnulusOuterRadiusInAperture,
+                    prep.Spec.ReadNoiseElectrons, saturationElectrons).Flux;
+
+                var atFixed = new double[fixedRadiiPx.Length];
+                for (int k = 0; k < fixedRadiiPx.Length; k++) atFixed[k] = AtRadius(fixedRadiiPx[k]);
+
+                var atFwhm = new double[fwhmRadiiPx.Length];
+                for (int k = 0; k < fwhmRadiiPx.Length; k++) atFwhm[k] = AtRadius(fwhmRadiiPx[k]);
+
+                // Windowed at the sky annulus's inner edge, which is where the star's light is
+                // taken to stop; see MeasureFwhmPx on why the window is part of the definition.
+                double starFwhm = AperturePhotometry.MeasureFwhmPx(
+                    electrons, w, h, s.X, s.Y, s.Background, inner);
+
                 var m = new Match
                 {
+                    FwhmPx = starFwhm,
+                    BackgroundElectrons = s.Background,
+                    FluxAtFixedRadii = atFixed,
+                    FluxAtFwhmRadii = atFwhm,
                     TrueMagnitude = t.VMag,
                     RecoveredMagnitude = mag,
                     RecoveredUncertainty = magError,

@@ -44,6 +44,60 @@ namespace ExoInstruments.Core
             public bool Saturated;
         }
 
+        /// <summary>
+        /// The width of one star as MEASURED ON THE PIXELS, in pixels, from the second moments of
+        /// its background-subtracted light inside a window.
+        ///
+        /// WHY A MEASURED WIDTH IS A DIFFERENT QUANTITY FROM THE SEEING. A pipeline detrending a
+        /// light curve regresses against the width it measured on the field, not against the
+        /// seeing that was commanded: it has no access to the second. The two differ by the
+        /// diffraction core, by the detector's sampling, and star by star by colour, which is the
+        /// whole subject here. Anything claiming to reproduce what a pipeline does has to measure.
+        ///
+        /// SECOND MOMENTS, AND THE WINDOW IS PART OF THE DEFINITION. For a Gaussian the moment
+        /// width and the half-maximum width agree exactly through the 2*sqrt(2*ln 2) below. For a
+        /// real profile with Kolmogorov wings they do not: the wings carry moment out of
+        /// proportion to their height, so a wider window returns a wider star. That is not an
+        /// error to be corrected, it is what the estimator means, and it is why the window is an
+        /// argument rather than a constant. Report the window with the width.
+        ///
+        /// Pixels below the background are clipped to zero rather than allowed to contribute
+        /// negative moment, which on a faint star is the difference between a width and a NaN.
+        /// </summary>
+        public static double MeasureFwhmPx(float[] frame, int width, int height,
+                                           double centreX, double centreY,
+                                           double background, double windowPx)
+        {
+            if (frame == null || !(windowPx > 0.0)) return double.NaN;
+
+            int r0 = Math.Max(0, (int)Math.Floor(centreY - windowPx));
+            int r1 = Math.Min(height - 1, (int)Math.Ceiling(centreY + windowPx));
+            int c0 = Math.Max(0, (int)Math.Floor(centreX - windowPx));
+            int c1 = Math.Min(width - 1, (int)Math.Ceiling(centreX + windowPx));
+
+            double sum = 0.0, mxx = 0.0, myy = 0.0;
+            double w2 = windowPx * windowPx;
+            for (int y = r0; y <= r1; y++)
+            {
+                double dy = y - centreY;
+                for (int x = c0; x <= c1; x++)
+                {
+                    double dx = x - centreX;
+                    double d2 = dx * dx + dy * dy;
+                    if (d2 > w2) continue;
+                    double v = frame[y * width + x] - background;
+                    if (!(v > 0.0)) continue;
+                    sum += v;
+                    mxx += v * dx * dx;
+                    myy += v * dy * dy;
+                }
+            }
+            if (!(sum > 0.0)) return double.NaN;
+
+            double sigma2 = 0.5 * (mxx / sum + myy / sum);
+            return sigma2 > 0.0 ? 2.3548200450309493 * Math.Sqrt(sigma2) : double.NaN;
+        }
+
         // ------------------------------------------------------------------ aperture geometry
 
         /// <summary>

@@ -1321,6 +1321,57 @@ spectrum path weights the sub-bands to within **0.0 pm** of the blackbody path, 
 that would catch a units mistake; and a notch cut across the blue half of the delivered band moves
 the effective wavelength 4.4 nm redward, which no temperature can reproduce.
 
+### One row per frame and per star, and as many apertures as the study asks for
+
+The sequence export is a light curve: one ratio a frame, the target over its ensemble, already
+formed. That is the right shape for plotting a transit and the wrong shape for asking why the ratio
+moved. `GET /api/sequences/{id}/stars.csv` is the measurement underneath it, before anything is
+divided: every star the reduction matched, on every frame, with its own flux, its own MEASURED
+width, its own background, and its flux in every extra aperture the run asked for.
+
+`AperturePhotometry.MeasureFwhmPx` is the width, from the second moments of the star's own
+background-subtracted light. A pipeline regresses against what it measured, not against the seeing
+that was commanded; it has no access to the second. The window is an argument and not a constant,
+because on a profile with wings the moment width depends on it: measured on a theta^(-11/3) profile
+here, 6.18 px in an 8 px window against 10.22 px in a 24 px one. Report the window with the width.
+
+Extra apertures are `extraRadiiArcsec` and `extraRadiiInFwhm`, at most 32 of each. A curve against
+aperture radius then costs ONE rendered sequence instead of one per radius, which for the grid this
+program was extended for is a factor of fourteen.
+
+EACH APERTURE CARRIES ITS OWN SKY ANNULUS, and the first version did not. The annulus sits at a
+fixed multiple of the aperture it belongs to, so an aperture wider than about 1.4 times the light
+curve's own swallowed it: the background came from pixels inside the star and was subtracted from
+the star, and the recovered flux turned over and FELL with increasing radius. Section 29 of the
+harness pins both, and the failing arrangement is kept in it as the check that the fix is doing
+something: with its own annulus the flux rises and converges, 17.6 to 28.3 million electrons over
+3 to 16 px; sharing a tight aperture's annulus, it peaks at 27.7 and comes back down to 25.9.
+
+### A detector without the dice
+
+`noiseless` on a capture or a sequence renders the frame at its EXPECTATION. Three draws go, and
+they are all of them on this path: the scintillation multiplier, whose mean is exactly 1; the
+Poisson on signal plus dark, whose mean is its rate; and the read noise, whose mean is zero. What
+stays is everything that is not a draw: the fixed patterns, the blooming, the saturation, the
+non-linearity, the charge-transfer smear and the converter's ceiling. A noiseless frame is not an
+idealised frame, it is the same frame without the dice.
+
+It exists because an AMPLITUDE does not need noise. The effect this program was extended to measure
+is about a millimagnitude; photon noise on a real star is tens of them a frame, so recovering the
+amplitude from noisy frames means averaging hundreds per grid point for a number the physics
+already fixes exactly. Measured on the same pair of runs, the uncertainty on a differential
+measurement falls from 12 mmag to 0.05 mmag, a factor of 247, and frame-to-frame repeatability
+comes out at 3.3e-4 of the flux. Noise belongs in the injection-recovery half of a study, where
+what a real night can measure IS the question, and nowhere else.
+
+ONE THING HAD TO CHANGE DOWNSTREAM. Detection asks which pixels stand a given number of sigma above
+the background, and sigma was always the scatter measured on the frame. On a noiseless frame that
+scatter is exactly zero, `AperturePhotometry.FindSources` returns on it, and a perfectly good frame
+full of perfectly sharp stars reduces to nothing at all. The EXPECTED noise is still well defined,
+so it stands in: the photon and dark shot noise the sky would have carried, plus the read noise, in
+quadrature. The frame then detects at the same effective depth as its noisy twin, which is what
+makes the two comparable, and the reduction says in its notes when it had to do this.
+
 ## 5.9 Water vapour
 
 `Engine/Simulation/PwvTransmission.cs`, `Engine/Simulation/PwvSeries.cs`, `tools/fetch_pwv_grid.py`,

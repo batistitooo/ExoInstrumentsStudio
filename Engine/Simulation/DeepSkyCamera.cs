@@ -254,6 +254,30 @@ namespace ExoStudio.Simulation
             public double HeldAirmass = double.NaN;
 
             /// <summary>
+            /// Render the frame at its EXPECTATION: every random draw replaced by its mean, so the
+            /// same request twice gives the same pixels to the last bit and one frame carries what
+            /// a thousand averaged frames would.
+            ///
+            /// WHY A STUDY NEEDS THIS. The effect under measurement here is about a millimagnitude.
+            /// Photon noise on a realistic star is tens of millimagnitudes a frame, so recovering
+            /// the amplitude from noisy frames means averaging hundreds of them, per grid point,
+            /// for a number the physics already determines exactly. The noise adds nothing to an
+            /// AMPLITUDE and costs everything; it belongs in the injection-recovery half of the
+            /// study, where the question is what a real night can measure, and nowhere else.
+            ///
+            /// Three draws go, and they are all of them on this path: scintillation, the Poisson
+            /// on signal plus dark, and the read noise. Everything else that looks like noise is
+            /// FIXED PATTERN, already deterministic from the instrument and the binning, and it
+            /// stays: a flat field is part of the optics, not part of the weather.
+            ///
+            /// What does NOT go is the detector's physics. Blooming, saturation, non-linearity,
+            /// charge-transfer smear and the converter's ceiling are all still applied, to the
+            /// expected charge. A noiseless frame is not an idealised frame, it is the same frame
+            /// without the dice.
+            /// </summary>
+            public bool Noiseless;
+
+            /// <summary>
             /// Effective temperatures to impose on stars of this field, overriding what their
             /// colour indices imply. Null or empty leaves every star as the catalogue has it.
             ///
@@ -577,6 +601,9 @@ namespace ExoStudio.Simulation
             public OrbitalPlatforms.Platform Platform;
             public OrbitalPlatforms.State PlatformState;
             public PointingBudget Pointing;
+
+            /// <summary>Every draw replaced by its mean; see DeepSkyCamera.Request.Noiseless.</summary>
+            public bool Noiseless;
 
             public CameraFilter Filter;
             public double ExposureSeconds;
@@ -1042,8 +1069,13 @@ namespace ExoStudio.Simulation
                                        ? (req.Site?.ScintillationSiteCoefficient ?? double.NaN)
                                        : req.ScintillationSiteCoefficient);
             var rngScint = new Pcg32(req.Seed, Pcg32.StreamScintillation);
-            double scint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
-            double starScint = space ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
+            // At its expectation a scintillation multiplier is exactly 1: the relation gives the
+            // WIDTH of the distribution, and its mean is unity by construction, so a noiseless
+            // frame is not merely quieter here, it is unbiased.
+            double scint = space || req.Noiseless
+                ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
+            double starScint = space || req.Noiseless
+                ? 1.0 : Math.Max(0.0, 1.0 + NoiseSampler.Gaussian(rngScint, scintSigma));
 
             const double nonAtmTransmission = 1.0;   // no cloud, no ND filter here
 
@@ -1540,6 +1572,7 @@ namespace ExoStudio.Simulation
                 Tracking = req.Tracking || space,
                 DetectorTemperatureCelsius = detectorTempC,
                 ZoomFactor = zoom,
+                Noiseless = req.Noiseless,
                 Signal = signal,
                 W = w,
                 H = h,
@@ -1630,9 +1663,17 @@ namespace ExoStudio.Simulation
             // VisualTelescopeSpec.FrameTransferSeconds for which architectures those are.
             ChargeTransferSmear.Add(light, p.W, p.H, p.SmearConstant, ChargeTransferSmear.ReadoutAxis.Columns);
 
+            // THE MEAN OF A POISSON DRAW IS ITS RATE, so the noiseless branch is the rate itself
+            // and not a rounded one: charge is counted in whole electrons on a real detector, but
+            // the expectation of that count is a real number and rounding it would put a
+            // quantisation floor of half an electron per pixel back into a frame built to have
+            // none.
             var rng = new Pcg32(seed, Pcg32.StreamShotNoise);
-            for (int i = 0; i < n; i++)
-                raw[i] = (float)NoiseSampler.Poisson(rng, light[i] + p.DarkElectronsPerPixel);
+            if (p.Noiseless)
+                for (int i = 0; i < n; i++) raw[i] = (float)(light[i] + p.DarkElectronsPerPixel);
+            else
+                for (int i = 0; i < n; i++)
+                    raw[i] = (float)NoiseSampler.Poisson(rng, light[i] + p.DarkElectronsPerPixel);
 
             ApplyBlooming(raw, p.W, p.H, (float)p.FullWellElectrons);
 
@@ -1673,7 +1714,7 @@ namespace ExoStudio.Simulation
 
                 e += SensorNonUniformity.OffsetElectrons(p.OffsetMap, i);
 
-                e += NoiseSampler.Gaussian(rngRead, p.Spec.ReadNoiseElectrons);
+                if (!p.Noiseless) e += NoiseSampler.Gaussian(rngRead, p.Spec.ReadNoiseElectrons);
                 // COUNTED BEFORE THE CLIP, which is the whole point: after Math.Min the evidence
                 // that this pixel ran off the top of the converter is gone.
                 double counts = Math.Floor(e / p.ElectronsPerAdu + p.BiasAdu);
