@@ -271,8 +271,12 @@ namespace ExoStudio.Data
             return hits
                 .Select(s =>
                 {
-                    double? teff = StellarColor.TeffFromColorIndexBV(
-                        double.IsNaN(s.ColorIndexBV) ? null : s.ColorIndexBV);
+                    // The star's own temperature, which is the catalogue's fit when the
+                    // parameters sidecar is installed and Ballesteros on the clamped colour
+                    // when it is not. One definition, RenderedStar.EffectiveTeffK, so the
+                    // number a chart shows is the number a frame is rendered with.
+                    double eff = s.EffectiveTeffK;
+                    double? teff = double.IsNaN(eff) ? (double?)null : eff;
                     return new Neighbour
                     {
                         RaDeg = s.RaDeg,

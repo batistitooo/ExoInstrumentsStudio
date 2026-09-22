@@ -4257,6 +4257,30 @@ Section("27. A star's temperature, when the catalogue's colour cannot reach it")
           Math.Abs(field27[0].EffectiveTeffK - floorK) < 1e-9,
           $"{field27[0].EffectiveTeffK:F0} K from B-V 2.0");
 
+    // THE CATALOGUE'S OWN FIT BEATS THE COLOUR, because the colour is clamped and the fit is not.
+    var fitted27 = new RenderedStar { RaDeg = 0, DecDeg = 0, VMag = 12.0,
+                                      ColorIndexBV = 2.0, CatalogueTeffK = 2600.0 };
+    Check("the catalogue's own temperature is preferred to the clamped colour",
+          Math.Abs(fitted27.EffectiveTeffK - 2600.0) < 1e-9,
+          $"{fitted27.EffectiveTeffK:F0} K against the colour's {floorK:F0} K floor");
+
+    // AND BOTH ARE BEATEN BY AN EXPLICIT OVERRIDE, which is what a study states deliberately.
+    var both27 = new RenderedStar { RaDeg = 0, DecDeg = 0, VMag = 12.0, ColorIndexBV = 2.0,
+                                    CatalogueTeffK = 3000.0, OverrideTeffK = 2600.0 };
+    Check("and an explicit override is preferred to the catalogue's fit",
+          Math.Abs(both27.EffectiveTeffK - 2600.0) < 1e-9, $"{both27.EffectiveTeffK:F0} K");
+
+    // THE WIDTH AND THE FLUX AGREE ABOUT REDDENING, which they did not when EffectiveTeffK read
+    // the observed colour while CollectedElectrons dereddened first. On a reddened star that gave
+    // one temperature for the brightness and a cooler one for the image width.
+    var reddened27 = new RenderedStar { RaDeg = 0, DecDeg = 0, VMag = 13.0,
+                                        ColorIndexBV = 0.978, ReddeningEBv = 0.30 };
+    double? intrinsic27 = ReddenedStarSpectrum.IntrinsicTeffK(0.978, 0.30);
+    Check("a reddened star's width uses the same intrinsic temperature its flux does",
+          intrinsic27.HasValue && Math.Abs(reddened27.EffectiveTeffK - intrinsic27.Value) < 1e-9,
+          $"{reddened27.EffectiveTeffK:F0} K intrinsic against "
+          + $"{StellarColor.TeffFromColorIndexBV(0.978) ?? double.NaN:F0} K from the observed colour");
+
     var temps27 = new List<DeepSkyCamera.StarOverride>
     {
         new DeepSkyCamera.StarOverride { HasPosition = true, RaDeg = 280.0, DecDeg = 38.0,

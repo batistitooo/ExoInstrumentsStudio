@@ -66,6 +66,23 @@ namespace ExoInstruments.Core
         public SpectralCurve OverrideSpectrum;
 
         /// <summary>
+        /// The effective temperature the CATALOGUE carries for this star, from Gaia's own
+        /// astrophysical-parameters sidecar, or NaN when no sidecar is installed or the star was
+        /// never fitted. Kelvin.
+        ///
+        /// This is the honest temperature and the colour index is not. B-V is clamped at 2.0 in
+        /// the packed file, a floor of 3169 K through Ballesteros, which excludes every M dwarf a
+        /// transit survey actually observes. The sidecar carries teff_gspphot as a uint16 in
+        /// kelvin, bounded only at 0 and 65535, so it reaches the stars the colour cannot.
+        ///
+        /// It is a FITTED quantity, not a measured one, and Gaia's own documentation is clear
+        /// that GSP-Phot is least reliable for the coolest dwarfs. Good enough for a comparison
+        /// ensemble, where thirty of them average; not good enough for the target of a study
+        /// about the target's own colour, which is what OverrideSpectrum is for.
+        /// </summary>
+        public double CatalogueTeffK;
+
+        /// <summary>
         /// The temperature to use for this star: the override when there is one, otherwise
         /// Ballesteros from the colour index, otherwise NaN for a star with no usable colour.
         /// One definition, so the image width and the band integral cannot disagree.
@@ -75,7 +92,25 @@ namespace ExoInstruments.Core
             get
             {
                 if (!double.IsNaN(OverrideTeffK) && OverrideTeffK > 0.0) return OverrideTeffK;
-                double? t = StellarColor.TeffFromColorIndexBV(HasColor ? ColorIndexBV : (double?)null);
+
+                // THE CATALOGUE'S OWN FIT BEFORE THE COLOUR, because the colour is clamped and
+                // the fit is not. Ballesteros on a B-V of 2.0 cannot return below 3169 K whatever
+                // the star is; teff_gspphot says 2600 when the star is 2600.
+                if (!double.IsNaN(CatalogueTeffK) && CatalogueTeffK > 0.0) return CatalogueTeffK;
+
+                if (!HasColor) return double.NaN;
+
+                // DEREDDENED WHEN THE REDDENING IS KNOWN, because the catalogue's colour is an
+                // OBSERVED one and StellarPhotometry.CollectedElectrons has always dereddened
+                // before it picks a temperature. Reading the raw colour here would give a star
+                // one temperature for its brightness and a cooler one for its image width, which
+                // is the disagreement this property exists to prevent. On a reddened G star the
+                // gap is hundreds of kelvin: the catalogue's own fit, which solves for the
+                // extinction, puts one V = 13.4 star in a TRAPPIST-1 field at 5743 K where the
+                // raw colour says 4796.
+                double? t = HasReddening
+                    ? ReddenedStarSpectrum.IntrinsicTeffK(ColorIndexBV, ReddeningEBv)
+                    : StellarColor.TeffFromColorIndexBV(ColorIndexBV);
                 return t ?? double.NaN;
             }
         }
@@ -124,6 +159,27 @@ namespace ExoInstruments.Core
     public sealed class RenderedStarCatalog : IDisposable
     {
         private static readonly byte[] Magic = { (byte)'E', (byte)'X', (byte)'O', (byte)'S', (byte)'T', (byte)'A', (byte)'R', (byte)'1' };
+
+        /// <summary>The astrophysical-parameters sidecar, written beside the catalogue by the packer.</summary>
+        private static readonly byte[] ApMagic = { (byte)'E', (byte)'X', (byte)'O', (byte)'S', (byte)'T', (byte)'A', (byte)'P', (byte)'1' };
+        private const int ApRecordBytes = 6;        // float32 parallax, uint16 kelvin
+        private const int ApHeaderBytes = 8 + 12 + 4;
+
+        private MemoryMappedFile apMapping;
+        private MemoryMappedViewAccessor apView;
+
+        /// <summary>
+        /// Whether the sidecar is mapped and being used. False is not a failure: the catalogue
+        /// works without it and every star then falls back to its colour index.
+        /// </summary>
+        public bool HasAstrophysicalParameters => apView != null;
+
+        /// <summary>
+        /// Why the sidecar is not in use, when it is not. Null when it is, or when there is no
+        /// sidecar beside the catalogue at all. A sidecar that IS there and cannot be used is the
+        /// case worth a sentence: it means ten gigabytes of real temperatures are sitting unread.
+        /// </summary>
+        public string AstrophysicalParametersNote { get; private set; }
 
         // Must match tools/pack_gaia_catalog.py, which writes the file.
         private const int FormatVersion = 3;
@@ -233,6 +289,118 @@ namespace ExoInstruments.Core
 
             mapping = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
             view = mapping.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+
+            LoadAstrophysicalParameters(SidecarPathFor(path, ".ap"));
+        }
+
+        /// <summary>
+        /// Where a sidecar sits for a catalogue reached at <paramref name="path"/>.
+        ///
+        /// BESIDE THE REAL FILE, NOT BESIDE THE LINK. A catalogue is very often reached through a
+        /// symbolic link: one build of it on a big disk, linked into wherever each consumer looks
+        /// for it. The sidecars are written beside the build, by the packer, in one pass, so
+        /// appending ".ap" to the link's own path looks in the wrong directory and finds nothing.
+        /// The failure is silent in the worst way, because a missing sidecar is legitimate: every
+        /// star quietly falls back to its colour index and ten gigabytes of real temperatures go
+        /// unread with nothing said.
+        ///
+        /// So the link is resolved first, and only if that finds nothing is the literal path
+        /// tried, which is the plain non-link case.
+        /// </summary>
+        private static string SidecarPathFor(string path, string suffix)
+        {
+            try
+            {
+                FileSystemInfo target = File.ResolveLinkTarget(path, returnFinalTarget: true);
+                if (target != null)
+                {
+                    string beside = target.FullName + suffix;
+                    if (File.Exists(beside)) return beside;
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            return path + suffix;
+        }
+
+        /// <summary>
+        /// Map the astrophysical-parameters sidecar, if it is there and if it belongs to this
+        /// catalogue. Six bytes a star, record for record with the main file.
+        ///
+        /// CHECKED AGAINST THE CATALOGUE IT CLAIMS TO BELONG TO, which is what its header is for:
+        /// a sidecar holding a different star count or a different band width is a different
+        /// build, and using it would shift every temperature by some number of stars and hand
+        /// each one its neighbour's. That is exactly the kind of error nothing downstream could
+        /// detect, so a mismatch is REFUSED and said out loud rather than papered over.
+        ///
+        /// Absent is not an error. The catalogue has always worked without it and every star then
+        /// falls back to its colour index, which is what happened before the sidecar was read at
+        /// all.
+        /// </summary>
+        private void LoadAstrophysicalParameters(string apPath)
+        {
+            AstrophysicalParametersNote = null;
+            if (!File.Exists(apPath)) return;
+
+            try
+            {
+                long apLength;
+                using (var stream = File.OpenRead(apPath))
+                using (var reader = new BinaryReader(stream))
+                {
+                    byte[] magic = reader.ReadBytes(ApMagic.Length);
+                    for (int i = 0; i < ApMagic.Length; i++)
+                    {
+                        if (magic.Length != ApMagic.Length || magic[i] != ApMagic[i])
+                        {
+                            AstrophysicalParametersNote =
+                                "a file sits beside the catalogue named like its parameters sidecar "
+                              + "but does not carry its signature, so it is not being read";
+                            return;
+                        }
+                    }
+
+                    int apVersion = reader.ReadInt32();
+                    int apCount = reader.ReadInt32();
+                    int apBands = reader.ReadInt32();
+                    float apBandWidth = reader.ReadSingle();
+                    apLength = stream.Length;
+
+                    if (apVersion != 1)
+                    {
+                        AstrophysicalParametersNote = $"parameters sidecar is version {apVersion}, which this does not read";
+                        return;
+                    }
+                    if (apCount != count || apBands != bandCount
+                        || Math.Abs(apBandWidth - bandWidthDeg) > 1e-6)
+                    {
+                        AstrophysicalParametersNote =
+                            $"parameters sidecar describes {apCount:N0} stars in {apBands} bands and this "
+                          + $"catalogue has {count:N0} in {bandCount}, so they are different builds and "
+                          + "pairing them would give every star its neighbour's temperature";
+                        return;
+                    }
+                }
+
+                long need = ApHeaderBytes + (long)count * ApRecordBytes;
+                if (apLength < need)
+                {
+                    AstrophysicalParametersNote =
+                        $"parameters sidecar is truncated: {count:N0} stars need {need:N0} bytes and the "
+                      + $"file is {apLength:N0}";
+                    return;
+                }
+
+                apMapping = MemoryMappedFile.CreateFromFile(apPath, FileMode.Open, null, 0,
+                                                            MemoryMappedFileAccess.Read);
+                apView = apMapping.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            }
+            catch (IOException ex)
+            {
+                AstrophysicalParametersNote = "parameters sidecar could not be opened: " + ex.Message;
+                apView = null;
+                apMapping = null;
+            }
         }
 
         /// <summary>
@@ -247,8 +415,12 @@ namespace ExoInstruments.Core
         {
             view?.Dispose();
             mapping?.Dispose();
+            apView?.Dispose();
+            apMapping?.Dispose();
             view = null;
             mapping = null;
+            apView = null;
+            apMapping = null;
             count = 0;
         }
 
@@ -343,6 +515,16 @@ namespace ExoInstruments.Core
                 short bvMilli = view.ReadInt16(at + 10);
                 ushort ebvMilli = hasReddening ? view.ReadUInt16(at + 12) : EbvUnknown;
 
+                // The catalogue's own temperature, from the sidecar, read only for a star that
+                // survived both cuts. Zero is the packer's "never fitted" and becomes NaN here,
+                // so the colour index takes over for that star and for no other.
+                double teffK = double.NaN;
+                if (apView != null)
+                {
+                    ushort teffKelvin = apView.ReadUInt16(ApHeaderBytes + (long)i * ApRecordBytes + 4);
+                    if (teffKelvin > 0) teffK = teffKelvin;
+                }
+
                 results.Add(new RenderedStar
                 {
                     RaDeg = starRaDeg,
@@ -350,6 +532,7 @@ namespace ExoInstruments.Core
                     VMag = vMagMilli / 1000.0 - VMagOffset,
                     ColorIndexBV = bvMilli == BvUnknown ? double.NaN : bvMilli / 1000.0,
                     ReddeningEBv = ebvMilli == EbvUnknown ? double.NaN : ebvMilli / 1000.0,
+                    CatalogueTeffK = teffK,
                 });
             }
         }

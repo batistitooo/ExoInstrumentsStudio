@@ -36,7 +36,16 @@ namespace ExoStudio.Simulation
 
         public bool IsLoaded => Catalog != null && Catalog.IsLoaded;
 
-        public string Describe() => $"{Name}, all sky, {Count:N0} stars";
+        public string Describe()
+        {
+            string ap = Catalog == null ? ""
+                : Catalog.HasAstrophysicalParameters
+                    ? ", with the catalogue's own temperatures"
+                    : Catalog.AstrophysicalParametersNote != null
+                        ? ", WITHOUT temperatures: " + Catalog.AstrophysicalParametersNote
+                        : ", temperatures from the colour index";
+            return $"{Name}, all sky, {Count:N0} stars{ap}";
+        }
     }
 
     /// <summary>

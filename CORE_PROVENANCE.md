@@ -263,6 +263,33 @@ target has, so a study run without it would have under-measured a colour effect 
 
 **The mod holds the same clamp**, and the same catalogue file, so it gains the same reach.
 
+A third field, `CatalogueTeffK`, and the sidecar it comes from. `tools/build_allsky_catalog.py`
+writes `GaiaAllSky.starcat.ap` beside the catalogue: six bytes a star, a float32 parallax and a
+uint16 temperature in kelvin, record for record with the main file, bounded only at 0 and 65535.
+It is Gaia's own `teff_gspphot`, it reaches below the colour's 3169 K floor, and NOTHING IN THE
+PROGRAM OPENED IT. Ten gigabytes of measured temperatures sat beside a clamped colour index that
+was being used instead.
+
+It is mapped now, validated against the catalogue it claims to belong to by star count and band
+width, and refused with a sentence when those disagree, because pairing two builds would hand
+every star its neighbour's temperature. Absent is not an error: the colour takes over, which is
+what happened before.
+
+THE SIDECAR IS FOUND BESIDE THE REAL FILE, not beside the link. A catalogue is usually reached
+through a symbolic link, one build on a big disk linked into wherever each consumer looks, and the
+packer writes the sidecars beside the build. Appending the suffix to the link's own path looks in
+the wrong directory and finds nothing, silently, because a missing sidecar is legitimate. This
+cost an afternoon before it was noticed.
+
+Evidence, measured on a real field: over 8.5 arcmin around TRAPPIST-1 to V = 18, **40 of 41 stars**
+carry a fitted temperature, and it differs from the clamped colour's by up to 947 K.
+
+And `EffectiveTeffK` DEREDDENS, which it did not at first. `StellarPhotometry.CollectedElectrons`
+has always dereddened before choosing a temperature, so reading the raw colour here gave a star
+one temperature for its brightness and a cooler one for its image width. On the V = 13.4 star
+above, the observed colour says 4796 K, the dereddened one 5678 K, and Gaia's own fit 5743 K:
+the correction recovers nearly all of the difference, which is how it was found.
+
 A second field came with it, `OverrideSpectrum`, and a single `EffectiveTeffK` that both consumers
 read. A temperature is not enough for the coolest stars: a blackbody at 2600 K has no water, no TiO
 and no VO, and those bands carve the blue half of an I+z' passband while leaving the red half
