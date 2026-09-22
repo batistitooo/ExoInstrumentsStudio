@@ -4520,6 +4520,101 @@ Section("29. A star's width measured on its own pixels, and an aperture that car
           !sharedRises, "the background is taken from inside the star and subtracted from it");
 }
 
+Section("30. The kernel this program builds is the profile the atmosphere makes");
+{
+    // THE ONE CHECK THE WHOLE COLOUR STUDY RESTS ON. Everything downstream measures how much light
+    // a circle catches, which is a statement about the PROFILE and nothing else. If the kernel is
+    // not the long-exposure atmospheric profile, no aperture curve measured through it means
+    // anything, and the failure would be invisible: a Gaussian-ish kernel makes perfectly
+    // plausible stars and perfectly wrong wings.
+    //
+    // The reference is an INDEPENDENT implementation, in another language, from the transfer
+    // function rather than from a kernel: scripts/analytic.py in the ember project evaluates
+    // EE(r) = 2 pi r integral MTF(u) J1(2 pi u r) du with MTF(u) = exp(-3.44 u^(5/3)), Fried
+    // (1966), by quadrature, and finds the profile's own FWHM at 0.975534 lambda/r0 against the
+    // 0.976 usually quoted. Nothing here consults it at run time; the numbers are pinned so that
+    // a change on either side has to be explained.
+    //
+    // RENORMALISED AT THE KERNEL'S OWN REACH, WHICH IS WHAT THIS PROGRAM BUILDS. The kernel stops
+    // where the profile has fallen to AtmosphericTailFraction of its peak, 6.40 FWHM at the
+    // sampling below, and is then normalised to unit sum. A Kolmogorov profile still has 0.419 per
+    // cent of its light beyond 6.40 FWHM, and that light is put back inside, so the reference is
+    // the analytic profile divided by its own value there. Compared against the raw profile
+    // instead, every number below sits high by about that 0.4 per cent, which is how the
+    // renormalisation was identified rather than mistaken for a shape error.
+    //
+    // KernelRadiusInFwhm is 3 and MaxKernelRadiusPx is 128, and the FIRST version of this check
+    // sampled at 0.02 arcsec so the ceiling bound at 2.56 FWHM. Every encircled energy then came
+    // out high by a further per cent and the check failed for a reason that was entirely its own.
+    //
+    // AND THE RENORMALISATION COSTS THE EFFECT NOTHING, which is worth knowing rather than
+    // worrying about: it is the same constant for every star, because every star has the same
+    // profile shape, so it cancels out of the ratio of ratios the effect is defined as. Checked
+    // over 0.75 to 2.5 FWHM in the ember notebook and identical to ten decimal places. What the
+    // truncation does cost is REACH: an aperture wider than the kernel cannot be asked about.
+    //
+    // DIFFRACTION IS MADE NEGLIGIBLE RATHER THAN SUBTRACTED, by asking for a ten-metre aperture:
+    // the Airy core is then 0.017 arcsec against 1 arcsec of seeing, so what is left to compare is
+    // the atmosphere alone. On a real half-metre the two are not separable, and that is the
+    // subject of the aperture-diameter result rather than of this check.
+    (double R, double Ee)[] kolmogorov30 =
+    {
+        (0.50, 0.423531364), (0.75, 0.677100272), (1.00, 0.827510615),
+        (1.25, 0.901971763), (1.50, 0.938325265), (2.00, 0.969121433),
+    };
+
+    // 20 px per FWHM, so 3 FWHM is 60 px and the 128 px ceiling does not bind. At the 0.02 arcsec
+    // pixels tried first it did, capping the kernel at 2.56 FWHM, and every encircled energy came
+    // out high by the flux that was missing from the normalisation.
+    const double seeing30 = 1.0, plate30 = 0.05, centre30 = 700e-9;
+    ChromaticSubBand[] mono30 = { new ChromaticSubBand { WavelengthMeters = centre30, Weight = 1.0 } };
+    float[] kernel30 = OpticalPsf.BuildChromaticKernel(
+        plate30, 10.0, 0.0, seeing30, centre30, 0.0, 0, 0.0, null, mono30, out int radius30);
+
+    double Ee30(double rPx)
+    {
+        int side = 2 * radius30 + 1;
+        double inside = 0.0, total = 0.0;
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+            {
+                double v = kernel30[y * side + x];
+                total += v;
+                double dx = x - radius30, dy = y - radius30;
+                if (dx * dx + dy * dy <= rPx * rPx) inside += v;
+            }
+        return total > 0.0 ? inside / total : double.NaN;
+    }
+
+    double fwhmPx30 = seeing30 / plate30;
+    double worst30 = 0.0;
+    Console.WriteLine($"         kernel radius {radius30} px, {fwhmPx30:F0} px per FWHM, "
+                    + $"reaching {radius30 / fwhmPx30:F2} FWHM");
+    Console.WriteLine("         r/FWHM   Studio        analytic      difference");
+    foreach ((double r, double want) in kolmogorov30)
+    {
+        double got = Ee30(r * fwhmPx30);
+        worst30 = Math.Max(worst30, Math.Abs(got - want));
+        Console.WriteLine($"         {r,-8:F2} {got,-13:F6} {want,-13:F6} {(got - want):+0.000000;-0.000000}");
+    }
+
+    // A PART IN A THOUSAND, and the budget is discretisation rather than physics: 20 px per FWHM
+    // with a hard pixel-centre test for the circle, against a quadrature with no grid at all.
+    Check("the chromatic kernel's encircled energy is the Kolmogorov profile's",
+          worst30 < 0.002,
+          $"worst disagreement {worst30:F6} over 0.5 to 2 FWHM, against an independent quadrature "
+          + "of Fried's transfer function in another language");
+
+    // AND IT IS NOT A GAUSSIAN, which is the failure this is really guarding against. Compared at
+    // one FWHM, where a truncated Kolmogorov still has a sixth of its light outside and a Gaussian
+    // has a sixteenth.
+    double gauss1 = 1.0 - Math.Exp(-0.5 * Math.Pow(2.0 * Math.Sqrt(2.0 * Math.Log(2.0)), 2.0));
+    double kolm1 = Ee30(fwhmPx30);
+    Check("and it is emphatically not a Gaussian, which is what the wings are for",
+          gauss1 - kolm1 > 0.05,
+          $"{kolm1:F4} at one FWHM against a Gaussian's {gauss1:F4}: "
+          + $"{(1.0 - kolm1) / (1.0 - gauss1):F1} times as much light still outside");
+}
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

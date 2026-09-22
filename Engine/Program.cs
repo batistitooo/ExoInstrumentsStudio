@@ -2531,6 +2531,21 @@ app.MapPost("/api/capture", (CaptureRequestDto req) =>
         // bin*bin while leaving the converter's ceiling exactly where it was.
         saturatedByConverterFraction = r.SaturatedByConverterFraction,
         psfKernelRadiusPx = r.PsfKernelRadiusPx,
+
+        // THE COLOUR GROUPS AND THE WAVELENGTH EACH ONE'S KERNEL WAS BUILT ON. Without this a
+        // study measuring a colour effect has to GUESS the separation it imposed, and a guess is
+        // the one thing a validation cannot contain: the whole quantity under test scales with
+        // the ratio of two of these numbers. Empty when the stars were not split.
+        psfGroups = r.PsfGroupTeffK.Length == 0 ? null
+            : Enumerable.Range(0, r.PsfGroupTeffK.Length).Select(i => new
+              {
+                  teffK = Finite(r.PsfGroupTeffK[i]),
+                  lambdaEffNm = Finite(r.PsfGroupLambdaEffMeters[i] * 1e9),
+                  stars = r.PsfGroupStarCount[i],
+                  fromSpectrum = i < r.PsfGroupFromSpectrum.Length && r.PsfGroupFromSpectrum[i],
+              }).ToArray(),
+        starsWithImposedTemperature = r.StarsWithImposedTemperature,
+        starsWithoutColour = r.StarsWithoutColour,
         computeMs = r.ComputeMs,
         observedUtc = r.ObservedUtc,
 

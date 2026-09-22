@@ -507,6 +507,16 @@ namespace ExoStudio.Simulation
             public int[] PsfGroupStarCount = System.Array.Empty<int>();
 
             /// <summary>
+            /// Whether each group's kernel was weighted by a TABULATED SPECTRUM rather than by a
+            /// blackbody at its temperature. Exposed because the two are otherwise
+            /// indistinguishable from outside: a star isolated on its catalogue temperature and a
+            /// star isolated on its spectrum both come back as one group, and if the spectrum
+            /// silently failed to attach, the only symptom is an effective wavelength that looks
+            /// like a plausible temperature.
+            /// </summary>
+            public bool[] PsfGroupFromSpectrum = System.Array.Empty<bool>();
+
+            /// <summary>
             /// Stars the split could not colour, drawn with the field's median width instead of
             /// their own. Gaia leaves many entries without a colour index and Ballesteros
             /// refuses one outside -0.5 to 2.5, so this is never zero on a real field and a
@@ -1488,6 +1498,7 @@ namespace ExoStudio.Simulation
                 var teffs = new double[colourPlanes.Count];
                 var lambdas = new double[colourPlanes.Count];
                 var counts = new int[colourPlanes.Count];
+                var fromSpectrum = new bool[colourPlanes.Count];
                 for (int g = 0; g < colourPlanes.Count; g++)
                 {
                     (float[] plane, double teffK, SpectralCurve groupSpectrum, int count) = colourPlanes[g];
@@ -1499,6 +1510,7 @@ namespace ExoStudio.Simulation
 
                     teffs[g] = teffK;
                     counts[g] = count;
+                    fromSpectrum[g] = groupSpectrum != null;
                     lambdas[g] = PhotonWeightedWavelength(groupBands);
 
                     float[] groupKernel = OpticalPsf.BuildChromaticKernel(
@@ -1518,6 +1530,7 @@ namespace ExoStudio.Simulation
                 res.PsfGroupTeffK = teffs;
                 res.PsfGroupLambdaEffMeters = lambdas;
                 res.PsfGroupStarCount = counts;
+                res.PsfGroupFromSpectrum = fromSpectrum;
             }
             res.ConvolveMs = swConv.Elapsed.TotalMilliseconds;
 
@@ -2661,7 +2674,32 @@ namespace ExoStudio.Simulation
             ChromaticSubBand[] bands = BuildSubBands(centreMeters, bandwidthAngstrom, zenithDistanceDeg,
                                                      plateScale, siteAltitudeMeters, zenithRight, zenithUp);
             if (response == null || spectrum == null) return bands;
-            return WeighSubBands(bands, response, spectrum.At);
+
+            // AVERAGED OVER EACH SUB-BAND, NOT SAMPLED AT ITS CENTRE, and on a cool star that is
+            // the difference between a number and a coin toss.
+            //
+            // There are twelve sub-bands across the passband, so each stands for about twenty
+            // nanometres. A solar-type spectrum is smooth on that scale and a point sample is
+            // fine. AN M DWARF IS NOT: TiO and VO carve it at the nanometre, so whether a
+            // sub-band's centre happens to land in a band head or on a peak is arbitrary, and the
+            // twelve weights that come back are noise dressed as a spectrum.
+            //
+            // Measured, through this very path before the fix: PHOENIX at 5500 K came back within
+            // 0.26 nm of a blackbody at the same temperature, 4000 K was still sensible, and then
+            // the trend REVERSED. 3300 K and 2600 K both returned effective wavelengths BLUER than
+            // the 5500 K ensemble, which is impossible for a cooler star and was the symptom that
+            // found this. A flat window over the same spectra in another language puts 2600 K
+            // nearly 2 nm redder than 5500 K, which is the sign physics requires.
+            //
+            // SystemBandpass makes exactly this argument about the telluric water forest and
+            // averages the filter curve for the same reason; its comment records a 30 per cent
+            // swing from a 0.01 nm move of a band edge under point sampling.
+            double halfWidth = bands.Length > 1
+                ? 0.5 * Math.Abs(bands[1].WavelengthMeters - bands[0].WavelengthMeters)
+                : 0.0;
+            return WeighSubBands(bands, response, lambda => halfWidth > 0.0
+                ? spectrum.MeanOver(lambda - halfWidth, lambda + halfWidth)
+                : spectrum.At(lambda));
         }
 
         /// <summary>Photon weight times system throughput, per sub-band, with the flat fallback.</summary>
@@ -2711,11 +2749,20 @@ namespace ExoStudio.Simulation
         /// The frame's stars split into at most <paramref name="groups"/> bins of effective
         /// temperature, each bin carrying the temperature its own kernel should be built on.
         ///
-        /// EQUAL COUNT, NOT EQUAL WIDTH. A transit field is mostly solar-type stars with one red
-        /// dwarf in it, and that dwarf is the entire measurement. Equal-width temperature bins
-        /// would put it in a bin of its own only by luck and would leave most bins empty; cutting
-        /// the sorted temperatures into equal counts guarantees the extremes are separated, which
-        /// is the property this is for.
+        /// CUT AT THE LARGEST GAPS, which is the only rule that does what this is for.
+        ///
+        /// Equal-width bins leave most of them empty, because a field's temperatures pile up around
+        /// solar. EQUAL-COUNT BINS WERE TRIED AND ARE WORSE, and the way they fail is instructive:
+        /// a transit field is one red dwarf among hundreds of solar-type stars, and cutting the
+        /// sorted temperatures into equal counts puts that dwarf in a bin of a hundred and eighty
+        /// whose median is 5500 K. Its own temperature is then discarded, the group is drawn at the
+        /// ensemble's width, and the colour effect the run exists to measure comes out at exactly
+        /// zero with nothing to show why. Measured on a real field: a 2600 K target imposed on the
+        /// brightest star produced no group of its own at all.
+        ///
+        /// Sorting and cutting at the k-1 largest gaps is one-dimensional clustering by the only
+        /// structure that matters here. An outlier is by definition on the far side of a large gap,
+        /// so it is isolated first, which is the property this is for.
         ///
         /// A STAR WITH NO USABLE COLOUR TAKES THE FIELD MEDIAN, and is counted. Gaia leaves many
         /// entries without a colour index, and Ballesteros refuses a B-V outside -0.5 to 2.5, so
@@ -2780,10 +2827,22 @@ namespace ExoStudio.Simulation
                 return c != 0 ? c : a.CompareTo(b);
             });
 
-            for (int g = 0; g < k; g++)
+            // The k-1 largest gaps in the sorted temperatures, as cut points. Ties broken on the
+            // lower index so the split depends on the catalogue and not on the sort's stability.
+            var gaps = new List<(double Size, int At)>(Math.Max(0, order.Length - 1));
+            for (int i = 1; i < order.Length; i++)
+                gaps.Add((teff[order[i]] - teff[order[i - 1]], i));
+            gaps.Sort((a, b) => b.Size != a.Size ? b.Size.CompareTo(a.Size) : a.At.CompareTo(b.At));
+
+            var cuts = new List<int> { 0 };
+            for (int i = 0; i < gaps.Count && cuts.Count < k; i++)
+                if (gaps[i].Size > 0.0) cuts.Add(gaps[i].At);
+            cuts.Add(order.Length);
+            cuts.Sort();
+
+            for (int g = 0; g + 1 < cuts.Count; g++)
             {
-                int from = (int)((long)g * order.Length / k);
-                int to = (int)((long)(g + 1) * order.Length / k);
+                int from = cuts[g], to = cuts[g + 1];
                 if (to <= from) continue;
                 var members = new List<RenderedStar>(to - from);
                 var temps = new List<double>(to - from);
