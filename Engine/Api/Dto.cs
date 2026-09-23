@@ -1004,6 +1004,19 @@ namespace ExoStudio.Api
         public bool? Noiseless { get; set; }
 
         /// <summary>
+        /// Where the sky annulus sits, in multiples of the aperture radius. Null leaves Core's
+        /// own 2 to 3 (Howell 1989).
+        ///
+        /// A sequence could not set this at all until now, and the single-frame path could: the
+        /// annulus is the obvious suspect whenever a differential ratio drifts with the seeing,
+        /// because a profile that widens pushes its own wings into the ring that is supposed to
+        /// measure the sky under it. Ruling it out took a run per hypothesis through curl. It is
+        /// a parameter of the experiment, so it belongs on the request.
+        /// </summary>
+        public double? AnnulusInnerInAperture { get; set; }
+        public double? AnnulusOuterInAperture { get; set; }
+
+        /// <summary>
         /// Render every frame at this airmass, whatever the field is really doing. Null takes the
         /// airmass from the sky, which is what an observation does.
         ///

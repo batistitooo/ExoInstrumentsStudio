@@ -274,6 +274,7 @@ validation/               the cross-validations behind ACCURACY.md
   astrometry/             pointing and airmass against Skyfield
 tools/check_core_drift.py diffs the vendored core against a mod checkout
 TECHNICAL_REFERENCE.md    every figure Studio adds beyond Core, with its source
+docs/manual.md            measuring a colour-dependent seeing drift, control by control
 Engine/
   ExoStudio.csproj        compiles Core/** + Session/** from this repository
   Program.cs              the HTTP API and static host

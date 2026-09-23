@@ -164,6 +164,14 @@ namespace ExoStudio.Simulation
         /// </summary>
         public double PlateScaleArcsec = double.NaN;
 
+        /// <summary>
+        /// Where this run put its sky annulus, in aperture radii. NaN for Core's own 2 to 3.
+        /// Recorded because a ring that a widening profile leaks into measures the star rather
+        /// than the sky, and a run has to be able to say where it put one.
+        /// </summary>
+        public double AnnulusInnerInAperture = double.NaN;
+        public double AnnulusOuterInAperture = double.NaN;
+
         /// <summary>The water overhead across the run, or null when the term is absent.</summary>
         public PwvSeries Pwv;
 

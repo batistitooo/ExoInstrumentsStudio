@@ -861,6 +861,8 @@ app.MapPost("/api/sequences", (SequenceRequest req) =>
         StarOverrides = seqTemps,
         HoldAirmass = req.HoldAirmass ?? double.NaN,
         Noiseless = req.Noiseless ?? false,
+        AnnulusInnerInAperture = req.AnnulusInnerInAperture ?? double.NaN,
+        AnnulusOuterInAperture = req.AnnulusOuterInAperture ?? double.NaN,
         ExtraRadiiArcsec = req.ExtraRadiiArcsec ?? Array.Empty<double>(),
         ExtraRadiiInFwhm = req.ExtraRadiiInFwhm ?? Array.Empty<double>(),
         ApertureRadiusArcsec = req.ApertureRadiusArcsec ?? double.NaN,
@@ -3843,7 +3845,9 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
                 apertureRadiusArcsec: seq.ApertureRadiusArcsec,
                 apertureRadiusInFwhm: seq.ApertureRadiusInFwhm,
                 extraRadiiArcsec: seq.ExtraRadiiArcsec,
-                extraRadiiInFwhm: seq.ExtraRadiiInFwhm);
+                extraRadiiInFwhm: seq.ExtraRadiiInFwhm,
+                annulusInnerInAperture: seq.AnnulusInnerInAperture,
+                annulusOuterInAperture: seq.AnnulusOuterInAperture);
 
             // THE EPOCH OF A FRAME IS THE MIDDLE OF ITS EXPOSURE, not the instant the shutter
             // opened. prep.ObservedUt is when it opened: the transit factor recorded alongside is

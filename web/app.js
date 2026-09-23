@@ -3554,6 +3554,15 @@ function rsPaintLook() {
       'absent here is one this column deleted.';
 }
 
+// Read a comma-separated list of aperture radii, or undefined for an empty box. Anything that is
+// not a number is passed through as NaN rather than dropped, so the server refuses the request and
+// names the offending entry instead of quietly measuring in fewer circles than were asked for.
+function radiusList(id) {
+  const raw = ($(id)?.value || '').trim();
+  if (raw === '') return undefined;
+  return raw.split(',').map((v) => parseFloat(v.trim()));
+}
+
 async function rsLook(tic, sector) {
   const meta = $('rsLookMeta');
   meta.textContent = 'fetching…';
@@ -3865,6 +3874,11 @@ $('seqStart').onclick = async () => {
         comparisons: parseInt($('seqComps').value, 10),
         psfColourGroups: parseInt($('seqPsfGroups').value, 10) || 0,
         calibrate: $('seqCal').checked,
+        noiseless: $('seqNoiseless').checked,
+        extraRadiiArcsec: radiusList('seqExtraArcsec'),
+        extraRadiiInFwhm: radiusList('seqExtraFwhm'),
+        annulusInnerInAperture: $('seqAnnIn').value === '' ? undefined : parseFloat($('seqAnnIn').value),
+        annulusOuterInAperture: $('seqAnnOut').value === '' ? undefined : parseFloat($('seqAnnOut').value),
         seed: seedRaw === '' ? undefined : Number(seedRaw),
         pwv: pwvRequestBody(),
         seeing: seeingRequestBody(),
