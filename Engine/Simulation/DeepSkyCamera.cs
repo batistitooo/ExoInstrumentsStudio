@@ -1471,8 +1471,11 @@ namespace ExoStudio.Simulation
             }
             else
             {
+                // The measured curve's own support when there is one, so the profile sees the band
+                // the flux sees. See TrySubBandSpan for what the declared width costs a red band.
+                TrySubBandSpan(spec, req.Filter, out double spanLo, out double spanHi);
                 subBands = BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale, atmosphereAltM,
-                                         zenithRight, zenithUp);
+                                         zenithRight, zenithUp, spanLo, spanHi);
             }
             var swKernel = System.Diagnostics.Stopwatch.StartNew();
             float[] kernel = OpticalPsf.BuildChromaticKernel(
@@ -1502,11 +1505,14 @@ namespace ExoStudio.Simulation
                 for (int g = 0; g < colourPlanes.Count; g++)
                 {
                     (float[] plane, double teffK, SpectralCurve groupSpectrum, int count) = colourPlanes[g];
+                    TrySubBandSpan(spec, req.Filter, out double gLo, out double gHi);
                     ChromaticSubBand[] groupBands = groupSpectrum != null
                         ? BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale,
-                                        atmosphereAltM, zenithRight, zenithUp, response, groupSpectrum)
+                                        atmosphereAltM, zenithRight, zenithUp, response, groupSpectrum,
+                                        gLo, gHi)
                         : BuildSubBands(wavelength, bandwidthA, zenithDistance, plateScale,
-                                        atmosphereAltM, zenithRight, zenithUp, response, teffK);
+                                        atmosphereAltM, zenithRight, zenithUp, response, teffK,
+                                        gLo, gHi);
 
                     teffs[g] = teffK;
                     counts[g] = count;
@@ -2583,10 +2589,54 @@ namespace ExoStudio.Simulation
         /// Internal rather than private so the harness can ask the CAMERA where it put the blue
         /// end, instead of asking Core the same question with the arguments written out by hand.
         /// </summary>
+        /// <summary>
+        /// The wavelength interval the twelve sub-bands should be laid across, taken from the
+        /// MEASURED curves when there are any.
+        ///
+        /// WHY THE DECLARED WIDTH IS THE WRONG INTERVAL ONCE A CURVE EXISTS. The declared
+        /// bandwidth is a half-power width, and the sub-bands are laid over centre plus or minus
+        /// 0.75 of it, so they stop where the band is already well down rather than where it
+        /// stops transmitting. That is harmless for a top-hat filter and it is not harmless for a
+        /// red band on a cool star: measured on a SPECULOOS-like I+z' declared at 837 nm and
+        /// 2200 Angstrom, the nodes reach 1002 nm while the glass times the detector still
+        /// transmits to 1100, and 4.2 per cent of a 2600 K star's photons through that band lie
+        /// red of the last node against 2.4 per cent of a 5500 K star's. On z' declared at 888 nm
+        /// and 1240 Angstrom it is 14.8 per cent against far less. The point spread function then
+        /// sees a bluer star than the flux does, differentially, which biases exactly the
+        /// colour-dependent width this codebase exists to render.
+        ///
+        /// The flux integral never had this problem: SystemBandpass takes its limits from the
+        /// curve's own support. This makes the profile agree with it.
+        ///
+        /// Returns false when no measured curve is mounted, and the declared width is then still
+        /// the best interval available and is used unchanged.
+        /// </summary>
+        public static bool TrySubBandSpan(VisualTelescopeSpec spec, CameraFilter filter,
+                                          out double loMeters, out double hiMeters)
+        {
+            loMeters = hiMeters = double.NaN;
+            SpectralCurve f = FilterTransmissionCurve(spec, filter);
+            if (f == null) return false;
+            double lo = f.MinWavelengthMeters, hi = f.MaxWavelengthMeters;
+
+            // Intersected with the detector, because a node where the detector is blind carries no
+            // photons and spending one of only twelve there is waste rather than error.
+            SpectralCurve q = spec?.QuantumEfficiencyCurve;
+            if (q != null)
+            {
+                lo = Math.Max(lo, q.MinWavelengthMeters);
+                hi = Math.Min(hi, q.MaxWavelengthMeters);
+            }
+            if (!(hi > lo)) return false;
+            loMeters = lo; hiMeters = hi;
+            return true;
+        }
+
         public static ChromaticSubBand[] BuildSubBands(
             double centreMeters, double bandwidthAngstrom, double zenithDistanceDeg,
             double plateScale, double siteAltitudeMeters,
-            double zenithRight, double zenithUp)
+            double zenithRight, double zenithUp,
+            double spanLoMeters = double.NaN, double spanHiMeters = double.NaN)
         {
             // ICAO standard atmosphere at the site's altitude, the harness's own inputs.
             double tC = 15.0 - 0.0065 * siteAltitudeMeters;
@@ -2595,6 +2645,8 @@ namespace ExoStudio.Simulation
 
             double bandwidthMeters = bandwidthAngstrom * 1e-10;
             double lo = centreMeters - 0.75 * bandwidthMeters, hi = centreMeters + 0.75 * bandwidthMeters;
+            if (spanHiMeters > spanLoMeters && spanLoMeters > 0.0)
+            { lo = spanLoMeters; hi = spanHiMeters; }
             var bands = new ChromaticSubBand[12];
             for (int i = 0; i < bands.Length; i++)
             {
@@ -2646,10 +2698,12 @@ namespace ExoStudio.Simulation
             double centreMeters, double bandwidthAngstrom, double zenithDistanceDeg,
             double plateScale, double siteAltitudeMeters,
             double zenithRight, double zenithUp,
-            SystemResponse response, double teffK)
+            SystemResponse response, double teffK,
+            double spanLoMeters = double.NaN, double spanHiMeters = double.NaN)
         {
             ChromaticSubBand[] bands = BuildSubBands(centreMeters, bandwidthAngstrom, zenithDistanceDeg,
-                                                     plateScale, siteAltitudeMeters, zenithRight, zenithUp);
+                                                     plateScale, siteAltitudeMeters, zenithRight, zenithUp,
+                                                     spanLoMeters, spanHiMeters);
             if (response == null || !(teffK > 0.0)) return bands;
 
             return WeighSubBands(bands, response,
@@ -2669,10 +2723,12 @@ namespace ExoStudio.Simulation
             double centreMeters, double bandwidthAngstrom, double zenithDistanceDeg,
             double plateScale, double siteAltitudeMeters,
             double zenithRight, double zenithUp,
-            SystemResponse response, SpectralCurve spectrum)
+            SystemResponse response, SpectralCurve spectrum,
+            double spanLoMeters = double.NaN, double spanHiMeters = double.NaN)
         {
             ChromaticSubBand[] bands = BuildSubBands(centreMeters, bandwidthAngstrom, zenithDistanceDeg,
-                                                     plateScale, siteAltitudeMeters, zenithRight, zenithUp);
+                                                     plateScale, siteAltitudeMeters, zenithRight, zenithUp,
+                                                     spanLoMeters, spanHiMeters);
             if (response == null || spectrum == null) return bands;
 
             // AVERAGED OVER EACH SUB-BAND, NOT SAMPLED AT ITS CENTRE, and on a cool star that is

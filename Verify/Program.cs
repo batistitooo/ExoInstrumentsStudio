@@ -5499,6 +5499,76 @@ Section("36. How far out the diffraction halo is kept, and what the cut costs at
                     : "the ordering in D breaks somewhere, which is the truncation showing through");
 }
 
+Section("37. Which wavelengths the profile is built over when the band carries a measured curve");
+{
+    // THE PROFILE AND THE FLUX MUST SEE THE SAME BAND. The flux integral has always taken its
+    // limits from the filter curve's own support (SystemBandpass), while the twelve chromatic
+    // sub-bands were laid over the DECLARED half-power width, centre plus or minus 0.75 of it.
+    // For a top hat those are the same interval. For a red band on a cool star they are not, and
+    // the difference lands on the one quantity that must not be biased by colour.
+    //
+    // Measured on a SPECULOOS-like I+z' declared at 837 nm and 2200 Angstrom, whose glass times
+    // detector transmits to about 1100 nm: the nodes stopped at 1002 nm, leaving 4.2 per cent of
+    // a 2600 K star's photons unseen by the profile against 2.4 per cent of a 5500 K star's. On
+    // a z' declared at 888 nm and 1240 Angstrom it was 14.8 per cent against far less. The point
+    // spread function was therefore built for a bluer star than the flux was, differentially.
+    var wl37 = new double[64];
+    var tr37 = new double[64];
+    for (int i = 0; i < wl37.Length; i++)
+    {
+        wl37[i] = 700.0 + i * (1110.0 - 700.0) / (wl37.Length - 1);
+        tr37[i] = i == 0 || i == wl37.Length - 1 ? 0.0 : 0.95;   // a wide band, zero at both ends
+    }
+    VisualTelescopeSpec wide37 = VisualTelescopeCatalog.Rc20.ShallowCopy();
+    wide37.RedCentralWavelengthNm = 837.0;
+    wide37.RedBandwidthAngstrom = 2200.0;          // the half-power width, far narrower than the glass
+    wide37.RedFilterCurve = new SpectralCurve(wl37, tr37);
+    wide37.QuantumEfficiencyCurve = null;
+
+    bool got37 = DeepSkyCamera.TrySubBandSpan(wide37, CameraFilter.Red,
+                                              out double lo37, out double hi37);
+    Check("a band with a measured curve reports the curve's own span",
+          got37 && Math.Abs(lo37 * 1e9 - 700.0) < 1e-6 && Math.Abs(hi37 * 1e9 - 1110.0) < 1e-6,
+          got37 ? $"{lo37 * 1e9:F1} to {hi37 * 1e9:F1} nm" : "no span reported");
+
+    double declaredLo = (837.0 - 0.75 * 220.0), declaredHi = (837.0 + 0.75 * 220.0);
+    Console.WriteLine($"         declared width would have spanned {declaredLo:F1} to {declaredHi:F1} nm, "
+                    + $"the curve spans {lo37 * 1e9:F1} to {hi37 * 1e9:F1}");
+    Check("and that span reaches further into the red than the declared width did",
+          hi37 * 1e9 > declaredHi + 50.0,
+          $"{hi37 * 1e9:F1} against {declaredHi:F1} nm, {hi37 * 1e9 - declaredHi:F0} nm of band recovered");
+
+    // THE NODES MUST ACTUALLY MOVE. A span that is computed and then ignored would pass the check
+    // above and change nothing.
+    ChromaticSubBand[] narrow37 = DeepSkyCamera.BuildSubBands(837e-9, 2200.0, 0.0, 0.35, 2635.0, 0.0, 1.0);
+    ChromaticSubBand[] full37 = DeepSkyCamera.BuildSubBands(837e-9, 2200.0, 0.0, 0.35, 2635.0, 0.0, 1.0,
+                                                            lo37, hi37);
+    Check("the sub-band nodes follow the curve rather than the declared width",
+          full37[^1].WavelengthMeters > narrow37[^1].WavelengthMeters + 50e-9,
+          $"reddest node {full37[^1].WavelengthMeters * 1e9:F1} nm against "
+        + $"{narrow37[^1].WavelengthMeters * 1e9:F1} before");
+    Check("and they stay inside the curve, so no node is spent where nothing transmits",
+          full37[0].WavelengthMeters >= lo37 && full37[^1].WavelengthMeters <= hi37,
+          $"{full37[0].WavelengthMeters * 1e9:F1} to {full37[^1].WavelengthMeters * 1e9:F1} nm "
+        + $"inside {lo37 * 1e9:F1} to {hi37 * 1e9:F1}");
+
+    // A BAND WITH NO MEASURED CURVE IS UNCHANGED, which is what keeps every instrument in the
+    // roster rendering exactly as it did.
+    VisualTelescopeSpec bare37 = VisualTelescopeCatalog.Rc20.ShallowCopy();
+    bare37.RedFilterCurve = null;
+    Check("a band with no curve keeps the declared width, so nothing else in the roster moves",
+          !DeepSkyCamera.TrySubBandSpan(bare37, CameraFilter.Red, out _, out _));
+
+    // AND THE DETECTOR CLIPS IT. A node where the silicon is blind carries no photons, and there
+    // are only twelve to spend.
+    VisualTelescopeSpec clipped37 = wide37.ShallowCopy();
+    clipped37.QuantumEfficiencyCurve = new SpectralCurve(new[] { 400.0, 950.0 }, new[] { 0.9, 0.0 });
+    DeepSkyCamera.TrySubBandSpan(clipped37, CameraFilter.Red, out double cLo37, out double cHi37);
+    Check("the detector's own reach clips the span",
+          Math.Abs(cHi37 * 1e9 - 950.0) < 1e-6,
+          $"{cLo37 * 1e9:F1} to {cHi37 * 1e9:F1} nm once the detector stops at 950");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

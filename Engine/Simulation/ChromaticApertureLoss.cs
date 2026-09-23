@@ -144,11 +144,12 @@ namespace ExoStudio.Simulation
 
             (float[] Kernel, int Radius) KernelFor(Colour c)
             {
+                DeepSkyCamera.TrySubBandSpan(spec, filter, out double spanLo, out double spanHi);
                 ChromaticSubBand[] bands = c.Spectrum != null
                     ? DeepSkyCamera.BuildSubBands(centre, bandwidth, 0.0, plate, siteAltitudeMeters,
-                                                  0.0, 1.0, response, c.Spectrum)
+                                                  0.0, 1.0, response, c.Spectrum, spanLo, spanHi)
                     : DeepSkyCamera.BuildSubBands(centre, bandwidth, 0.0, plate, siteAltitudeMeters,
-                                                  0.0, 1.0, response, c.TeffK);
+                                                  0.0, 1.0, response, c.TeffK, spanLo, spanHi);
                 float[] k = OpticalPsf.BuildChromaticKernel(
                     plate, spec.ApertureMeters, spec.SecondaryObstructionFraction,
                     atmosphericSeeingArcsec, centre, 0.0,
