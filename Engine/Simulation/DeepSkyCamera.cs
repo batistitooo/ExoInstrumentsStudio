@@ -2611,13 +2611,56 @@ namespace ExoStudio.Simulation
         /// Returns false when no measured curve is mounted, and the declared width is then still
         /// the best interval available and is used unchanged.
         /// </summary>
+        /// <summary>
+        /// How far down a measured filter's own peak the twelve profile nodes are laid. See
+        /// TrySubBandSpan for the measurement that set it.
+        /// </summary>
+        public const double NodeSpanFloorFraction = 0.01;
+
         public static bool TrySubBandSpan(VisualTelescopeSpec spec, CameraFilter filter,
                                           out double loMeters, out double hiMeters)
         {
             loMeters = hiMeters = double.NaN;
             SpectralCurve f = FilterTransmissionCurve(spec, filter);
             if (f == null) return false;
-            double lo = f.MinWavelengthMeters, hi = f.MaxWavelengthMeters;
+
+            // WHERE THE BAND TRANSMITS, NOT WHERE THE FILE HAS SAMPLES, and the difference is the
+            // whole value of this. There are only TWELVE nodes. A measured scan carries the band
+            // and it also carries whatever the blocking coating leaks outside it, and a leak of a
+            // tenth of a per cent spread over four hundred nanometres costs nothing in flux while
+            // it triples the interval the nodes have to cover. Measured on a Sloan r' scan whose
+            // band is 165 nm wide and whose file spans 704 nm: spanning the file put the twelve
+            // nodes 59 nm apart, two or three of them inside the band at all, and the effective
+            // wavelength it produced was wrong by 76 per cent. Spanning the part that transmits
+            // above one per cent of the band's own peak brought the same quantity to 12 per cent,
+            // and on I+z' and z' it took the agreement with a 0.1 nm integral from 7.8 and 18.2
+            // per cent to 0.6 and 2.5.
+            //
+            // The CURVE itself is not trimmed, and must not be: SystemBandpass integrates it at
+            // 64 Simpson nodes over its whole support and the leak carries real photons there. A
+            // cool star delivers 3.5 per cent of its r' light beyond 700 nm against 0.4 per cent
+            // for a solar analogue, which is a differential the flux must keep. This trims only
+            // WHERE THE TWELVE PROFILE NODES GO, and it is the profile's own sampling budget that
+            // forces it.
+            double loSamp = f.MinWavelengthMeters, hiSamp = f.MaxWavelengthMeters;
+            double peak = 0.0;
+            const int Probe = 512;
+            for (int i = 0; i <= Probe; i++)
+                peak = Math.Max(peak, f.At(loSamp + (hiSamp - loSamp) * i / Probe));
+            double lo = loSamp, hi = hiSamp;
+            if (peak > 0.0)
+            {
+                double cut = NodeSpanFloorFraction * peak;
+                double first = double.NaN, last = double.NaN;
+                for (int i = 0; i <= Probe; i++)
+                {
+                    double lam = loSamp + (hiSamp - loSamp) * i / Probe;
+                    if (f.At(lam) < cut) continue;
+                    if (double.IsNaN(first)) first = lam;
+                    last = lam;
+                }
+                if (double.IsFinite(first) && last > first) { lo = first; hi = last; }
+            }
 
             // Intersected with the detector, because a node where the detector is blind carries no
             // photons and spending one of only twelve there is waste rather than error.

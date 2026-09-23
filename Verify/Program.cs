@@ -5527,9 +5527,12 @@ Section("37. Which wavelengths the profile is built over when the band carries a
 
     bool got37 = DeepSkyCamera.TrySubBandSpan(wide37, CameraFilter.Red,
                                               out double lo37, out double hi37);
+    // Within a probe step of the curve's own edges: the first and last samples of this test
+    // curve are exact zeros, so the span correctly stops just inside them rather than on them.
     Check("a band with a measured curve reports the curve's own span",
-          got37 && Math.Abs(lo37 * 1e9 - 700.0) < 1e-6 && Math.Abs(hi37 * 1e9 - 1110.0) < 1e-6,
-          got37 ? $"{lo37 * 1e9:F1} to {hi37 * 1e9:F1} nm" : "no span reported");
+          got37 && Math.Abs(lo37 * 1e9 - 700.0) < 2.0 && Math.Abs(hi37 * 1e9 - 1110.0) < 2.0,
+          got37 ? $"{lo37 * 1e9:F1} to {hi37 * 1e9:F1} nm, against a curve on 700.0 to 1110.0"
+                : "no span reported");
 
     double declaredLo = (837.0 - 0.75 * 220.0), declaredHi = (837.0 + 0.75 * 220.0);
     Console.WriteLine($"         declared width would have spanned {declaredLo:F1} to {declaredHi:F1} nm, "
@@ -5551,6 +5554,31 @@ Section("37. Which wavelengths the profile is built over when the band carries a
           full37[0].WavelengthMeters >= lo37 && full37[^1].WavelengthMeters <= hi37,
           $"{full37[0].WavelengthMeters * 1e9:F1} to {full37[^1].WavelengthMeters * 1e9:F1} nm "
         + $"inside {lo37 * 1e9:F1} to {hi37 * 1e9:F1}");
+
+    // A LEAK OUTSIDE THE BAND MUST NOT DRAG THE NODES OUT WITH IT. A measured scan carries the
+    // band and whatever the blocking coating leaks beyond it; there are twelve nodes, and a leak
+    // of a tenth of a per cent spread over four hundred nanometres would take most of them.
+    var lk37 = new double[400];
+    var lv37 = new double[400];
+    for (int i = 0; i < lk37.Length; i++)
+    {
+        lk37[i] = 400.0 + i * (1110.0 - 400.0) / (lk37.Length - 1);
+        lv37[i] = lk37[i] >= 550.0 && lk37[i] <= 690.0 ? 0.95      // the band
+                : lk37[i] > 700.0 ? 0.002                          // the leak, 0.2 per cent
+                : 0.0;
+    }
+    VisualTelescopeSpec leaky37 = VisualTelescopeCatalog.Rc20.ShallowCopy();
+    leaky37.RedFilterCurve = new SpectralCurve(lk37, lv37);
+    leaky37.QuantumEfficiencyCurve = null;
+    DeepSkyCamera.TrySubBandSpan(leaky37, CameraFilter.Red, out double kLo37, out double kHi37);
+    Console.WriteLine($"         a band of 550 to 690 nm leaking 0.2 per cent to 1110 spans "
+                    + $"{kLo37 * 1e9:F1} to {kHi37 * 1e9:F1} nm");
+    Check("a far out-of-band leak does not drag the profile nodes out with it",
+          kHi37 * 1e9 < 720.0,
+          $"{kLo37 * 1e9:F1} to {kHi37 * 1e9:F1} nm, against a file that runs to 1110");
+    Check("and the band itself is still covered",
+          kLo37 * 1e9 <= 552.0 && kHi37 * 1e9 >= 688.0,
+          $"{kLo37 * 1e9:F1} to {kHi37 * 1e9:F1} nm covers 550 to 690");
 
     // A BAND WITH NO MEASURED CURVE IS UNCHANGED, which is what keeps every instrument in the
     // roster rendering exactly as it did.
