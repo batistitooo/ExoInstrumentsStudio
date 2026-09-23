@@ -4905,6 +4905,147 @@ Section("31. A frame rendered without the dice, and the detection that still has
     }
 }
 
+Section("32. The kernel's own aperture curve, against the model the study predicts with");
+{
+    // WHERE A DISAGREEMENT LIVES, KERNEL OR CHAIN. A rendered differential measurement came back
+    // 11 mmag from the analytic prediction at one FWHM, identically for every star in the field,
+    // so it is not noise and not the photometry of any one source. This asks the kernel the same
+    // question with no frame in between: take the same profile at two seeings, put the same
+    // circle on both, and compare the fraction of light it catches. If the kernel agrees with the
+    // model here, the disagreement is downstream, in deposition or in the aperture sum.
+    VisualTelescopeSpec rc32 = VisualTelescopeCatalog.Rc20;
+    double plate32 = rc32.NativePixelSizeMeters / rc32.FocalLengthMeters * 206264.80624709636;
+    const double centre32 = 643e-9;
+    double[] seeings32 = { 0.9519, 1.2375 };
+
+    float[] Kernel32(double seeing, out int radius)
+    {
+        ChromaticSubBand[] bands = DeepSkyCamera.BuildSubBands(
+            centre32, DeepSkyCamera.FilterBandwidthAngstrom(rc32, CameraFilter.Red),
+            0.0, plate32, 2635.0, 0.0, 1.0);
+        return OpticalPsf.BuildChromaticKernel(
+            plate32, rc32.ApertureMeters, rc32.SecondaryObstructionFraction, seeing,
+            centre32, 0.0, rc32.SpiderVaneCount, rc32.SpiderVaneWidthMeters,
+            rc32.PrimaryMirrorPads, bands, out radius);
+    }
+    double Ee32(float[] k, int radius, double rPx)
+    {
+        int side = 2 * radius + 1;
+        double inside = 0.0, total = 0.0;
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+            {
+                double v = k[y * side + x];
+                total += v;
+                double dx = x - radius, dy = y - radius;
+                if (dx * dx + dy * dy <= rPx * rPx) inside += v;
+            }
+        return total > 0.0 ? inside / total : double.NaN;
+    }
+
+    float[] kA = Kernel32(seeings32[0], out int rA);
+    float[] kB = Kernel32(seeings32[1], out int rB);
+    Console.WriteLine($"         plate scale {plate32:F5} arcsec/px, kernels reach "
+                    + $"{rA * plate32 / seeings32[0]:F2} and {rB * plate32 / seeings32[1]:F2} FWHM");
+    Console.WriteLine($"         measured FWHM {OpticalPsf.MeasureKernelFwhmArcsec(kA, rA, plate32):F4} "
+                    + $"and {OpticalPsf.MeasureKernelFwhmArcsec(kB, rB, plate32):F4} arcsec, "
+                    + $"against {seeings32[0]:F4} and {seeings32[1]:F4} of atmosphere");
+    Console.WriteLine($"         {"r/FWHM0",-9}{"EE at 0.95",-13}{"EE at 1.24",-13}{"ratio",-12}");
+    foreach (double r in new[] { 0.75, 1.0, 1.5, 2.0, 3.0 })
+    {
+        double rPx = r * seeings32[0] / plate32;
+        double a = Ee32(kA, rA, rPx), b = Ee32(kB, rB, rPx);
+        Console.WriteLine($"         {r,-9:F2}{a,-13:F6}{b,-13:F6}{b / a,-12:F6}");
+    }
+
+    // The kernels are normalised to unit sum over their own support, so a ratio of encircled
+    // fractions at one radius is the quantity a fixed aperture actually measures.
+    double oneFwhm = 1.0 * seeings32[0] / plate32;
+    double ratio32 = Ee32(kB, rB, oneFwhm) / Ee32(kA, rA, oneFwhm);
+    Check("the kernel loses light to worse seeing, and by a plausible amount",
+          ratio32 > 0.7 && ratio32 < 0.95, $"{ratio32:F6} at one FWHM");
+}
+
+Section("33. What a fixed circle on a sampled star costs, and the sampling it takes to pay it");
+{
+    // THE CONTROLLED VERSION OF A MEASUREMENT THAT WOULD NOT SETTLE. A differential ratio on
+    // rendered frames came back anywhere between 0.8 and 18 mmag depending on the field, the
+    // pointing and which comparisons were picked, against an effect of about one. Too many things
+    // moved at once to learn anything. This builds the frame instead: one Gaussian of known width,
+    // integrated over each pixel, at a known sub-pixel position, measured by the same aperture
+    // code at two widths. Nothing else is in it, and the answer is closed form.
+    //
+    // WHAT IT FINDS, AND IT IS A PROPERTY OF THE SAMPLING RATHER THAN A DEFECT. A circle on a
+    // pixel grid does not catch the same fraction of two stars that differ only in where they sit
+    // between pixels. The exact-area weights make the GEOMETRY exact; they cannot make the flux
+    // inside a boundary pixel uniform, and it is not. So the ratio a fixed aperture reports
+    // between two seeings carries a phase-dependent error, and that error is the floor under any
+    // differential measurement made this way.
+    //
+    // It falls steeply with sampling, which is the useful part: the table below is the sampling a
+    // study needs for the size of effect it is chasing.
+    const int W33 = 121, H33 = 121, BASE = 60, SUB = 9;
+    const double SKY33 = 100.0;
+
+    float[] Star33(double fwhm, double phaseX, double phaseY)
+    {
+        double sigma = fwhm / 2.3548200450309493;
+        var f = new float[W33 * H33];
+        for (int y = 0; y < H33; y++)
+            for (int x = 0; x < W33; x++)
+            {
+                double sum = 0.0;
+                for (int sy = 0; sy < SUB; sy++)
+                    for (int sx = 0; sx < SUB; sx++)
+                    {
+                        double dx = x + (sx + 0.5) / SUB - 0.5 - (BASE + phaseX);
+                        double dy = y + (sy + 0.5) / SUB - 0.5 - (BASE + phaseY);
+                        sum += Math.Exp(-(dx*dx + dy*dy) / (2*sigma*sigma));
+                    }
+                f[y * W33 + x] = (float)(SKY33 + 1e6 * sum / (SUB * SUB));
+            }
+        return f;
+    }
+    double EeGauss(double r, double fwhm)
+        => 1.0 - Math.Exp(-0.5 * Math.Pow(r * 2.3548200450309493 / fwhm, 2.0));
+
+    Console.WriteLine("         px per FWHM   centred on truth   centred on pixel");
+    var floors = new List<(double Sampling, double Truth, double Pixel)>();
+    foreach (double sampling in new[] { 2.5, 3.46, 5.0, 8.0, 14.0, 24.0 })
+    {
+        double fwhmA = sampling, fwhmB = sampling * 1.3, radius = sampling;
+        double exact = EeGauss(radius, fwhmB) / EeGauss(radius, fwhmA);
+        double Flux(float[] f, double cx, double cy) => AperturePhotometry.Measure(
+            f, W33, H33, cx, cy, radius, radius * 3.0, radius * 5.0, 6.0, 1e12).Flux;
+
+        var truth = new List<double>();
+        var pixel = new List<double>();
+        for (int i = 0; i < 10; i++)
+        {
+            double px = i / 10.0, py = (i * 3 % 10) / 10.0;
+            float[] a = Star33(fwhmA, px, py), b = Star33(fwhmB, px, py);
+            truth.Add(Flux(b, BASE + px, BASE + py) / Flux(a, BASE + px, BASE + py));
+            double ix = Math.Round(BASE + px), iy = Math.Round(BASE + py);
+            pixel.Add(Flux(b, ix, iy) / Flux(a, ix, iy));
+        }
+        double st = 2.5 * Math.Log10(truth.Max() / truth.Min()) * 1000.0;
+        double sp = 2.5 * Math.Log10(pixel.Max() / pixel.Min()) * 1000.0;
+        floors.Add((sampling, st, sp));
+        Console.WriteLine($"         {sampling,11:F2}   {st,16:F3}   {sp,16:F3}");
+    }
+
+    Check("the floor falls steeply with sampling, which is what makes it a design rule",
+          floors[0].Truth > 4.0 * floors[^1].Truth,
+          $"{floors[0].Truth:F2} mmag at {floors[0].Sampling:F1} px per FWHM against "
+          + $"{floors[^1].Truth:F3} at {floors[^1].Sampling:F0}");
+    Check("and centring on the nearest pixel rather than the star costs several times more",
+          floors[1].Pixel > 2.0 * floors[1].Truth,
+          $"{floors[1].Pixel:F2} against {floors[1].Truth:F2} mmag at SPECULOOS-like sampling");
+    Check("a well sampled star measures its ratio to far better than a millimagnitude",
+          floors[^1].Truth < 0.2,
+          $"{floors[^1].Truth:F3} mmag at {floors[^1].Sampling:F0} px per FWHM");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"
