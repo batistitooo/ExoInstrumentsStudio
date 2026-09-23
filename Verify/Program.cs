@@ -5046,6 +5046,375 @@ Section("33. What a fixed circle on a sampled star costs, and the sampling it ta
           $"{floors[^1].Truth:F3} mmag at {floors[^1].Sampling:F0} px per FWHM");
 }
 
+Section("34. The chromatic loss as a fitted regressor, against the polynomial an observer reaches for");
+{
+    // WHAT PANEL B OF THE STUDY IS. A transit is injected into a curve that also carries a drift
+    // correlated with the seeing, because the target is redder than its comparisons and the
+    // circle is fixed. The question is not whether the drift exists - section 32 measured it in
+    // the kernel - but how much of the TRANSIT a detrend eats while removing it. Three polynomial
+    // orders in the measured width, and the physical column, on identical points.
+    //
+    // ON SYNTHETIC POINTS AND NOT A RENDERED RUN, deliberately. A rendered sequence would carry
+    // the pixel-grid floor of section 33, the photon noise, and the estimator's own bias, and the
+    // thing under test here is the ARITHMETIC OF THE FIT. Feeding it a curve whose systematic is
+    // known exactly is what makes a recovered bias attributable. The rendered version is the
+    // study's own job.
+
+    const double Injected = 0.007;          // 7 mmag, a TRAPPIST-1b sized event
+    const double Cadence = 30.0;
+    const int Frames = 360;                 // three hours
+    const double Ingress = 0.1;
+
+    // The seeing rises through the night, and the event sits in the middle of the rise: the worst
+    // case, and the common one, because a transit is scheduled at culmination and the seeing
+    // degrades as the night cools.
+    double[] width = new double[Frames];
+    double[] u = new double[Frames];
+    double[] ut = new double[Frames];
+    for (int i = 0; i < Frames; i++)
+    {
+        ut[i] = i * Cadence;
+        width[i] = 1.00 + 0.30 * i / (Frames - 1.0);
+
+        double centre = Frames / 2.0, half = 36.0 * 60.0 / Cadence / 2.0;
+        double d = Math.Abs(i - centre), ramp = Ingress * 2.0 * half;
+        u[i] = d <= half - ramp ? 1.0
+             : d >= half ? 0.0
+             : (half - d) / ramp;
+    }
+
+    // The systematic: the loss a fixed circle takes, which is NOT linear in the width. Its
+    // curvature is the whole reason a polynomial is not a free lunch. Taken here as the encircled
+    // -energy difference of two Gaussians whose widths differ by the colour ratio, which has the
+    // same shape as the Kolmogorov answer over this range and can be written in closed form.
+    const double ColourRatio = 0.99339;     // 2600 K against 5500 K in I+z', from the spectra
+    const double RadiusInFwhm = 1.2;
+    double Loss(double fwhm)
+    {
+        double sigma = fwhm / 2.3548200450309493, r = RadiusInFwhm * 1.00;
+        double eeT = 1.0 - Math.Exp(-r * r / (2.0 * sigma * sigma * ColourRatio * ColourRatio));
+        double eeE = 1.0 - Math.Exp(-r * r / (2.0 * sigma * sigma));
+        return 2500.0 * Math.Log10(eeT / eeE);
+    }
+
+    List<TransitDepthFit.Point> Points(bool withSystematic, bool withPrediction)
+    {
+        var pts = new List<TransitDepthFit.Point>(Frames);
+        for (int i = 0; i < Frames; i++)
+        {
+            double systematic = withSystematic ? Loss(width[i]) : 0.0;
+            pts.Add(new TransitDepthFit.Point
+            {
+                Ut = ut[i],
+                Airmass = 1.2,
+                Ratio = (1.0 - Injected * u[i]) * Math.Pow(10.0, -0.4 * systematic / 1000.0),
+                TransitFactor = 1.0 - Injected * u[i],
+                PhotonPpt = double.NaN,
+                FwhmArcsec = width[i],
+                EeChromMmag = withPrediction ? Loss(width[i]) : double.NaN,
+            });
+        }
+        return pts;
+    }
+
+    double BiasPpm(TransitDepthFit.Baseline b, bool systematic)
+    {
+        TransitDepthFit.Result r = TransitDepthFit.Fit(Points(systematic, true), b, Injected);
+        return r.Refusal != null ? double.NaN : r.BiasPpm;
+    }
+
+    // THE ESTIMATOR'S OWN FLOOR FIRST, which is the control PwvTransitBias insists on and the
+    // audit told this study to copy. The fit is a matched filter on the injected truth, so with
+    // NO systematic it must return the injected depth under every baseline. A floor that is not
+    // near zero would mean every number below was measuring the fit rather than the physics.
+    var floors = new List<(string Name, double Ppm)>();
+    foreach (TransitDepthFit.Baseline b in new[]
+        { TransitDepthFit.Baseline.Flat, TransitDepthFit.Baseline.Fwhm,
+          TransitDepthFit.Baseline.FwhmQuadratic, TransitDepthFit.Baseline.EeChrom })
+        floors.Add((b.ToString(), BiasPpm(b, false)));
+
+    Console.WriteLine($"         {"baseline",-18}{"floor, ppm",-14}{"bias, ppm",-14}{"of 7000 ppm",-12}");
+    var biases = new List<(string Name, double Ppm)>();
+    foreach ((string name, double floor) in floors)
+    {
+        TransitDepthFit.Baseline b = Enum.Parse<TransitDepthFit.Baseline>(name);
+        double bias = BiasPpm(b, true);
+        biases.Add((name, bias));
+        Console.WriteLine($"         {name,-18}{floor,-14:F4}{bias,-14:F2}"
+                        + $"{100.0 * bias / (Injected * 1e6),-12:F2}%");
+    }
+
+    Check("with no systematic every baseline returns the depth that was injected",
+          floors.All(f => Math.Abs(f.Ppm) < 1.0),
+          $"worst floor {floors.OrderByDescending(f => Math.Abs(f.Ppm)).First().Ppm:F4} ppm of 7000");
+
+    double flat = biases[0].Ppm, order1 = biases[1].Ppm, order2 = biases[2].Ppm, physical = biases[3].Ppm;
+
+    Check("a chromatic drift under a transit biases the depth when nothing removes it",
+          Math.Abs(flat) > 10.0,
+          $"{flat:F1} ppm, {100.0 * flat / (Injected * 1e6):F2} per cent of the event");
+    // ORDER ONE DOES NOT HELP, AND THAT IS THE RESULT, not a broken test. A transit is scheduled
+    // at culmination and sits in the MIDDLE of the run, so it is symmetric in time while a line
+    // in a monotonically rising width is antisymmetric about that same centre: the two are very
+    // nearly orthogonal, and removing the line takes away almost nothing the depth was absorbing.
+    // What the depth absorbs is the CURVATURE of the loss, which is symmetric about the middle
+    // and looks exactly like a dip there. A first-order detrend leaves that curvature untouched
+    // and can leave the answer slightly worse than doing nothing.
+    Check("a first order polynomial in the width does not remove the bias",
+          Math.Abs(order1) > 0.5 * Math.Abs(flat),
+          $"{order1:F1} ppm at order 1, against {flat:F1} with a constant only: the depth "
+        + "absorbs the curvature, and a line does not touch it");
+    Check("the second order, which does reach the curvature, removes most of it",
+          Math.Abs(order2) < 0.1 * Math.Abs(order1),
+          $"{order2:F2} ppm at order 2, against {order1:F2} at order 1");
+    Check("but the physical regressor beats both, because it is the right shape",
+          Math.Abs(physical) < Math.Abs(order2),
+          $"{physical:F3} ppm, against {order2:F2} for the best polynomial");
+    Check("the physical regressor recovers the depth to better than a part in a thousand",
+          Math.Abs(physical) / (Injected * 1e6) < 1e-3,
+          $"{100.0 * physical / (Injected * 1e6):F4} per cent of the injected depth");
+
+    // A REGRESSOR THAT DOES NOT MOVE IS A SECOND CONSTANT, and a singular design that returned a
+    // number would be worse than one that refused.
+    var held = new List<TransitDepthFit.Point>(Frames);
+    for (int i = 0; i < Frames; i++)
+    {
+        TransitDepthFit.Point p = Points(false, true)[i];
+        p.FwhmArcsec = 1.0;
+        held.Add(p);
+    }
+    TransitDepthFit.Result stuck = TransitDepthFit.Fit(held, TransitDepthFit.Baseline.Fwhm, Injected);
+    Check("a run whose width never moves refuses a baseline in the width",
+          stuck.Refusal != null && stuck.Refusal.Contains("singular"),
+          stuck.Refusal ?? "it returned a depth");
+
+    // A FRAME WITH NO MEASURED WIDTH IS A REFUSAL, NOT A DROPPED ROW, or the polynomial orders
+    // would be compared against a flat model fitted on a different set of frames.
+    List<TransitDepthFit.Point> gap = Points(true, true);
+    TransitDepthFit.Point blind = gap[10];
+    blind.FwhmArcsec = double.NaN;
+    gap[10] = blind;
+    TransitDepthFit.Result refused = TransitDepthFit.Fit(gap, TransitDepthFit.Baseline.Fwhm, Injected);
+    Check("a frame that measured no width is refused rather than quietly dropped",
+          refused.Refusal != null && refused.Refusal.Contains("measured width"),
+          refused.Refusal ?? "it fitted the rest anyway");
+    Check("and the same frames still fit under a baseline that does not need a width",
+          TransitDepthFit.Fit(gap, TransitDepthFit.Baseline.Flat, Injected).Refusal == null);
+}
+
+Section("35. The chromatic loss Studio predicts, and which of the two causes wins");
+{
+    // THE REGRESSOR'S OWN PHYSICS, with no fit around it. Section 34 showed that a column of the
+    // right shape removes the bias; this asks what shape Studio actually builds, which is a
+    // different question and the one the study's claim rests on.
+    //
+    // AND IT IS NOT THE OBVIOUS SHAPE. Two things happen to a redder star at once and they pull
+    // opposite ways. Seeing goes as lambda^(-1/5), so the atmosphere delivers it NARROWER.
+    // Diffraction goes as lambda, so the telescope delivers it WIDER. Which one wins inside a
+    // fixed circle is a property of the aperture, not a fact about colour, and getting that
+    // backwards would invert the sign of every conclusion while leaving every amplitude right.
+    // THE NUMBERS BELOW ARE A MECHANISM, NOT AN AMPLITUDE. This runs a catalogue RC20 through
+    // the shipped Red band on blackbody colours, because that is what the harness can build with
+    // no custom instrument in it. A real study of this effect uses a much redder and much wider
+    // passband, where the two colours' mean wavelengths are far further apart, and tabulated
+    // spectra rather than Planck, where a cool star's molecular bands move its mean further
+    // still. Both make the loss larger by a large factor. What is pinned here is the SIGN, the
+    // two causes that set it, the shape against radius and width, and the floor the prediction
+    // carries; the size for any one instrument is that instrument's own measurement.
+    VisualTelescopeSpec spec35 = VisualTelescopeCatalog.Rc20;      // 0.51 m
+    SystemResponse response35 = DeepSkyCamera.BuildSystemResponse(spec35, CameraFilter.Red, 1.2, 2635.0);
+    const double Radius35 = 1.2;   // arcsec, a fixed circle near one delivered FWHM
+    var cool35 = new ChromaticApertureLoss.Colour(2600.0, null);
+    var warm35 = new ChromaticApertureLoss.Colour(5500.0, null);
+
+    bool Loss35(VisualTelescopeSpec sp, double radius, double seeing,
+                out ChromaticApertureLoss.Sample sample, double sampling = 0.0)
+        => ChromaticApertureLoss.TryEvaluate(sp, CameraFilter.Red, response35, 2635.0, radius,
+                                             cool35, warm35, seeing, out sample, out _, sampling);
+
+    bool okCool = Loss35(spec35, Radius35, 1.0, out ChromaticApertureLoss.Sample cool);
+    Check("a cool target against a solar ensemble gives a loss at all", okCool);
+
+    if (okCool)
+    {
+        Console.WriteLine($"         2600 K against 5500 K, {Radius35:F2} arcsec circle, 1.00 arcsec of atmosphere:");
+        Console.WriteLine($"         delivered: target {cool.DeliveredFwhmTargetArcsec:F4}, ensemble "
+                        + $"{cool.DeliveredFwhmArcsec:F4} arcsec, difference "
+                        + $"{1000.0 * (cool.DeliveredFwhmTargetArcsec - cool.DeliveredFwhmArcsec):+0.0;-0.0} mas, "
+                        + $"loss {cool.LossMmag:+0.000;-0.000} mmag");
+
+        // The telescope's own share is not a detail at half a metre: an Airy core of about 0.27
+        // arcsec against 1.00 of atmosphere is what takes the delivered width to 1.12.
+        Check("the delivered width is wider than the atmosphere that produced it",
+              cool.DeliveredFwhmArcsec > 1.0,
+              $"{cool.DeliveredFwhmArcsec:F4} arcsec delivered from 1.00 of seeing");
+    }
+
+    // A PAIR WITH NO COLOUR DIFFERENCE HAS NO EFFECT, by construction. This is the null test the
+    // whole study is checked against, and it has to come out at zero to the numerics rather than
+    // to a tolerance someone chose.
+    bool okNull = ChromaticApertureLoss.TryEvaluate(
+        spec35, CameraFilter.Red, response35, 2635.0, Radius35,
+        warm35, warm35, 1.0, out ChromaticApertureLoss.Sample same, out _);
+    Check("two stars of the same colour lose nothing to each other",
+          okNull && Math.Abs(same.LossMmag) < 1e-9, $"{same.LossMmag:E2} mmag");
+
+    // WHAT THE EFFECT ACTUALLY IS: THE SWING, NOT THE VALUE. The loss at ONE seeing is a static
+    // offset between two stars, and a differential light curve normalised to a mean of one
+    // divides it out along with everything else constant. What survives is how that offset MOVES
+    // when the seeing moves, which is why the regressor is a column and not a number. The value
+    // at a single seeing can sit either side of zero without meaning anything: at 0.51 m it is
+    // negative here, and the swing across the same night is still positive. Reading the
+    // single-seeing sign as the sign of the effect is the mistake this block exists to prevent.
+    const double Seeing35 = 1.00, Worse35 = 1.30;
+
+    // THE TWO CAUSES, SEPARATED BY GROWING THE MIRROR. Everything else held: the same passband,
+    // the same seeings, the same circle. As the aperture grows the Airy core shrinks as 1/D and
+    // the atmosphere is left alone with the profile, so this sweep is the chromatic seeing term
+    // emerging from under the diffraction term.
+    Console.WriteLine($"         {"D, m",-8}{"FWHM difference, mas",-24}{"loss at 1.00\"",-16}"
+                    + $"{"at 1.30\"",-14}{"swing, mmag",-12}");
+    var byDiameter = new List<(double D, double Swing, double Dfwhm, double At1)>();
+    foreach (double d in new[] { 0.51, 1.0, 2.0, 5.0, 15.0 })
+    {
+        VisualTelescopeSpec grown = spec35.ShallowCopy();
+        grown.ApertureMeters = d;
+        grown.FocalLengthMeters = d * 6.8;
+        if (!Loss35(grown, Radius35, Seeing35, out ChromaticApertureLoss.Sample good)) continue;
+        if (!Loss35(grown, Radius35, Worse35, out ChromaticApertureLoss.Sample bad)) continue;
+        double dm = 1000.0 * (good.DeliveredFwhmTargetArcsec - good.DeliveredFwhmArcsec);
+        byDiameter.Add((d, bad.LossMmag - good.LossMmag, dm, good.LossMmag));
+        Console.WriteLine($"         {d,-8:F2}{dm,-24:+0.00;-0.00}{good.LossMmag,-16:+0.000;-0.000}"
+                        + $"{bad.LossMmag,-14:+0.000;-0.000}{bad.LossMmag - good.LossMmag,-12:+0.000;-0.000}");
+    }
+
+    Check("the redder star is always delivered narrower, because the atmosphere sets the width",
+          byDiameter.Count == 5 && byDiameter.All(b => b.Dfwhm < 0.0),
+          byDiameter.Count == 5
+            ? $"{byDiameter[0].Dfwhm:+0.00;-0.00} mas at 0.51 m, {byDiameter[^1].Dfwhm:+0.00;-0.00} at 15 m"
+            : "incomplete");
+    Check("but the narrowing grows with the mirror, as diffraction stops fighting it",
+          byDiameter.Count == 5 && byDiameter[^1].Dfwhm < byDiameter[0].Dfwhm,
+          $"{byDiameter[0].Dfwhm:F2} mas at 0.51 m against {byDiameter[^1].Dfwhm:F2} at 15 m");
+
+    // THE SIGN THAT MATTERS, and it does not flip. Worse seeing spreads both stars, the fixed
+    // circle loses light from both, and it loses LESS from the one the atmosphere keeps narrower:
+    // the ratio moves in the target's favour. Independently: ember's own quadrature of Fried's
+    // transfer function gives +1.40 mmag at 0.25 m and +2.04 at 2 m for this pair in I+z', the
+    // same sign at every diameter it was asked at.
+    Check("the swing is positive at every aperture, which is the sign the study rests on",
+          byDiameter.Count == 5 && byDiameter.All(b => b.Swing > 0.0),
+          byDiameter.Count == 5
+            ? $"{byDiameter[0].Swing:+0.000;-0.000} mmag at 0.51 m, {byDiameter[^1].Swing:+0.000;-0.000} at 15 m"
+            : "incomplete");
+    Check("and the single-seeing value is not that sign, which is why only the swing is fitted",
+          byDiameter.Count == 5 && byDiameter[0].At1 < 0.0 && byDiameter[0].Swing > 0.0,
+          $"{byDiameter[0].At1:+0.000;-0.000} mmag at 0.51 m and one arcsec, swinging "
+        + $"{byDiameter[0].Swing:+0.000;-0.000} across the night");
+    Check("diffraction damps the swing, so a small mirror sees less of the effect but not none",
+          byDiameter.Count == 5 && byDiameter[0].Swing < byDiameter[^1].Swing
+                                && byDiameter[0].Swing > 0.3 * byDiameter[^1].Swing,
+          $"{byDiameter[0].Swing:F3} mmag at 0.51 m against {byDiameter[^1].Swing:F3} at 15 m, "
+        + $"{100.0 * byDiameter[0].Swing / byDiameter[^1].Swing:F0} per cent of it");
+
+    // AND THE NUMBER IS NOT AN ARTEFACT OF THE GRID IT WAS INTEGRATED ON. Section 33 measured
+    // what a circle on a pixel grid costs a flux ratio; this asks whether the prediction has
+    // already paid it. Tripling the sampling must not move the answer by anything that matters.
+    bool okCoarse = Loss35(spec35, Radius35, 1.0, out ChromaticApertureLoss.Sample coarse, 10.0);
+    bool okFine = Loss35(spec35, Radius35, 1.0, out ChromaticApertureLoss.Sample fine, 28.0);
+    Console.WriteLine($"         sampling 10, 20, 28 px per FWHM: {coarse.LossMmag:+0.0000;-0.0000}, "
+                    + $"{cool.LossMmag:+0.0000;-0.0000}, {fine.LossMmag:+0.0000;-0.0000} mmag");
+    // The spread over a 2.8-fold change of grid is the prediction's OWN numerical floor, and it
+    // is quoted as one rather than tightened away: it does not fall monotonically with sampling,
+    // so it is grid noise and not a convergence the next decimal would buy. Two hundredths of a
+    // millimagnitude against an effect of a few tenths to a few is the statement that matters.
+    double floor35 = new[] { coarse.LossMmag, cool.LossMmag, fine.LossMmag }.Max()
+                   - new[] { coarse.LossMmag, cool.LossMmag, fine.LossMmag }.Min();
+    Check("the prediction's own numerical floor is far below the effect it predicts",
+          okCoarse && okFine && floor35 < 0.02,
+          $"{floor35:F4} mmag of spread across a 2.8-fold change of grid");
+
+    // AND IT REFUSES RATHER THAN RETURNS A DEFAULT when the sampling asked for would push the
+    // normalisation radius past the kernel's cap. The first version of this check read a
+    // defaulted sample and reported a clean zero, which looked like perfect convergence.
+    Check("a sampling too fine for the kernel's reach is refused, not silently defaulted",
+          !ChromaticApertureLoss.TryEvaluate(spec35, CameraFilter.Red, response35, 2635.0, Radius35,
+                                             cool35, warm35, 1.0, out _, out string fineErr, 40.0)
+          && fineErr.Contains("coarser"),
+          "it returned a loss at a sampling whose kernel cannot reach the normalisation radius");
+
+    // THE EFFECT AGAINST RADIUS, at an aperture where the atmosphere is alone with the profile.
+    // A tight circle sits on the steep part of the core where a width change moves the most
+    // light; a wide one has nothing left outside to move.
+    VisualTelescopeSpec big35 = spec35.ShallowCopy();
+    big35.ApertureMeters = 15.0;
+    big35.FocalLengthMeters = 15.0 * 6.8;
+    var byRadius = new List<(double R, double Mmag)>();
+    foreach (double r in new[] { 0.3, 0.6, 0.9, 1.2, 1.8, 2.4, 3.6 })
+        if (Loss35(big35, r, Seeing35, out ChromaticApertureLoss.Sample good35)
+            && Loss35(big35, r, Worse35, out ChromaticApertureLoss.Sample bad35))
+            byRadius.Add((r, bad35.LossMmag - good35.LossMmag));
+    Console.WriteLine($"         {"radius, arcsec",-18}{"swing, mmag, at 15 m",-22}");
+    foreach ((double r, double m) in byRadius) Console.WriteLine($"         {r,-18:F2}{m,-22:F4}");
+    Check("a circle past the radius the profiles are normalised over is refused",
+          !ChromaticApertureLoss.TryEvaluate(big35, CameraFilter.Red, response35, 2635.0, 9.0,
+                                             cool35, warm35, 1.0, out _, out string wideErr)
+          && wideErr.Contains("normalised over"),
+          "it compared enclosed fractions outside the radius they were normalised at");
+    // THE SHAPE AGAINST RADIUS IS A PEAK, NOT A SLOPE, and the first version of this check asserted
+    // a slope and failed. The effect is driven by the flux that CROSSES the aperture boundary when
+    // the profile widens. A circle deep inside the core has little gradient under its edge and
+    // little to lose; a circle far outside has nothing left outside to move; the most is taken
+    // near one delivered width, where the boundary sits on the steepest part of the profile.
+    // ember's own quadrature of Fried's transfer function, independently, does the same: +1.185
+    // mmag at 0.4 arcsec, rising to +2.547 at 0.8, back down to +0.163 at 3.0.
+    int peak35 = 0;
+    for (int i = 1; i < byRadius.Count; i++) if (byRadius[i].Mmag > byRadius[peak35].Mmag) peak35 = i;
+    Check("the effect peaks near one delivered width rather than growing without bound",
+          byRadius.Count == 7 && peak35 > 0 && peak35 < byRadius.Count - 1,
+          byRadius.Count == 7
+            ? $"largest at {byRadius[peak35].R:F1} arcsec on a {1.0028:F2} arcsec profile, "
+            + $"{byRadius[peak35].Mmag:F3} mmag"
+            : "incomplete");
+    Check("and a wide aperture all but removes it, which is the rule the study reports",
+          byRadius.Count == 7 && byRadius[^1].Mmag < 0.1 * byRadius[peak35].Mmag,
+          byRadius.Count == 7
+            ? $"{byRadius[^1].Mmag:F4} mmag at 3.6 arcsec against {byRadius[peak35].Mmag:F3} at the peak"
+            : "incomplete");
+    Check("a circle deep inside the core also sees little, because its edge has no gradient under it",
+          byRadius.Count == 7 && byRadius[0].Mmag < byRadius[peak35].Mmag,
+          byRadius.Count == 7 ? $"{byRadius[0].Mmag:F3} mmag at 0.3 arcsec" : "incomplete");
+
+    // THE COLUMN INVERTS ONTO A MEASURED WIDTH, which is the only form a pipeline can use.
+    var widths35 = new List<double>();
+    for (int i = 0; i < 9; i++) widths35.Add(1.05 + 0.04 * i);
+    double[] col35 = ChromaticApertureLoss.Column(
+        spec35, CameraFilter.Red, response35, 2635.0, Radius35,
+        cool35, warm35, widths35, out string colErr);
+    Check("the prediction inverts onto a measured width across a night's range", col35 != null, colErr);
+    if (col35 != null)
+    {
+        Console.WriteLine($"         measured {widths35[0]:F2} to {widths35[^1]:F2} arcsec "
+                        + $"gives {col35[0]:F3} to {col35[^1]:F3} mmag, a swing of "
+                        + $"{col35.Max() - col35.Min():F3}");
+        Check("the column moves with the width, which is what makes it a regressor at all",
+              col35.Max() - col35.Min() > 0.05,
+              $"{col35.Max() - col35.Min():F3} mmag across the night");
+        Check("and it is monotone in the width, so it inverts without ambiguity",
+              Enumerable.Range(1, col35.Length - 1).All(i => col35[i] > col35[i - 1])
+              || Enumerable.Range(1, col35.Length - 1).All(i => col35[i] < col35[i - 1]),
+              $"{col35[0]:F4} to {col35[^1]:F4} mmag");
+    }
+
+    // A TRACKING APERTURE HAS NO FIXED CIRCLE, so there is nothing to predict and saying so beats
+    // returning a number that looks like an answer.
+    Check("an aperture that is not fixed in arcsec is refused",
+          !ChromaticApertureLoss.TryEvaluate(
+              spec35, CameraFilter.Red, response35, 2635.0, double.NaN,
+              cool35, warm35, 1.0, out _, out string trackErr) && trackErr.Contains("FIXED IN ARCSEC"),
+          "it returned a loss for a tracking aperture");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"

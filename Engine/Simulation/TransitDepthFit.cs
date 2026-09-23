@@ -63,6 +63,23 @@ namespace ExoStudio.Simulation
 
             /// <summary>A correction already applied to this point, in millimagnitudes. Zero when none.</summary>
             public double CorrectionMmag;
+
+            /// <summary>
+            /// The width the pipeline MEASURED on this frame, arcsec, averaged over the field's
+            /// own stars. Not the seeing the run was given: a reduction never sees that, and the
+            /// two differ by the instrument's own share of the profile and by the estimator's
+            /// bias. NaN when the frame carried no usable star width.
+            /// </summary>
+            public double FwhmArcsec;
+
+            /// <summary>
+            /// The chromatic aperture loss this frame's width predicts for THIS pair of colours
+            /// at THIS radius, millimagnitudes, from the encircled energy of the two profiles.
+            /// The physical alternative to a polynomial: it knows that the loss follows the
+            /// target's own wavelength rather than the field's average width. NaN when not asked
+            /// for.
+            /// </summary>
+            public double EeChromMmag;
         }
 
         /// <summary>Which baseline the reduction is allowed to remove. Held fixed across conditions or nothing compares.</summary>
@@ -76,6 +93,25 @@ namespace ExoStudio.Simulation
             TimeAirmass,
             /// <summary>Plus a quadratic airmass term.</summary>
             TimeAirmassQuadratic,
+
+            /// <summary>
+            /// Linear in the width the pipeline measured. The first order of the polynomial
+            /// detrend that observers reach for when a night's curve tracks the seeing. It is
+            /// deliberately NOT accompanied by a time term: one regressor at a time, or a bias
+            /// cannot be attributed to the thing that caused it.
+            /// </summary>
+            Fwhm,
+
+            /// <summary>Quadratic in the measured width. Second order of the same polynomial.</summary>
+            FwhmQuadratic,
+
+            /// <summary>
+            /// The physical regressor: the encircled-energy loss the frame's own width predicts
+            /// for this pair of colours through this aperture, rather than a free polynomial in
+            /// the width. One coefficient, and if the physics is right it should come back near
+            /// one.
+            /// </summary>
+            EeChrom,
         }
 
         public sealed class Result
@@ -139,6 +175,38 @@ namespace ExoStudio.Simulation
                 return r;
             }
 
+            // A BASELINE THAT NEEDS A COLUMN REFUSES WHEN THE COLUMN IS SHORT, rather than fitting
+            // the epochs that have it. The whole point of comparing orders 0, 1 and 2 is that they
+            // are the same arithmetic on the same frames; a width model that quietly dropped the
+            // frames where no star was measured would be compared against a flat model that kept
+            // them, and the difference between the two would be the subset, not the detrend.
+            bool needsFwhm = baseline is Baseline.Fwhm or Baseline.FwhmQuadratic;
+            bool needsEe = baseline == Baseline.EeChrom;
+            if (needsFwhm)
+            {
+                int missing = rows.Count(p => !(p.FwhmArcsec > 0.0) || !double.IsFinite(p.FwhmArcsec));
+                if (missing > 0)
+                {
+                    r.Refusal = $"{missing} of {rows.Count} epochs carry no measured width, so a "
+                              + "baseline in FWHM cannot be fitted on the same frames as a flat "
+                              + "one. Those frames found too few stars to measure on: loosen the "
+                              + "detection, lengthen the exposure, or fit a baseline that does not "
+                              + "need a width.";
+                    return r;
+                }
+            }
+            if (needsEe)
+            {
+                int missing = rows.Count(p => !double.IsFinite(p.EeChromMmag));
+                if (missing > 0)
+                {
+                    r.Refusal = $"{missing} of {rows.Count} epochs carry no chromatic prediction, "
+                              + "so the physical regressor has nothing to fit there. It needs a "
+                              + "measured width on every frame and an aperture fixed in arcsec.";
+                    return r;
+                }
+            }
+
             // THE PROFILE, NORMALISED TO UNIT DEPTH. u runs 0 out of transit to 1 at the floor, and
             // takes the intermediate values on the ramps that the exposure average actually
             // produced. With no injection every u is zero and there is nothing to fit, which is
@@ -188,6 +256,34 @@ namespace ExoStudio.Simulation
             { names.Add("airmass"); cols.Add(x); }
             if (baseline == Baseline.TimeAirmassQuadratic)
             { names.Add("airmass^2"); cols.Add(x.Select(v => v * v).ToArray()); }
+            if (needsFwhm || needsEe)
+            {
+                // Centred like the airmass, and for the same reason: an uncentred width of about
+                // one arcsec squared against a constant is a design a solver can still invert but
+                // whose coefficients no longer mean anything separately.
+                double[] g = needsEe
+                    ? rows.Select(p => p.EeChromMmag).ToArray()
+                    : rows.Select(p => p.FwhmArcsec).ToArray();
+                double gMean = g.Average();
+                double gSpread = g.Max() - g.Min();
+                if (!(gSpread > 1e-9 * Math.Max(1.0, Math.Abs(gMean))))
+                {
+                    r.Refusal = needsEe
+                        ? "The chromatic prediction is the same on every frame, so it is a second "
+                        + "constant and the fit is singular. It only varies when the width does: "
+                        + "run a sequence whose seeing actually moves."
+                        : $"The measured width is {gMean:F4} arcsec on every frame to within a part "
+                        + "in a billion, so a baseline in FWHM is a second constant and the fit is "
+                        + "singular. Give the run a seeing series that moves, or fit a flat "
+                        + "baseline, which is what order zero of this polynomial already is.";
+                    return r;
+                }
+                double[] gc = g.Select(v => v - gMean).ToArray();
+                names.Add(needsEe ? "ee_chrom" : "fwhm");
+                cols.Add(gc);
+                if (baseline == Baseline.FwhmQuadratic)
+                { names.Add("fwhm^2"); cols.Add(gc.Select(v => v * v).ToArray()); }
+            }
 
             int baselineColumns = cols.Count;
             // The transit column enters NEGATIVE so its coefficient is a positive depth.

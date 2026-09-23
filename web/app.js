@@ -5805,6 +5805,12 @@ function renderLcDepth() {
   $('lcDepthPanel').hidden = false;
   $('lcDepthNote').textContent =
     `${d.points} epochs · ${d.inTransit} in transit, ${d.outOfTransit} out · baseline ${d.baseline}`
+    + (d.measuredFwhmArcsecFrom != null
+       ? ` · measured FWHM ${fmt.num(d.measuredFwhmArcsecFrom, 3)} to ${fmt.num(d.measuredFwhmArcsecTo, 3)}"`
+       : '')
+    + (d.eeChromMmagFrom != null
+       ? ` · predicted loss ${fmt.num(d.eeChromMmagFrom, 3)} to ${fmt.num(d.eeChromMmagTo, 3)} mmag`
+       : '')
     + (d.waterCorrected ? ' · water corrected' : '');
 
   $('lcDepthVerdict').hidden = false;

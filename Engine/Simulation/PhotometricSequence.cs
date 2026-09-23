@@ -126,15 +126,16 @@ namespace ExoStudio.Simulation
         public double HoldAirmass = double.NaN;
 
         /// <summary>
-        /// The photometric aperture this run measured in: a radius in arcsec held fixed against
-        /// the seeing, or a multiple of each frame's own FWHM. NaN for the default. Recorded
-        /// because the aperture is not a detail of the reduction here, it is the experiment.
-        /// </summary>
-        /// <summary>
         /// Temperatures this run imposed on stars of the field, or null for none. Recorded because
         /// a run whose target was given a temperature is about a star that is in no catalogue.
         /// </summary>
         public List<DeepSkyCamera.StarOverride> StarOverrides;
+
+        /// <summary>
+        /// Every frame rendered at its expectation. Recorded because a noiseless run and a noisy
+        /// one are not the same experiment and must not be pooled.
+        /// </summary>
+        public bool Noiseless;
 
         /// <summary>
         /// Extra apertures every star is ALSO measured in on every frame, beyond the one that
@@ -144,17 +145,24 @@ namespace ExoStudio.Simulation
         /// This is what makes a curve against aperture radius cost one rendered sequence instead
         /// of one per radius, and it is why the per-star export exists.
         /// </summary>
-        /// <summary>
-        /// Every frame rendered at its expectation. Recorded because a noiseless run and a noisy
-        /// one are not the same experiment and must not be pooled.
-        /// </summary>
-        public bool Noiseless;
-
         public double[] ExtraRadiiArcsec = System.Array.Empty<double>();
         public double[] ExtraRadiiInFwhm = System.Array.Empty<double>();
 
+        /// <summary>
+        /// The photometric aperture this run measured in: a radius in arcsec held fixed against
+        /// the seeing, or a multiple of each frame's own FWHM. NaN for the default. Recorded
+        /// because the aperture is not a detail of the reduction here, it is the experiment.
+        /// </summary>
         public double ApertureRadiusArcsec = double.NaN;
         public double ApertureRadiusInFwhm = double.NaN;
+
+        /// <summary>
+        /// The scale the frames were actually measured at, arcsec per pixel, taken from the first
+        /// frame rather than recomputed. Recorded because a star width is measured in PIXELS and
+        /// every physical prediction is in arcsec, and recomputing the scale from the telescope
+        /// means guessing the binning the run was given.
+        /// </summary>
+        public double PlateScaleArcsec = double.NaN;
 
         /// <summary>The water overhead across the run, or null when the term is absent.</summary>
         public PwvSeries Pwv;
@@ -208,6 +216,27 @@ namespace ExoStudio.Simulation
         public CancellationTokenSource Cancellation { get; } = new();
 
         public List<FrameRow> Snapshot() { lock (gate) return rows.ToList(); }
+
+        /// <summary>
+        /// The width a reduction would call this frame's, in pixels: the MEDIAN of what the stars
+        /// of the field measured, not the seeing the run was given.
+        ///
+        /// WHY THE MEDIAN AND NOT THE MEAN. A real field contains unresolved blends, and a blend
+        /// measures wider than the seeing by whatever its separation is: one target in a SPECULOOS
+        /// -like field came back 24.9 per cent wider than every other bright star in the same
+        /// frame, in every configuration including one where all the stars were given the same
+        /// temperature. A mean carries that into the regressor; a median does not. Returns NaN
+        /// when no star on the frame was measurable, which the fit refuses on rather than papers
+        /// over.
+        /// </summary>
+        public static double FieldFwhmPx(FrameRow f)
+        {
+            if (f?.Stars == null) return double.NaN;
+            List<double> w = f.Stars.Where(s => s.FwhmPx > 0.0 && double.IsFinite(s.FwhmPx))
+                                    .Select(s => s.FwhmPx).OrderBy(v => v).ToList();
+            if (w.Count == 0) return double.NaN;
+            return w.Count % 2 == 1 ? w[w.Count / 2] : 0.5 * (w[w.Count / 2 - 1] + w[w.Count / 2]);
+        }
         public void Add(FrameRow r) { lock (gate) { rows.Add(r); Done = rows.Count; } }
 
         // ------------------------------------------------------------------ the airmass ladder
@@ -434,7 +463,8 @@ namespace ExoStudio.Simulation
             /// </summary>
             public List<(double Ut, double Airmass, double PwvMm, double TransitFactor,
                          double Ratio, double PhotonPpt,
-                         double SeeingArcsec, double SeeingZenith500Arcsec, double FwhmPx)> Series = new();
+                         double SeeingArcsec, double SeeingZenith500Arcsec, double FwhmPx,
+                         double MeasuredFwhmPx)> Series = new();
 
             /// <summary>The colours the differential ratio is built from - the whole reason water does not cancel.</summary>
             public double EnsembleBv;
@@ -599,7 +629,8 @@ namespace ExoStudio.Simulation
             {
                 FrameRow f = usable[kept[i]];
                 a.Series.Add((f.Ut, f.Airmass, f.PwvMm, f.TransitFactor, norm[i], photon[i] * 1000.0,
-                              f.SeeingArcsec, f.SeeingZenith500Arcsec, f.FwhmPx));
+                              f.SeeingArcsec, f.SeeingZenith500Arcsec, f.FwhmPx,
+                              FieldFwhmPx(f)));
             }
 
             // The colour trend: every star's own drift against the same ensemble, then those

@@ -1032,8 +1032,118 @@ static double[] WaterCorrection(PhotometricSequence seq, PhotometricSequence.Ana
 }
 
 /// <summary>The fitted depth of one run, with or without the water correction applied.</summary>
+/// <summary>
+/// The physical regressor column for one run: what a fixed circle is predicted to cost the target
+/// relative to the ensemble on each frame, from the width that frame's own stars measured.
+///
+/// The two colours come from the caller, or failing that from the temperatures the run IMPOSED on
+/// its field: a positional override is the target, a position-free one is everything else. When
+/// neither is available this refuses and says which one to pass, because a regressor built on a
+/// guessed colour would still fit, still reduce a residual, and still be wrong by whatever the
+/// guess was off by.
+/// </summary>
+static double[] ChromaticRegressor(PhotometricSequence seq, InstrumentSpec instrument,
+                                   double[] fwhmArcsec, double targetTeffK, double ensembleTeffK,
+                                   out string note, out string error)
+{
+    note = null;
+    error = null;
+
+    if (!(seq.ApertureRadiusArcsec > 0.0))
+    {
+        error = "This run measured in an aperture that follows each frame's own width, so there "
+              + "is no fixed circle for a chromatic loss to happen in. The physical regressor "
+              + "only means something for an aperture fixed in arcsec, which is also the only "
+              + "case where the effect it predicts exists at all.";
+        return null;
+    }
+    if (!(seq.PlateScaleArcsec > 0.0))
+    {
+        error = "This run recorded no plate scale, so a width in pixels cannot become a width in "
+              + "arcsec. Re-run the sequence.";
+        return null;
+    }
+
+    ObservingSites.Site site = CustomInstruments.SiteById(seq.Site) ?? ObservingSites.ById(seq.Site);
+    if (!DeepSkyCamera.TryResolveBand(instrument.VisualTelescope, seq.Filter,
+                                      out VisualTelescopeSpec spec,
+                                      out ExoInstruments.Visualization.CameraFilter filter,
+                                      out string bandError))
+    { error = bandError; return null; }
+
+    // The two colours: what was asked for, else what the run imposed.
+    DeepSkyCamera.StarOverride positional =
+        seq.StarOverrides?.FirstOrDefault(o => o.HasPosition);
+    DeepSkyCamera.StarOverride field =
+        seq.StarOverrides?.FirstOrDefault(o => !o.HasPosition);
+
+    ChromaticApertureLoss.Colour target = targetTeffK > 0.0
+        ? new ChromaticApertureLoss.Colour(targetTeffK, null)
+        : new ChromaticApertureLoss.Colour(positional?.TeffK ?? double.NaN, positional?.Spectrum);
+    ChromaticApertureLoss.Colour ensemble = ensembleTeffK > 0.0
+        ? new ChromaticApertureLoss.Colour(ensembleTeffK, null)
+        : new ChromaticApertureLoss.Colour(field?.TeffK ?? double.NaN, field?.Spectrum);
+
+    if (!target.IsUsable)
+    {
+        error = "The physical regressor needs the target's colour, and this run imposed none on "
+              + "it. Pass targetTeffK, or re-run with a temperature or a spectrum on the target.";
+        return null;
+    }
+    if (!ensemble.IsUsable)
+    {
+        error = "The physical regressor needs the comparison stars' colour, and this run imposed "
+              + "none on them. Pass ensembleTeffK, or re-run with a position-free override that "
+              + "gives the field a temperature.";
+        return null;
+    }
+
+    int usable = fwhmArcsec.Count(v => v > 0.0 && double.IsFinite(v));
+    if (usable < fwhmArcsec.Length)
+    {
+        error = $"{fwhmArcsec.Length - usable} of {fwhmArcsec.Length} frames measured no star "
+              + "width, so the prediction has no width to be evaluated at there.";
+        return null;
+    }
+
+    // The response at the run's own mean air, which is what its photons came through. The column
+    // is a function of width, not of airmass, so one response for the run rather than one per
+    // frame: the passband's shape moves by far less across a ladder than the colour difference
+    // this is measuring.
+    double meanAirmass = seq.Snapshot().Where(r => r.Error == null && double.IsFinite(r.Airmass))
+                            .Select(r => r.Airmass).DefaultIfEmpty(1.0).Average();
+    double altitude = site?.AltitudeMeters ?? spec.SiteAltitudeMeters;
+    SystemResponse response = DeepSkyCamera.BuildSystemResponse(spec, filter, meanAirmass, altitude);
+
+    double[] column = ChromaticApertureLoss.Column(
+        spec, filter, response, altitude, seq.ApertureRadiusArcsec,
+        target, ensemble, fwhmArcsec, out error);
+    if (column == null) return null;
+
+    string targetLabel = target.Spectrum != null ? "a tabulated spectrum" : $"{target.TeffK:F0} K";
+    string ensembleLabel = ensemble.Spectrum != null ? "a tabulated spectrum" : $"{ensemble.TeffK:F0} K";
+    note = $"The baseline is the chromatic aperture loss itself, predicted for {targetLabel} "
+         + $"against {ensembleLabel} through a {seq.ApertureRadiusArcsec:F3} arcsec circle, from "
+         + $"each frame's own measured width. It swings {column.Max() - column.Min():F3} mmag "
+         + $"across this run. A fitted coefficient near one means the curve moved by what the "
+         + $"optics say it should; far from one means something else is moving it.";
+    return column;
+}
+
+/// <summary>
+/// The depth a run gives back, under one baseline model, with the colours the physical regressor
+/// is between.
+///
+/// THE TEMPERATURES ARE ARGUMENTS, NOT MEASUREMENTS, and that is the honest shape. An observer
+/// building this regressor knows their target's spectral type and their comparison stars' from a
+/// catalogue; they do not recover it from the frames they are about to detrend. Passing them in
+/// also means the regressor can be asked what it would predict for a colour pair the run did not
+/// have, which is how the study separates the size of the effect from the fit's ability to
+/// remove it. Either left NaN falls back to what the run imposed on its own stars.
+/// </summary>
 static object FitSequenceDepth(PhotometricSequence seq, string baselineName, bool correct,
                                InstrumentSpec instrument, PwvTransmission table,
+                               double targetTeffK, double ensembleTeffK,
                                out TransitDepthFit.Result fit, out string error)
 {
     fit = null;
@@ -1080,6 +1190,23 @@ static object FitSequenceDepth(PhotometricSequence seq, string baselineName, boo
           + $"which no observer has.";
     }
 
+    // THE WIDTH THE PIPELINE MEASURED, in arcsec, at the scale the frames were measured at. NaN
+    // where no star on the frame carried a width, which the fit refuses on rather than drops.
+    double plateScale = seq.PlateScaleArcsec;
+    double[] fwhmArcsec = a.Series
+        .Select(row => plateScale > 0.0 && row.MeasuredFwhmPx > 0.0
+                     ? row.MeasuredFwhmPx * plateScale : double.NaN)
+        .ToArray();
+
+    double[] eeChrom = null;
+    string regressorNote = null;
+    if (baseline == TransitDepthFit.Baseline.EeChrom)
+    {
+        eeChrom = ChromaticRegressor(seq, instrument, fwhmArcsec, targetTeffK, ensembleTeffK,
+                                     out regressorNote, out string regError);
+        if (eeChrom == null) { error = regError; return null; }
+    }
+
     var points = new List<TransitDepthFit.Point>(a.Series.Count);
     for (int i = 0; i < a.Series.Count; i++)
     {
@@ -1089,11 +1216,14 @@ static object FitSequenceDepth(PhotometricSequence seq, string baselineName, boo
             Ut = row.Ut, Airmass = row.Airmass, Ratio = row.Ratio,
             TransitFactor = row.TransitFactor, PhotonPpt = row.PhotonPpt,
             CorrectionMmag = corr != null ? corr[i] : 0.0,
+            FwhmArcsec = fwhmArcsec[i],
+            EeChromMmag = eeChrom != null ? eeChrom[i] : double.NaN,
         });
     }
 
     fit = TransitDepthFit.Fit(points, baseline, seq.Transient.Depth);
     if (fit.Refusal != null) { error = fit.Refusal; return null; }
+    if (regressorNote != null) fit.Notes.Insert(0, regressorNote);
 
     return new
     {
@@ -1113,6 +1243,10 @@ static object FitSequenceDepth(PhotometricSequence seq, string baselineName, boo
         correlatedWith = fit.WorstRegressor,
         targetBv = FiniteRounded(a.TargetBv, 4),
         ensembleBv = FiniteRounded(a.EnsembleBv, 4),
+        measuredFwhmArcsecFrom = FiniteRounded(fwhmArcsec.Where(double.IsFinite).DefaultIfEmpty(double.NaN).Min(), 4),
+        measuredFwhmArcsecTo = FiniteRounded(fwhmArcsec.Where(double.IsFinite).DefaultIfEmpty(double.NaN).Max(), 4),
+        eeChromMmagFrom = FiniteRounded(eeChrom?.Min() ?? double.NaN, 4),
+        eeChromMmagTo = FiniteRounded(eeChrom?.Max() ?? double.NaN, 4),
         coefficients = fit.Coefficients.Select(c => new
         {
             name = c.Name, value = FiniteRounded(c.Value, 8), error = FiniteRounded(c.Error, 8),
@@ -1125,7 +1259,8 @@ static object FitSequenceDepth(PhotometricSequence seq, string baselineName, boo
     };
 }
 
-app.MapGet("/api/sequences/{id}/depth", (string id, string baseline, bool? correct) =>
+app.MapGet("/api/sequences/{id}/depth", (string id, string baseline, bool? correct,
+                                        double? targetTeffK, double? ensembleTeffK) =>
 {
     PhotometricSequence seq = sequences.Get(id);
     if (seq == null) return Results.NotFound(new { error = "No such sequence." });
@@ -1135,6 +1270,7 @@ app.MapGet("/api/sequences/{id}/depth", (string id, string baseline, bool? corre
     if (instrument == null) return Results.BadRequest(new { error = "The sequence's instrument is no longer available." });
 
     object payload = FitSequenceDepth(seq, baseline, correct ?? false, instrument, deepSky.Value.Pwv,
+                                      targetTeffK ?? double.NaN, ensembleTeffK ?? double.NaN,
                                       out _, out string error);
     return payload == null ? Results.BadRequest(new { error }) : Results.Json(payload);
 });
@@ -1167,9 +1303,11 @@ app.MapGet("/api/sequences/compare", (string a, string b, string baseline, bool?
     InstrumentSpec ib = PointableAstrographs().FirstOrDefault(i => string.Equals(i.Name, sb.Telescope, StringComparison.OrdinalIgnoreCase));
     if (ia == null || ib == null) return Results.BadRequest(new { error = "A run's instrument is no longer available." });
 
-    object pa = FitSequenceDepth(sa, baseline, correct ?? false, ia, deepSky.Value.Pwv, out TransitDepthFit.Result fa, out string ea);
+    object pa = FitSequenceDepth(sa, baseline, correct ?? false, ia, deepSky.Value.Pwv,
+                                 double.NaN, double.NaN, out TransitDepthFit.Result fa, out string ea);
     if (pa == null) return Results.BadRequest(new { error = $"Run {a}: {ea}" });
-    object pb = FitSequenceDepth(sb, baseline, correct ?? false, ib, deepSky.Value.Pwv, out TransitDepthFit.Result fb, out string eb);
+    object pb = FitSequenceDepth(sb, baseline, correct ?? false, ib, deepSky.Value.Pwv,
+                                 double.NaN, double.NaN, out TransitDepthFit.Result fb, out string eb);
     if (pb == null) return Results.BadRequest(new { error = $"Run {b}: {eb}" });
 
     (double diff, double err, string note) = TransitDepthFit.Difference(fa, fb);
@@ -1275,8 +1413,12 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
     sb.Append("# seeing_zenith500_arcsec is what the run asked for, seeing_delivered_arcsec is what this "
             + "frame's passband was given at its airmass, and fwhm_px is what the reduction used. "
             + "None of the three is a width measured on the stars.\n");
+    sb.Append("# measured_fwhm_arcsec IS: the median width of the field's own stars on that frame, "
+            + "which is the only one of the four a real reduction has, and the one a detrend "
+            + "against seeing must be built on. It differs from seeing_delivered_arcsec by the "
+            + "telescope's own share of the profile and by the estimator's bias.\n");
     sb.Append("ut_seconds,utc,airmass,pwv_mm,transit_factor,ratio,photon_ppt,"
-            + "seeing_zenith500_arcsec,seeing_delivered_arcsec,fwhm_px\n");
+            + "seeing_zenith500_arcsec,seeing_delivered_arcsec,fwhm_px,measured_fwhm_arcsec\n");
 
     string Num(double v, string f) => double.IsFinite(v) ? v.ToString(f, CultureInfo.InvariantCulture) : "";
     foreach (var row in a.Series)
@@ -1290,7 +1432,9 @@ app.MapGet("/api/sequences/{id}/export.csv", (string id) =>
           .Append(Num(row.PhotonPpt, "0.######")).Append(',')
           .Append(Num(row.SeeingZenith500Arcsec, "0.######")).Append(',')
           .Append(Num(row.SeeingArcsec, "0.######")).Append(',')
-          .Append(Num(row.FwhmPx, "0.######")).Append('\n');
+          .Append(Num(row.FwhmPx, "0.######")).Append(',')
+          .Append(Num(seq.PlateScaleArcsec > 0.0 ? row.MeasuredFwhmPx * seq.PlateScaleArcsec
+                                                 : double.NaN, "0.######")).Append('\n');
     }
 
     return Results.File(System.Text.Encoding.UTF8.GetBytes(sb.ToString()), "text/csv",
@@ -3724,6 +3868,9 @@ static void RunSequence(PhotometricSequence seq, VisualTelescopeSpec spec, Obser
             // a varying one, so an airmass detrend absorbs it. It is a real approximation and it
             // is small; the epoch was neither.
             double midExposureUt = prep.ObservedUt + 0.5 * prep.ExposureSeconds;
+
+            if (!double.IsFinite(seq.PlateScaleArcsec) && prep.Meta.PlateScaleArcsec > 0.0)
+                seq.PlateScaleArcsec = prep.Meta.PlateScaleArcsec;
 
             seq.Add(new PhotometricSequence.FrameRow
             {

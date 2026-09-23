@@ -1919,6 +1919,97 @@ each was tried first:
 under test, so `/api/sequences/compare` refuses two runs fitted with different baselines rather than
 subtracting them.
 
+### Baselines in the measured width, and the physical one
+
+Four further baselines exist for a systematic that tracks the **seeing** rather than the air or the
+clock: `Flat` (order 0 of a polynomial in the width, and already listed above), `Fwhm` (order 1),
+`FwhmQuadratic` (order 2), and `EeChrom`. None of the four carries a time term. That is deliberate
+and it is the rule the whole comparison rests on: one regressor at a time, or a recovered bias is
+not attributable to the thing that caused it.
+
+**The width they use is the one a pipeline measures**, not the seeing the run was given: the
+**median** of the field's own stars on that frame, `PhotometricSequence.FieldFwhmPx`, converted with
+the scale the frames were measured at (`PhotometricSequence.PlateScaleArcsec`). The median rather
+than the mean because a field contains unresolved blends, and a blend measures wider than the seeing
+by whatever its separation is: one target in a SPECULOOS-like field came back **24.9 per cent wider**
+than every other bright star in the same frame, in every configuration including one where all the
+stars were given the same temperature. It reaches the series CSV as `measured_fwhm_arcsec`, beside
+the three widths that are **not** measured (`seeing_zenith500_arcsec`, `seeing_delivered_arcsec`,
+`fwhm_px`).
+
+A frame that measured no width is a **refusal**, not a dropped row. Orders 0, 1 and 2 are only
+comparable if they are the same arithmetic on the same frames; a width model that quietly fitted the
+subset that had a width would differ from a flat model by the subset rather than by the detrend. A
+width that never moves is refused too, because the column is then a second constant and the design
+is singular.
+
+`EeChrom` is `Engine/Simulation/ChromaticApertureLoss.cs`: what a **fixed** circle costs the target
+relative to the ensemble, from the encircled energy of the two profiles Core would render them with.
+It is a function of the measured width alone, and the two colours are **arguments**
+(`targetTeffK`, `ensembleTeffK` on `/api/sequences/{id}/depth`, defaulting to what the run imposed
+through its star overrides) because an observer knows their target's type from a catalogue rather
+than from the frames they are about to detrend. It refuses an aperture that is not fixed in arcsec:
+a radius taken as a multiple of each frame's own width re-centres the circle on the profile every
+frame, which is exactly what makes the effect cancel.
+
+Three things about that prediction are not obvious and each of them was wrong first.
+
+1. **The effect is the SWING, not the value.** The loss at one seeing is a static offset between
+   two stars, and a differential curve normalised to a mean of one divides it out with everything
+   else constant. Only its movement with the width survives, which is why the regressor is a
+   column and not a number, and the single-seeing value can sit either side of zero without
+   meaning anything. On a 0.51 m through a 1.20 arcsec circle, 2600 K against 5500 K, the loss is
+   **-0.153 mmag at 1.00 arcsec of seeing and +0.163 at 1.30**: negative, positive, and the swing
+   between them is what a night's curve shows.
+
+   Diffraction damps that swing but never reverses it. Seeing goes as lambda^(-1/5) so the
+   atmosphere delivers a redder star narrower; diffraction goes as lambda so the telescope
+   delivers it wider, and the two fight inside the profile:
+
+   | D | delivered width difference | swing, 1.00 to 1.30 arcsec |
+   |---|---|---|
+   | 0.51 m | -0.29 mas | +0.316 mmag, 72 % of the limit |
+   | 1.0 m | -0.96 mas | +0.380 |
+   | 2.0 m | -1.22 mas | +0.403 |
+   | 15 m | -1.39 mas | +0.438 |
+
+   **Against radius it is a peak, not a slope**, because what drives it is the flux CROSSING the
+   aperture boundary when the profile widens: a circle deep in the core has no gradient under its
+   edge, a wide one has nothing left outside to move. At 15 m on a 1.00 arcsec profile:
+   **0.156 mmag at 0.3 arcsec, 0.537 at 0.9, 0.0204 at 3.6.** An independent quadrature of Fried's
+   transfer function outside Studio finds the same shape and the same sign at every diameter and
+   radius it was asked at, peaking at 0.8 arcsec rather than 0.9.
+2. **It is integrated at 20 pixels per FWHM whatever the detector did.** A circle on a pixel grid
+   gets a flux ratio wrong by a phase-dependent amount that only falls with sampling (§ Verify 33).
+   A detector cannot choose its sampling; a prediction can, and nothing forces this one onto the
+   detector's grid.
+3. **Both profiles are normalised at a common physical radius, four FWHM, not at the kernel's own
+   edge.** Core caps a kernel at 128 pixels, so its physical reach is 128 divided by the sampling:
+   asking for a finer grid silently asks for a shorter profile. Normalising each kernel by its own
+   total therefore normalises by a different amount of wing at every sampling, and the answer never
+   converges: **-0.2206, -0.1933, -0.1300 mmag at 10, 20 and 40 pixels per FWHM** before this was
+   fixed. With the common radius the spread across a 2.8-fold change of grid is **0.011 mmag**,
+   which is the prediction's own numerical floor and is quoted as one. An aperture reaching past
+   that radius is refused rather than compared.
+
+Verify section 34 puts the four baselines on one synthetic curve carrying a known width-correlated
+systematic under a 7000 ppm transit, with the no-systematic control that PwvTransitBias insists on
+(every baseline returns the injected depth to better than 0.0001 ppm). The result worth knowing:
+
+| baseline | bias, ppm | of the 7000 ppm event |
+|---|---|---|
+| `Flat` | -24.94 | -0.36 % |
+| `Fwhm` | **-28.96** | **-0.41 %**: worse than doing nothing |
+| `FwhmQuadratic` | 0.52 | 0.01 % |
+| `EeChrom` | **0.26** | **0.004 %** |
+
+**A first-order polynomial in the width does not help, and can hurt.** A transit is scheduled at
+culmination and sits in the middle of the run, so it is symmetric in time, while a line in a
+monotonically rising width is antisymmetric about that same centre: the two are nearly orthogonal,
+and removing the line takes away almost nothing the depth was absorbing. What the depth absorbs is
+the **curvature** of the loss, which is symmetric about the middle and looks exactly like a dip
+there. Order 2 reaches the curvature; the physical column is the right shape to begin with.
+
 ### The transfer function, re-measured with that estimator
 
 Reproducing §5.9's correction table with the joint matched-filter estimator instead of the two-step

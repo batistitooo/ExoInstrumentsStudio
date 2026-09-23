@@ -1165,8 +1165,12 @@
           <option value="Time">linear in time</option>
           <option value="TimeAirmass" selected>time and airmass</option>
           <option value="TimeAirmassQuadratic">plus airmass²</option>
-          <option value="Flat">a constant only</option>
+          <option value="Flat">a constant only (FWHM order 0)</option>
+          <option value="Fwhm">linear in measured FWHM (order 1)</option>
+          <option value="FwhmQuadratic">quadratic in measured FWHM (order 2)</option>
+          <option value="EeChrom">the chromatic aperture loss itself</option>
         </select>
+        <span class="q" tabindex="0" data-tip="The last four are the comparison a colour-dependent seeing drift calls for. Orders 0, 1 and 2 are the polynomial in MEASURED width that an observer reaches for when a night's curve tracks the seeing; it has no idea the loss follows the target's own wavelength rather than the field's average width, so it absorbs the right shape only by accident and eats part of the transit while it does. The last is the loss itself, predicted from the same optics the frames were rendered through: one column, whose coefficient should come back near one. None of the four carries a time term, because one regressor at a time is the only way a bias stays attributable to what caused it.">?</span>
         <label class="capcheck"><input id="lcDepthCorrect" type="checkbox"> correct for the water</label>
         <button id="lcDepthFit" class="accent">Fit</button>
       </div>

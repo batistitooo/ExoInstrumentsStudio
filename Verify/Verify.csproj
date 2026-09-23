@@ -60,6 +60,8 @@
     <Compile Include="$(StudioRoot)\Simulation\PwvRequirement.cs" />
     <Compile Include="$(StudioRoot)\Simulation\PwvTransitBias.cs" />
     <Compile Include="$(StudioRoot)\Simulation\TransitDepthFit.cs" />
+    <!-- Section 35: what a fixed circle costs a star for being the wrong colour. -->
+    <Compile Include="$(StudioRoot)\Simulation\ChromaticApertureLoss.cs" />
     <Compile Include="$(StudioRoot)\Simulation\Yield\Population.cs" />
     <Compile Include="$(StudioRoot)\Simulation\Yield\Programme.cs" />
     <Compile Include="$(StudioRoot)\Simulation\Yield\LightCurveSource.cs" />
