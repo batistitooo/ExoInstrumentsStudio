@@ -1479,7 +1479,8 @@ app.MapGet("/api/sequences/{id}/stars.csv", (string id) =>
           .Append(string.Join(", ", fixedR.Select(v => v.ToString("0.###", CultureInfo.InvariantCulture))))
           .Append('\n');
     if (fwhmR.Length > 0)
-        sb.Append("# extra apertures as multiples of each frame's measured width: ")
+        sb.Append("# extra apertures as multiples of the frame's MODELLED delivered seeing, "
+                + "which is not a width measured on the stars: ")
           .Append(string.Join(", ", fwhmR.Select(v => v.ToString("0.###", CultureInfo.InvariantCulture))))
           .Append('\n');
 

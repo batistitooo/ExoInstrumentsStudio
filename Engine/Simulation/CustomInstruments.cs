@@ -545,6 +545,12 @@ namespace ExoStudio.Simulation
                 // values, which is why an instrument could not carry g' or I+z' at all. Now the
                 // band is named by the observer and the position is optional: give one and the
                 // legacy slot is filled too, omit it and the band stands on its own.
+                // AND THE NAME IS WHAT THE PROVENANCE LINES SAY, not the slot. `position` is
+                // optional, so when it is omitted it is default(CameraFilter), which is
+                // Luminance: a three-band clone that named its bands I+z', z' and r' and left
+                // the slots off had every Derived and Assumptions line reading "Luminance", on
+                // all three. Those lines are what a figure made from this instrument has to
+                // carry, so a band that cannot name itself there is a provenance failure.
                 string bandName = !string.IsNullOrWhiteSpace(f.Label) ? f.Label.Trim()
                                 : !string.IsNullOrWhiteSpace(f.Position) ? f.Position.Trim()
                                 : null;
@@ -585,7 +591,7 @@ namespace ExoStudio.Simulation
                 // to be broad visible, which is a label that lies and the kind this codebase
                 // refuses everywhere else.
 
-                SpectralCurve curve = ParseCurve(f.TransmissionCurve, $"{position} transmission", 0.0, 1.0, ref error);
+                SpectralCurve curve = ParseCurve(f.TransmissionCurve, $"{bandName} transmission", 0.0, 1.0, ref error);
                 if (error != null) return null;
 
                 // A CURVE ON ANY BAND. This used to be refused on anything but Red, Green and
@@ -599,14 +605,14 @@ namespace ExoStudio.Simulation
                     // A measured curve already carries the filter's transmission, so the published
                     // peak must NOT be applied on top of it; that would count the filter twice.
                     // This is BuildSystemResponse's own rule, and it is why peak is forced to 1.
-                    b.Derived.Add($"{position}: the measured transmission curve is integrated directly, "
+                    b.Derived.Add($"{bandName}: the measured transmission curve is integrated directly, "
                                 + $"{f.TransmissionCurve.Count} points, so the passband shape is real rather than "
                                 + "a top-hat and the peak transmission is not applied on top of it.");
                     peak = 1.0;
                 }
                 else if (!f.PeakTransmission.HasValue)
                 {
-                    b.Assumptions.Add($"{position}: peak transmission not given, so the filter's own loss is unmodelled (the catalogue's own convention for an unpublished figure).");
+                    b.Assumptions.Add($"{bandName}: peak transmission not given, so the filter's own loss is unmodelled (the catalogue's own convention for an unpublished figure).");
                 }
 
                 // THE BAND ITSELF, registered by name. This is what the pipeline resolves against

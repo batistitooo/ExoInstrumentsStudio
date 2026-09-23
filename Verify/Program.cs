@@ -5415,6 +5415,90 @@ Section("35. The chromatic loss Studio predicts, and which of the two causes win
           "it returned a loss for a tracking aperture");
 }
 
+Section("36. How far out the diffraction halo is kept, and what the cut costs at each mirror");
+{
+    // WHY THIS EXISTS. The study's figure carries an inset of the effect against MIRROR DIAMETER,
+    // and a rendered inset is only worth drawing if the rendered profile's diameter dependence is
+    // the real one.
+    //
+    // THE SUPPORT IS A FIXED ANGLE, AND THE DIFFRACTION SCALE IS NOT. The kernel's reach is set by
+    // the atmospheric term and the budget, so it comes out near 10.9 arcsec on the study's fine
+    // grid whatever the mirror is. In units of the only length the diffraction pattern knows
+    // about, lambda/D, that same angle is 16 at a quarter metre and 126 at two metres. The Airy
+    // envelope falls as theta^-3, so the energy outside a radius falls only as 1/R: cutting at 16
+    // lambda/D and renormalising moves real flux from the wings into the core, and cutting at 126
+    // barely moves any. The bias is therefore DIAMETER DEPENDENT and it sharpens the small mirror,
+    // which is exactly the axis the inset measures.
+    //
+    // This check measures the cut and prints the radial curve, so the comparison against an
+    // independent quadrature can be made outside Studio rather than argued about inside it.
+    double[] diameters36 = { 0.25, 0.6, 1.0, 2.0 };
+    const double Plate36 = 0.08701796513549377;   // the study's fine grid
+    const double Lambda36 = 837e-9;
+    const double Seeing36 = 1.0;
+    const double ArcsecPerRadian = 206264.80624709636;
+
+    double Enclosed36(float[] k, int radius, double rPx)
+    {
+        int side = 2 * radius + 1;
+        double inside = 0.0, total = 0.0;
+        for (int y = 0; y < side; y++)
+            for (int x = 0; x < side; x++)
+            {
+                double v = k[y * side + x];
+                total += v;
+                double frac = AperturePhotometry.PixelDiscOverlap(x - radius, y - radius, rPx);
+                if (frac > 0.0) inside += v * frac;
+            }
+        return total > 0.0 ? inside / total : double.NaN;
+    }
+
+    double[] radii36 = { 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0 };
+    Console.WriteLine($"         {"D, m",-7}{"lam/D, as",-12}{"reach, as",-12}{"reach, lam/D",-14}"
+                    + string.Join("", radii36.Select(r => $"{"EE(" + r.ToString("F1") + ")",-10}")));
+    var reach36 = new List<(double D, double InLambdaOverD, double[] Ee)>();
+    foreach (double d in diameters36)
+    {
+        float[] k = OpticalPsf.BuildKernel(Plate36, d, 0.28, Lambda36, Seeing36, 0.0, out int radius);
+        if (k == null) { Check($"a kernel exists at D = {d} m", false); continue; }
+        double lod = Lambda36 / d * ArcsecPerRadian;
+        double[] ee = radii36.Select(r => Enclosed36(k, radius, r / Plate36)).ToArray();
+        reach36.Add((d, radius * Plate36 / lod, ee));
+        Console.WriteLine($"         {d,-7:F2}{lod,-12:F4}{radius * Plate36,-12:F3}"
+                        + $"{radius * Plate36 / lod,-14:F1}"
+                        + string.Join("", ee.Select(v => $"{v,-10:F5}")));
+    }
+
+    // THE MEASUREMENT, stated rather than asserted away: the reach in diffraction units spans
+    // almost an order of magnitude across the inset's diameters, which is the bias itself.
+    double loR = reach36.Min(r => r.InLambdaOverD), hiR = reach36.Max(r => r.InLambdaOverD);
+    Console.WriteLine($"         the same reach is {loR:F0} to {hiR:F0} lambda/D across the inset, "
+                    + $"a factor of {hiR / loR:F1}");
+
+    // WHAT CAN BE ASSERTED HERE WITHOUT A SECOND MODEL. Two things, and the third question, whether
+    // the diameter DEPENDENCE survives the cut, is answered outside against ember's own quadrature
+    // of Fried's transfer function, because Studio has no independent profile to check itself with.
+    Check("every diameter in the inset keeps its halo past ten diffraction widths",
+          reach36.All(r => r.InLambdaOverD >= 10.0),
+          $"the tightest cut is {loR:F1} lambda/D at D = {reach36.OrderBy(r => r.InLambdaOverD).First().D:F2} m");
+    Check("the encircled energy rises with radius at every diameter",
+          reach36.All(r => Enumerable.Range(1, r.Ee.Length - 1).All(i => r.Ee[i] > r.Ee[i - 1])),
+          "a profile that fell with radius would be a normalisation fault, not a truncation one");
+
+    // AND THE SHARPENING IS VISIBLE DIRECTLY. A smaller mirror diffracts MORE, so at a fixed
+    // angular radius it must enclose LESS light, always. If the rendered profile ever puts more
+    // light inside a fixed circle for a smaller mirror, the truncation has overtaken the physics
+    // and the inset cannot be rendered from these kernels.
+    bool ordered36 = true;
+    for (int i = 0; i < radii36.Length; i++)
+        for (int j = 1; j < reach36.Count; j++)
+            if (!(reach36[j].Ee[i] > reach36[j - 1].Ee[i])) ordered36 = false;
+    Check("a bigger mirror always keeps more light inside the same circle",
+          ordered36,
+          ordered36 ? "monotone in D at all nine radii"
+                    : "the ordering in D breaks somewhere, which is the truncation showing through");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"
