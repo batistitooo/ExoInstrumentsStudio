@@ -1347,9 +1347,22 @@ namespace ExoStudio.Simulation
                         // The SAME expression DepositStars would have evaluated for this star, so
                         // the override is the star's own brightness times the factor and nothing
                         // else. RenderedStar is a struct: the list element has to be written back.
+                        //
+                        // AND THAT MEANS THE STAR'S OWN SPECTRUM TOO. This call dropped
+                        // OverrideTeffK and OverrideSpectrum while the deposit's own electronsFor
+                        // passes both, so an injected transit silently replaced the host with the
+                        // star its CATALOGUE colour describes for the length of the event. On a
+                        // target carrying a PHOENIX 2600 K spectrum against a packed catalogue
+                        // that clamps B-V at 2.0, measured on ember-amp-real in I+z': 96600 e-
+                        // out of transit and 4889 e- in it, a ratio of 0.0506 where the injected
+                        // factor was 0.99357. A 3.24 magnitude step instead of a 7 millimagnitude
+                        // one, on exactly the stars an injection study is about. The truth column
+                        // was right throughout, which is what made it checkable: transit_factor
+                        // read 0.993574 while the flux ratio read 0.050614.
                         double baseElectrons = StellarPhotometry.CollectedElectrons(
                             s0.VMag, s0.ColorIndexBV, s0.ReddeningEBv,
-                            response, reddening, areaCm2, exposure, starTransmission);
+                            response, reddening, areaCm2, exposure, starTransmission,
+                            s0.OverrideTeffK, s0.OverrideSpectrum);
                         s0.FixedElectrons = transitFactor * baseElectrons;
                         stars[si] = s0;
                         transitStars++;

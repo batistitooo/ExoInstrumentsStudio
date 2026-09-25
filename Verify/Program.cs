@@ -5597,6 +5597,76 @@ Section("37. Which wavelengths the profile is built over when the band carries a
           $"{cLo37 * 1e9:F1} to {cHi37 * 1e9:F1} nm once the detector stops at 950");
 }
 
+Section("38. What an injected transit does to a star that carries its own spectrum");
+{
+    // THE TRUTH COLUMN WAS RIGHT AND THE PIXELS WERE NOT, which is the shape of bug that survives
+    // a long time. An injected transit dims its host by recomputing the host's electrons and
+    // multiplying by the transit factor. That recomputation dropped the star's OverrideTeffK and
+    // OverrideSpectrum, while the deposit's own electronsFor passes both, so for the length of
+    // the event the host was replaced by the star its CATALOGUE colour describes.
+    //
+    // Measured on the study this broke: a target carrying a PHOENIX 2600 K spectrum, against a
+    // packed catalogue that clamps B-V at 2.0 and therefore cannot express an M dwarf at all,
+    // rendered 96600 e- out of transit and 4889 e- in it. A ratio of 0.0506 where the injected
+    // factor was 0.99357: a 3.24 magnitude step instead of a 7 millimagnitude one. The reduction
+    // reported transit_factor 0.993574 throughout, so nothing in the outputs contradicted itself
+    // except the flux, and only for a star whose colour the catalogue could not carry.
+    //
+    // This checks the arithmetic directly rather than through a render: the electrons a star
+    // collects must not depend on whether a transit is being injected into it, beyond the factor.
+    VisualTelescopeSpec spec38 = VisualTelescopeCatalog.Rc20;
+    SystemResponse resp38 = DeepSkyCamera.BuildSystemResponse(spec38, CameraFilter.Red, 1.2, 2635.0);
+    double area38 = Math.PI * Math.Pow(50.0 * spec38.ApertureMeters, 2.0)
+                  * (1.0 - spec38.SecondaryObstructionFraction * spec38.SecondaryObstructionFraction);
+
+    // A cool star the catalogue cannot express: B-V clamped at 2.0 is a floor near 3169 K.
+    const double VMag38 = 16.0, Bv38 = 2.0, Teff38 = 2600.0;
+
+    double catalogue = StellarPhotometry.CollectedElectrons(
+        VMag38, Bv38, double.NaN, resp38, null, area38, 30.0, 1.0);
+    double withSpectrum = StellarPhotometry.CollectedElectrons(
+        VMag38, Bv38, double.NaN, resp38, null, area38, 30.0, 1.0, Teff38, null);
+
+    Console.WriteLine($"         V {VMag38:F1}, B-V {Bv38:F1}: the catalogue colour collects "
+                    + $"{catalogue:F0} e- and a {Teff38:F0} K override collects {withSpectrum:F0}, "
+                    + $"a factor of {withSpectrum / catalogue:F3}");
+    // The threshold is what THIS band and THIS star give, not what the study's own case gave. On
+    // an RC20 Red band the override is worth 0.27 mag; on the SPECULOOS-like I+z' clone where the
+    // bug was found it was worth 3.24. Both are enormous next to a 7 millimagnitude event, and
+    // writing the study's number into a check that renders a different configuration would be a
+    // threshold chosen to pass rather than measured.
+    Check("a temperature override changes what a star collects, or there is nothing to lose",
+          Math.Abs(2.5 * Math.Log10(withSpectrum / catalogue)) > 0.1,
+          $"{withSpectrum / catalogue:F3}, {2.5 * Math.Log10(withSpectrum / catalogue):+0.00;-0.00} mag "
+        + "here, and 3.24 mag on the I+z' clone where this was found");
+
+    // THE INJECTION MUST SCALE THE OVERRIDDEN STAR, NOT THE CATALOGUE ONE. This is the expression
+    // the transit path evaluates, written here exactly as it is written there.
+    const double Factor38 = 0.9935735;      // a 7 millimagnitude event
+    double injected = Factor38 * StellarPhotometry.CollectedElectrons(
+        VMag38, Bv38, double.NaN, resp38, null, area38, 30.0, 1.0, Teff38, null);
+    double ratio38 = injected / withSpectrum;
+    Console.WriteLine($"         in transit over out of transit: {ratio38:F6}, "
+                    + $"against an injected factor of {Factor38:F6}");
+    Check("an injected transit dims the star it was rendered as, not the one the catalogue holds",
+          Math.Abs(ratio38 - Factor38) < 1e-9,
+          $"{ratio38:F6} against {Factor38:F6}");
+
+    // AND THE SIZE OF THE BUG IT REPLACES, so the check says what it is protecting against.
+    double wrong = Factor38 * catalogue / withSpectrum;
+    Console.WriteLine($"         had the override been dropped the step would read {wrong:F6}, "
+                    + $"{2.5 * Math.Log10(Factor38 / wrong):F2} mag deep instead of "
+                    + $"{2.5 * Math.Log10(1.0 / Factor38) * 1000.0:F1} mmag");
+    // Against the event itself, which is the comparison that matters: a 7 mmag transit measured
+    // through a step of a quarter of a magnitude is not a measurement of the transit.
+    double eventMmag = 2.5 * Math.Log10(1.0 / Factor38) * 1000.0;
+    double wrongMmag = Math.Abs(2.5 * Math.Log10(Factor38 / wrong)) * 1000.0;
+    Check("and dropping it would have swamped the event it was supposed to inject",
+          wrongMmag > 10.0 * eventMmag,
+          $"{wrongMmag:F0} mmag of spurious step against a {eventMmag:F1} mmag event, "
+        + $"a factor of {wrongMmag / eventMmag:F0}");
+}
+
 Console.WriteLine();
 Console.WriteLine(failures == 0
     ? $"PASS  {checks} checks"
